@@ -1,0 +1,46 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-web"
+description = "tessera web portal: HTTP pages and JSON API over the local control socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+test = false
+doctest = false
+name = "tessera_web"
+path = "src/lib.rs"
+
+[[bin]]
+test = false
+name = "tessera-web"
+path = "src/main.rs"
+
+[dependencies]
+tessera-control-types = { workspace = true }
+tessera-state = { path = "../tessera-state", version = "0.2.0-beta" }
+tessera-network = { path = "../tessera-network", version = "0.2.0-beta" }
+tesseractl = { path = "../tesseractl", version = "0.2.0-beta" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json", "query", "multipart"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "process", "signal", "sync", "time", "macros", "fs"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# The EQ engine's websocket (plain `ws://` on the loopback: no TLS feature).
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+maud = { version = "0.27", features = ["axum"] }
+argon2 = { version = "0.5", features = ["std"] }
+getrandom = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+nix = { version = "0.31", default-features = false, features = ["term", "user", "fs", "hostname"] }
+
+[lints]
+workspace = true

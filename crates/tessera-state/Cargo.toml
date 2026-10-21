@@ -1,0 +1,29 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-state"
+description = "Config schema, state model, persistence, event bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tessera-control-types = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+
+
+[lib]
+test = false
+doctest = false
+
+[[example]]
+name = "reference_config"
+path = "examples/reference_config.rs"
+test = false

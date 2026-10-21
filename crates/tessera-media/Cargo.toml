@@ -1,0 +1,28 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-media"
+description = "Flow RX/TX, jitter buffers, packetization, sample-format conversion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+# Everything that needs the heap (buffers, flow engines, resamplers). Without
+# it the crate is bare `core`: time helpers, sample conversion, the packet
+# format trait, the reference format, the PI drift controller, the `Resampler`
+# trait.
+alloc = []
+std = ["alloc"]
+
+
+[lib]
+test = false
+doctest = false

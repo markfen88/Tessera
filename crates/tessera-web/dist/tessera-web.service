@@ -1,0 +1,65 @@
+# tessera web portal (ADR 0013): pages and a JSON API over the daemon's
+# control socket. Install as /usr/lib/systemd/system/tessera-web.service.
+#
+# Before the first start, set the operator password:
+#   sudo tessera-web set-password
+# The portal can change settings only if its user is also in the daemon's
+# admin group (default `tessera-admin`):
+#   sudo usermod -aG tessera-admin tessera-web && sudo systemctl restart tessera-web
+# Listening address and other settings: /etc/tessera/web.toml.
+# Appliance mode ([appliance] in web.toml) needs nothing here: the portal
+# runs plain systemctl as its own user over D-Bus (AF_UNIX below); a polkit
+# rules file (`tessera-web appliance polkit`) grants start/stop/restart of
+# the allowlisted units, and enable/disable go through the root oneshot
+# tessera-web-unitfile@.service. The hardening stays as it is; see
+# docs/web-portal.md.
+
+[Unit]
+Description=tessera web portal
+After=network-online.target tesserad.service
+Wants=network-online.target
+Requires=tessera-network.service
+After=tessera-network.service
+
+[Service]
+Type=simple
+User=tessera-web
+Group=tessera-web
+ExecStart=/usr/bin/tessera-web
+Restart=on-failure
+RestartSec=2s
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+PrivateTmp=yes
+PrivateDevices=yes
+# The daemon's sockets (connecting needs write permission on the socket).
+# The EQ engine pages of appliance mode (not in this version) will add its
+# configuration and coefficient directories and state file here
+# ([appliance.camilladsp] configs_dir, coeffs_dir, statefile).
+ReadWritePaths=-/run/tessera
+ReadWritePaths=-/run/tessera-network
+UMask=0077
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

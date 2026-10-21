@@ -1,0 +1,35 @@
+[Unit]
+Description=tessera standalone network configuration and recovery
+After=network.target
+Wants=network.target
+Before=network-online.target tesserad.service tessera-web.service
+
+[Service]
+Type=exec
+User=root
+Group=tessera-web
+RuntimeDirectory=tessera-network
+RuntimeDirectoryMode=0750
+StateDirectory=tessera-network
+StateDirectoryMode=0700
+ExecStartPre=/usr/bin/tessera-network boot-recover
+ExecStart=/usr/bin/tessera-network serve
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=120s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=~CAP_SYS_TIME
+ProtectHome=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

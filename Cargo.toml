@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.2.0-beta"
+edition = "2024"
+rust-version = "1.85"
+license = "MPL-2.0"
+repository = "https://github.com/markfen88/Tessera"
+
+[workspace.dependencies]
+tessera-control-types = { path = "crates/tessera-control-types", version = "0.2.0-beta" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

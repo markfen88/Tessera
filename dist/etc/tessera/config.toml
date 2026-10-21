@@ -1,0 +1,678 @@
+# tessera configuration: every key, commented out at its default.
+#
+# Keep this file as shipped: local edits here conflict with package
+# upgrades. Put your changes in /etc/tessera/config.d/*.toml, read after
+# this file in lexical order; a later file wins. Merging: tables merge key
+# by key; plain values and plain arrays (interfaces, cpu_affinity, ...)
+# replace, except `locked` lists, which add up; [[device]] entries merge
+# by `id` (a drop-in cannot remove a device); [[bridge]] and [[flow]]
+# lists are replaced as a whole by a file that has any. The configuration
+# guide (/usr/share/doc/tessera/configuration.md where installed,
+# docs/configuration.md in the sources)
+# explains precedence, drop-ins and locks.
+#
+# Generated from the schema by `tesserad --print-default-config`.
+#
+# apply: live = can also be changed at run time (tesseractl, the web portal,
+# a network controller); the run-time value is stored in state.toml and
+# wins over the files, unless the setting is pinned with `locked`. Only
+# some settings can be pinned: in [[device]] name, sample_rate, encoding,
+# latency, rx_channels, tx_channels and the channel labels; in [clock]
+# role and priority; in [network] the primary interface. Every other key
+# has no run-time form and no lock. `tesseractl config show` prints the
+# merged files.
+# reload = takes effect on SIGHUP (systemctl reload tesserad) or
+# `tesseractl config reload`. restart = needs a daemon restart.
+# restart scope: what a change interrupts (none; the device: its flows,
+# bridges and audio clients restart; the daemon: everything). tesseractl
+# and the web portal ask for confirmation before a change that interrupts
+# something (tesseractl --yes skips the question); a reload by SIGHUP does
+# not ask.
+#
+# Unknown keys are errors: a daemon older than a key refuses the file, so
+# upgrade the daemon before using new keys.
+
+#[daemon]
+# The process: logging, file locations, shutdown, real-time scheduling.
+#
+# Log filter. Raise to debug to diagnose a problem. --log-level overrides it,
+# and the RUST_LOG environment variable overrides both (and is not changed by
+# a reload).
+# (range: error|warn|info|debug|trace or target=level,...; apply: reload;
+# restart scope: none)
+#log_level = "info"
+#
+# Where state.toml (values changed at run time, device identities) is kept.
+# (range: absolute path; apply: restart; restart scope: daemon)
+#state_dir = "/var/lib/tessera"
+#
+# Where control.sock and audio.sock are created.
+# (range: absolute path; apply: restart; restart scope: daemon)
+#runtime_dir = "/run/tessera"
+#
+# Members of this group may change settings through the control socket; others
+# may only read.
+# (range: group name; apply: reload; restart scope: none)
+#admin_group = "tessera-admin"
+#
+# Time allowed for the final state flush and shutdown. Keep the service
+# manager's stop timeout above it.
+# (unit: s; range: 1..=4294967295; apply: reload; restart scope: none)
+#shutdown_timeout_secs = 20
+#
+# Debounce window for writing state.toml after a change. Longer means fewer
+# writes on flash storage; a crash inside the window loses the change.
+# (unit: ms; range: 0..=4294967295000; apply: reload; restart scope: none)
+#persist_delay_ms = 500
+#
+# Request SCHED_FIFO priorities and lock memory as [engine] says. false never
+# does (development, containers without the capability); audio then has no
+# timing guarantees.
+# (range: true|false; apply: restart; restart scope: daemon)
+#realtime = true
+
+#[control]
+# The local control socket (`control.sock`) used by tesseractl and the web
+# portal: frame size, connection limits, timeouts, rate limits.
+#
+# Largest request or response on the control socket. Clients learn it from the
+# status. Raise it if a status with very many devices or channels is refused
+# as too large.
+# (unit: bytes; range: 65536..=4294967295; apply: reload; restart scope: none)
+#max_frame_bytes = 1048576
+#
+# Most simultaneous control connections (all users).
+# (range: >= 1; apply: reload; restart scope: none)
+#max_connections = 256
+#
+# Most control connections one user may hold, so one user cannot use up the
+# slots.
+# (range: >= 1; apply: reload; restart scope: none)
+#max_connections_per_uid = 16
+#
+# Connection slots only administrators may use, so other users cannot lock
+# them out.
+# (range: < max_connections; apply: reload; restart scope: none)
+#admin_reserved_connections = 16
+#
+# A request/response connection silent this long is closed (event subscribers
+# are exempt).
+# (unit: s; range: 1..=4294967295; apply: reload; restart scope: none)
+#idle_timeout_secs = 60
+#
+# Events queued per subscriber before the oldest are dropped (the subscriber
+# is told how many).
+# (unit: events; range: >= 1; event_queue x max_connections x event size <= 2
+# GiB; apply: reload; restart scope: none)
+#event_queue = 256
+#
+# Requests a peer may send back to back before the rate limit applies.
+# (unit: requests; range: >= 1; apply: reload; restart scope: none)
+#rate_burst = 256
+#
+# Requests per second a peer may sustain.
+# (unit: requests/s; range: >= 1; apply: reload; restart scope: none)
+#rate_per_second = 128
+#
+# Time a peer may take to finish a frame, counted from its first byte
+# (trickling bytes does not extend it).
+# (unit: s; range: 1..=4294967295; apply: reload; restart scope: none)
+#frame_timeout_secs = 10
+#
+# Time to wait for a peer that does not read its responses before closing it.
+# (unit: s; range: 1..=4294967295; apply: reload; restart scope: none)
+#write_timeout_secs = 5
+#
+# Time to wait for a stalled event subscriber before dropping it.
+# (unit: s; range: 1..=4294967295; apply: reload; restart scope: none)
+#stream_write_timeout_secs = 30
+#
+# Worker threads of the control-plane runtime (not the audio threads).
+# (range: >= 1; apply: restart; restart scope: daemon)
+#threads = 2
+#
+# Group that owns the sockets. Unset: the group tessera if it exists (a
+# warning otherwise); a group set here that cannot be applied is an error.
+# (range: group name or number; apply: restart; restart scope: daemon; unset
+# by default, example:)
+#socket_group = "tessera"
+#
+# Permission bits of control.sock and audio.sock. Write them in octal:
+# socket_mode = 416 would be a different mode, so a decimal integer is an
+# error.
+# (unit: octal; range: 0o000..=0o777, written in octal (0o660 or "660"; a
+# decimal number is refused); apply: restart; restart scope: daemon)
+#socket_mode = 0o660
+
+#[audio]
+# Audio clients on `audio.sock` (PipeWire, ALSA, JACK): how many, and how much
+# shared ring memory they may use.
+#
+# Listen on audio.sock. auto: if [backends] enabled names a client backend.
+# (range: auto|on|off; apply: restart; restart scope: daemon)
+#socket = "auto"
+#
+# Most simultaneous audio client connections. Applies to new clients.
+# (range: >= 1; apply: reload; restart scope: none)
+#max_clients = 64
+#
+# Most audio client connections one user may hold.
+# (range: >= 1; apply: reload; restart scope: none)
+#max_clients_per_uid = 8
+#
+# Client period assumed when a client does not state one; sizes its ring.
+# (unit: frames; range: 1..=max_period_frames; apply: reload; restart scope:
+# none)
+#default_period_frames = 1024
+#
+# Largest period a client may ask for.
+# (unit: frames; range: >= 1; apply: reload; restart scope: none)
+#max_period_frames = 16384
+#
+# Shared ring memory all audio clients together may reserve. Also the budget a
+# channel-count change is checked against. Keep it under RLIMIT_MEMLOCK when
+# memory is locked.
+# (unit: MiB; range: >= 1; apply: reload; restart scope: none)
+#ring_budget_mib = 256
+#
+# Largest single client ring. Many channels at long latencies need more. At
+# most ring_budget_mib.
+# (unit: MiB; range: 1..=ring_budget_mib; apply: reload; restart scope: none)
+#max_ring_mib = 64
+#
+# Extra ring capacity for packets that arrive out of order.
+# (unit: us; range: >= 0; apply: reload; restart scope: none)
+#reorder_window_us = 10000
+
+#[network]
+# Network interfaces.
+#
+# Interfaces for audio and clock; the first is the primary. Empty: the first
+# wired interface with a carrier and an IPv4 address.
+# (range: interface names; apply: reload; restart scope: device)
+#interfaces = []
+#
+# Redundancy interface (Phase 6).
+# (range: interface name; apply: reload; restart scope: device; unset by
+# default, example:)
+#secondary = "enp4s0"
+#
+# Allow Wi-Fi interfaces for media. Wi-Fi timing is poor; use it only for
+# tests.
+# (range: true|false; apply: reload; restart scope: device)
+#allow_wireless = false
+#
+# Largest media payload per packet.
+# (unit: bytes; range: 1..=65535; apply: reload; restart scope: device)
+#mtu_payload = 1400
+#
+# Values that run-time commands may not change (primary: the runtime interface
+# selection).
+# (range: primary; apply: reload; restart scope: none)
+#locked = []
+
+#[clock]
+# The PTP clock. It drives a media clock only; the system clock is never
+# steered.
+#
+# Run PTP. false leaves the media clock free-running (--no-ptp); devices then
+# cannot sync with others. Read at start only.
+# (range: true|false; apply: restart; restart scope: daemon)
+#enabled = true
+#
+# Clock role. auto: leader-capable but follower-preferred.
+# (range: follower|leader|auto; apply: live; restart scope: none)
+#role = "follower"
+#
+# Leader-election priority.
+# (range: 0..=255 (lower wins); apply: live; restart scope: none)
+#priority = 128
+#
+# PTP timestamps: hardware if the interface supports it, else software.
+# (range: auto|hardware|software; apply: reload; restart scope: none)
+#timestamping = "auto"
+#
+# Transmit while the clock is not locked.
+# (range: true|false; apply: reload; restart scope: none)
+#free_running_tx = false
+#
+# Values that run-time commands may not change.
+# (range: role, priority; apply: reload; restart scope: none)
+#locked = []
+
+#[engine]
+# The media engine's real-time threads and packet batching. These size
+# real-time structures, so they apply at the next start.
+#
+# Media worker threads.
+# (range: >= 1; apply: restart; restart scope: daemon)
+#workers = 1
+#
+# Engine tick: how often audio clients and the receive drain wake (auto:
+# 1000).
+# (unit: us; range: auto or >= 1; apply: restart; restart scope: daemon)
+#tick_us = "auto"
+#
+# SCHED_FIFO priority of the media threads.
+# (range: 1..=99; apply: restart; restart scope: daemon)
+#rt_priority = 80
+#
+# SCHED_FIFO priority of the clock thread.
+# (range: 1..=99; apply: restart; restart scope: daemon)
+#ptp_rt_priority = 70
+#
+# CPUs to pin the real-time threads to (isolated cores give the best timing).
+# (range: CPU numbers; apply: restart; restart scope: daemon)
+#cpu_affinity = []
+#
+# Lock memory once the real-time objects exist, so page faults cannot stall
+# audio.
+# (range: true|false; apply: restart; restart scope: daemon)
+#mlock = true
+#
+# Datagrams per recvmmsg call. The kernel takes at most UIO_MAXIOV (1024) per
+# call; each one is a preallocated, memory-locked buffer of one packet.
+# (unit: datagrams; range: 1..=1024 (UIO_MAXIOV); apply: restart; restart
+# scope: daemon)
+#rx_batch = 32
+#
+# Receive batches per socket per tick (bounds the work of one tick).
+# (range: >= 1; apply: restart; restart scope: daemon)
+#rx_max_batches = 8
+#
+# Datagrams per sendmmsg call. The kernel takes at most UIO_MAXIOV (1024) per
+# call.
+# (unit: datagrams; range: 1..=1024 (UIO_MAXIOV); apply: restart; restart
+# scope: daemon)
+#tx_batch = 32
+#
+# Packets per transmit flow per tick (bounds the work of one tick).
+# (unit: packets; range: >= 1; apply: restart; restart scope: daemon)
+#tx_max_per_tick = 32
+#
+# Kernel socket buffer of media sockets. Raise it if the receive-drop counters
+# grow; the sysctl ceilings (net.core.rmem_max) cap it.
+# (unit: KiB; range: 1..=2097151; apply: restart; restart scope: daemon)
+#socket_buffer_kib = 2048
+#
+# Added to the receive latency published to audio clients on top of one tick
+# (wake-up jitter allowance).
+# (unit: us; range: >= 0; apply: restart; restart scope: daemon)
+#rx_margin_us = 250
+
+#[discovery]
+# mDNS advertisement of the logical devices.
+#
+# Discovery at all. false advertises nothing whatever advertise_devices says
+# (--no-discovery). Read at start only.
+# (range: true|false; apply: restart; restart scope: daemon)
+#enabled = true
+#
+# mDNS implementation: auto uses Avahi if it is on the bus, else the built-in
+# responder.
+# (range: auto|avahi|builtin|off; apply: reload; restart scope: none)
+#mdns = "auto"
+#
+# Advertise the logical devices. Off by default: the records name control
+# ports nothing listens on yet.
+# (range: true|false; apply: reload; restart scope: none)
+#advertise_devices = false
+
+#[backends]
+# Which audio-client backends may attach, and the resampler.
+#
+# Audio-client backends that may attach.
+# (range: pipewire, alsa, jack; apply: restart; restart scope: daemon)
+#enabled = ["pipewire", "alsa"]
+#
+# Resampler quality (auto: per platform).
+# (range: off|linear|cubic|sinc-fast|sinc-hq|auto; apply: reload; restart
+# scope: none)
+#resampler = "auto"
+
+#[aes67]
+# AES67 (Phase 5).
+#
+# Enable AES67 (Phase 5).
+# (range: true|false; apply: restart; restart scope: daemon)
+#enabled = false
+
+#[defaults.flow]
+# Defaults for every [[flow]] entry (each entry can override them). Applied
+# when a flow (re)starts.
+#
+# Interval of the receiver keepalives every rx flow sends to its source (a
+# unicast transmitter stops without them); 0 disables them. PROVISIONAL.
+# (unit: ms; range: >= 0; apply: reload; restart scope: none)
+#rx_keepalive_ms = 250
+#
+# Stop an rx flow's keepalives after this long without media (they resume with
+# the next packet); 0: never stop.
+# (unit: ms; range: >= 0; apply: reload; restart scope: none)
+#rx_keepalive_timeout_ms = 10000
+#
+# What a keepalive carries: empty (a zero-length datagram, as hardware
+# receivers send) or 1337 (the bytes 13 37). PROVISIONAL.
+# (range: "empty" or "1337" (strings; the integer 1337 is accepted too);
+# apply: reload; restart scope: none)
+#rx_keepalive_payload = "empty"
+
+#[defaults.bridge]
+# Defaults for every [[bridge]] entry (each entry can override them). Two
+# waits, both only after an error, never in steady state. error_backoff*: when
+# a card is missing, busy, unplugged or keeps failing, the bridge manager (a
+# normal-priority thread) closes it and waits before reopening it, so a
+# failing card is not reopened (and its real-time thread restarted) in a tight
+# loop; the wait starts at error_backoff_min_ms and doubles up to
+# error_backoff_max_ms, and a run of 10 s resets it. error_sleep*: while the
+# card stays open, the real-time bridge thread pauses after a step that met an
+# xrun or a card error, so a card in trouble cannot make it spin (polling the
+# card cannot replace the pause: the card reports an error at once in exactly
+# those states); the pause starts at error_sleep_min_ms and doubles up to
+# error_sleep_max_ms while the trouble lasts, and the first clean step resets
+# it. Changes apply at the bridge's next error.
+#
+# Double the wait after each failed reopen. false: always wait
+# error_backoff_min_ms (there is never no wait).
+# (range: true|false; apply: reload; restart scope: none)
+#error_backoff = true
+#
+# First wait of the bridge manager before it reopens a failed card. The floor
+# of 10 ms stops a failing card being reopened (and its real-time thread
+# restarted) in a tight loop; the manager itself is a normal-priority thread.
+# (unit: ms; range: 10..=error_backoff_max_ms; apply: reload; restart scope:
+# none)
+#error_backoff_min_ms = 500
+#
+# Longest wait between reopens. Lower it to recover sooner from a card that
+# comes back.
+# (unit: ms; range: error_backoff_min_ms..=600000; apply: reload; restart
+# scope: none)
+#error_backoff_max_ms = 30000
+#
+# Double the bridge thread's pause on each further step with an xrun or card
+# error. false: always pause error_sleep_min_ms (there is never no pause). The
+# pause is the one system call the real-time bridge thread makes besides the
+# card's I/O and the clock.
+# (range: true|false; apply: reload; restart scope: none)
+#error_sleep = true
+#
+# First pause of the bridge thread after a step with an xrun or card error.
+# The floor of 1 ms keeps a card in trouble from making the real-time thread
+# spin.
+# (unit: ms; range: 1..=error_sleep_max_ms; apply: reload; restart scope:
+# none)
+#error_sleep_min_ms = 2
+#
+# Longest pause of the bridge thread while the trouble lasts. Higher values
+# use less CPU on a broken card but make an xrun recover more slowly (the card
+# is serviced again only after the pause).
+# (unit: ms; range: error_sleep_min_ms..=1000; apply: reload; restart scope:
+# none)
+#error_sleep_max_ms = 64
+
+#[[device]]
+# A logical device as it appears on the network. Several are allowed; the
+# defaults below apply to each. Values marked live can also be changed at run
+# time and are then stored in state.toml (pin them with `locked`).
+#
+# Local key of the device (not its network identity). Required. Changing it
+# makes a new device.
+# (range: letters, digits, _ and -; apply: reload; restart scope: none;
+# required, example:)
+#id = "main"
+#
+# Name on the network. Default: the host name (<host>-<id> with several
+# devices). The 31-byte limit is the wire size of the name as far as known;
+# PROVISIONAL until a capture confirms it (OQ-CFG-2).
+# (range: 1..=31 bytes, no control characters (PROVISIONAL: the size of the
+# name on the wire, OQ-CFG-2); apply: live; restart scope: none; default
+# depends on the host, typical:)
+#name = "studio-pc"
+#
+# Receive channels. Changing it restarts the device.
+# (unit: channels; range: 0..=65535 (not both 0); apply: live; restart scope:
+# device)
+#rx_channels = 2
+#
+# Transmit channels. Changing it restarts the device.
+# (unit: channels; range: 0..=65535 (not both 0); apply: live; restart scope:
+# device)
+#tx_channels = 2
+#
+# Sample rate. Changing it restarts the device.
+# (unit: Hz; range: 44100, 48000, 88200, 96000, 176400, 192000; apply: live;
+# restart scope: device)
+#sample_rate = 48000
+#
+# Bits per sample on the wire.
+# (unit: bits; range: 16, 24, 32; apply: live; restart scope: device)
+#encoding = 24
+#
+# Receive latency. Default: 4000 on x86, 10000 on ARM.
+# (unit: us; range: within latency_bounds_us; apply: live; restart scope:
+# device; default depends on the host, typical:)
+#latency_us = 4000
+#
+# Range a run-time latency change may use.
+# (unit: us; range: [min, max]; apply: reload; restart scope: none; default
+# depends on the host, typical:)
+#latency_bounds_us = [1000, 40000]
+#
+# Accept a latency below this platform's timing floor (with a warning).
+# (range: true|false; apply: reload; restart scope: none)
+#allow_unsafe_latency = false
+#
+# Values that run-time commands may not change; the configured value always
+# wins.
+# (range: name, sample_rate, encoding, latency, rx_channel_labels,
+# tx_channel_labels, rx_channels, tx_channels; apply: reload; restart scope:
+# none)
+#locked = []
+#
+# Receive channel labels (default RX n).
+# (range: { <channel> = "label" }; apply: live; restart scope: none)
+#rx_channel_labels = {}
+#
+# Transmit channel labels (default TX n).
+# (range: { <channel> = "label" }; apply: live; restart scope: none)
+#tx_channel_labels = {}
+#
+# May this device transmit multicast flows.
+# (range: true|false; apply: reload; restart scope: none)
+#multicast.allow_tx_multicast = true
+
+#[[bridge]]
+# An in-daemon ALSA hardware-card bridge: moves audio between a card and a
+# contiguous channel range of a device, compensating the card's clock drift.
+#
+# The device this bridge belongs to. Required.
+# (range: a device id; apply: reload; restart scope: device; required,
+# example:)
+#device = "main"
+#
+# The card. Required.
+# (range: ALSA PCM name; apply: reload; restart scope: device; required,
+# example:)
+#alsa_pcm = "hw:CARD=<card>,DEV=0"
+#
+# playback: network to card; capture: card to network.
+# (range: playback|capture; apply: reload; restart scope: device)
+#direction = "playback"
+#
+# Unique name. Unset: <device>-<direction>.
+# (range: letters, digits, _ and -; apply: reload; restart scope: device;
+# unset by default, example:)
+#name = "main-playback"
+#
+# false keeps the entry but leaves the card alone.
+# (range: true|false; apply: reload; restart scope: device)
+#enabled = true
+#
+# First device channel carried; card channel 1 is this one.
+# (range: >= 1; apply: reload; restart scope: device)
+#first_channel = 1
+#
+# Channels carried. Unset: the rest of the device's channels from
+# first_channel on.
+# (unit: channels; range: >= 1; apply: reload; restart scope: device; unset by
+# default, example:)
+#channels = 2
+#
+# The card's rate. Unset: follow the device.
+# (unit: Hz; range: the device's rate; apply: reload; restart scope: device;
+# unset by default, example:)
+#sample_rate = 48000
+#
+# Frames per card period. Unset: 10 ms at the device's rate.
+# (unit: frames; range: >= 1; apply: reload; restart scope: device; unset by
+# default, example:)
+#period_frames = 480
+#
+# Card buffer. Unset: four periods.
+# (unit: frames; range: >= 2 periods; apply: reload; restart scope: device;
+# unset by default, example:)
+#buffer_frames = 1920
+#
+# Resampler quality; auto takes [backends] resampler; off disables drift
+# compensation.
+# (range: off|linear|cubic|sinc-fast|sinc-hq|auto; apply: reload; restart
+# scope: device)
+#resampler = "auto"
+#
+# Time constant of the drift loop. Slow on purpose so it cannot fight a second
+# servo downstream.
+# (unit: s; range: > 0; apply: reload; restart scope: device)
+#time_constant_s = 120.0
+#
+# Largest correction the loop may apply. The ceiling is what the bridge's
+# resampler can do (its ratio range, MAX_CORRECTION in tessera-backend-alsa),
+# not a policy.
+# (unit: ppm; range: 0..=3000 (the resampler's ratio range,
+# tessera-backend-alsa MAX_CORRECTION); apply: reload; restart scope: device)
+#max_correction_ppm = 200.0
+#
+# SCHED_FIFO priority of the bridge thread.
+# (range: 0..=99 (0: normal scheduling); apply: reload; restart scope: device)
+#rt_priority = 75
+#
+# CPU to pin the bridge thread to. Unset: not pinned.
+# (range: a CPU number; apply: reload; restart scope: device; unset by
+# default, example:)
+#cpu = 2
+#
+# Override of [defaults.bridge] error_backoff for this bridge.
+# (range: true|false; apply: reload; restart scope: none; unset by default,
+# example:)
+#error_backoff = true
+#
+# Override of [defaults.bridge] error_backoff_min_ms for this bridge.
+# (unit: ms; range: 10..=error_backoff_max_ms; apply: reload; restart scope:
+# none; unset by default, example:)
+#error_backoff_min_ms = 500
+#
+# Override of [defaults.bridge] error_backoff_max_ms for this bridge.
+# (unit: ms; range: error_backoff_min_ms..=600000; apply: reload; restart
+# scope: none; unset by default, example:)
+#error_backoff_max_ms = 30000
+#
+# Override of [defaults.bridge] error_sleep for this bridge.
+# (range: true|false; apply: reload; restart scope: none; unset by default,
+# example:)
+#error_sleep = true
+#
+# Override of [defaults.bridge] error_sleep_min_ms for this bridge.
+# (unit: ms; range: 1..=error_sleep_max_ms; apply: reload; restart scope:
+# none; unset by default, example:)
+#error_sleep_min_ms = 2
+#
+# Override of [defaults.bridge] error_sleep_max_ms for this bridge.
+# (unit: ms; range: error_sleep_min_ms..=1000; apply: reload; restart scope:
+# none; unset by default, example:)
+#error_sleep_max_ms = 64
+
+#[[flow]]
+# PROVISIONAL static audio flow between two tessera instances (test
+# scaffolding until flow control exists).
+#
+# Name of the flow (local, never on the wire). Required.
+# (range: unique name; apply: reload; restart scope: device; required,
+# example:)
+#id = "rx-a"
+#
+# rx: network to device; tx: device to network. Required.
+# (range: rx|tx; apply: reload; restart scope: device; required, example:)
+#direction = "rx"
+#
+# The device the flow belongs to. Required.
+# (range: a device id; apply: reload; restart scope: device; required,
+# example:)
+#device = "main"
+#
+# tx: destination UDP port; rx: local UDP port. Required.
+# (range: 1..=65535; apply: reload; restart scope: device; required, example:)
+#port = 4321
+#
+# Device channels carried, in wire order. Empty: every channel in that
+# direction.
+# (range: device channels; apply: reload; restart scope: device)
+#channels = []
+#
+# tx: destination (required); rx: accept packets only from this address.
+# (range: IPv4 address; apply: reload; restart scope: device; unset by
+# default, example:)
+#peer = "192.0.2.10"
+#
+# Interface to use. Unset: the primary.
+# (range: interface name; apply: reload; restart scope: device; unset by
+# default, example:)
+#interface = "enp3s0"
+#
+# Local address to bind. Unset: the interface's first address.
+# (range: IPv4 address; apply: reload; restart scope: device; unset by
+# default, example:)
+#local_address = "192.0.2.20"
+#
+# Packet format (provisional).
+# (range: reference; apply: reload; restart scope: device)
+#format = "reference"
+#
+# tx: frames per packet. Unset: a packet of about 667 us, rounded to frames
+# and reduced to fit the MTU.
+# (unit: frames; range: >= 1; apply: reload; restart scope: device; unset by
+# default, example:)
+#frames_per_packet = 32
+#
+# tx: extra delay before a packet is sent.
+# (unit: us; range: >= 0; apply: reload; restart scope: device)
+#send_offset_us = 0
+#
+# rx: accept datagrams from any source (off: only from peer, so others cannot
+# inject audio).
+# (range: true|false; apply: reload; restart scope: device)
+#any_source = false
+#
+# tx: DSCP of the media packets (46, EF).
+# (range: 0..=63; apply: reload; restart scope: device)
+#dscp = 46
+#
+# tx: how late a packet may still be sent before the flow skips forward.
+# Unset: half the latency.
+# (unit: us; range: >= 1; apply: reload; restart scope: device; unset by
+# default, example:)
+#max_lag_us = 2000
+#
+# rx: override of [defaults.flow] rx_keepalive_ms.
+# (unit: ms; range: >= 0; apply: reload; restart scope: device; unset by
+# default, example:)
+#rx_keepalive_ms = 250
+#
+# rx: override of [defaults.flow] rx_keepalive_timeout_ms.
+# (unit: ms; range: >= 0; apply: reload; restart scope: device; unset by
+# default, example:)
+#rx_keepalive_timeout_ms = 10000
+#
+# rx: override of [defaults.flow] rx_keepalive_payload.
+# (range: "empty" or "1337" (strings; the integer 1337 is accepted too);
+# apply: reload; restart scope: device; unset by default, example:)
+#rx_keepalive_payload = "empty"

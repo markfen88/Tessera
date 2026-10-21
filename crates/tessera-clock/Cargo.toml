@@ -1,0 +1,36 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-clock"
+description = "PTPv1 follower/leader, servo, media clock, SW/HW timestamping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# `std` adds `std::error::Error` impls only; the sans-IO core never allocates
+# and needs no `alloc` feature.
+default = ["std"]
+std = []
+# Linux platform layer (sockets, SO_TIMESTAMPING, runner thread, overlay
+# publisher). `unsafe` lives only in `platform` (ADR 0002).
+linux = ["std", "dep:tessera-audio-ipc", "dep:socket2", "dep:nix", "dep:libc", "dep:rtrb"]
+
+[dependencies]
+# Read-only dependency: only the clock-overlay writer is used (publisher adapter).
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.0-beta", optional = true }
+socket2 = { version = "0.6", optional = true, features = ["all"] }
+nix = { version = "0.31", optional = true, default-features = false, features = ["socket", "net", "poll", "event", "time", "signal", "sched", "uio"] }
+libc = { version = "0.2", optional = true }
+rtrb = { version = "0.4", optional = true }
+
+
+[lib]
+test = false
+doctest = false

@@ -1,0 +1,61 @@
+# tessera web portal, appliance mode: the root helper that enables,
+# disables or restarts one allowlisted service. Install as
+# /usr/lib/systemd/system/tessera-web-unitfile@.service (the package does).
+#
+# The portal runs as the unprivileged user tessera-web and never names a
+# service to systemd itself: it may only start instances of this template,
+#   tessera-web-unitfile@enable-<service>.service
+#   tessera-web-unitfile@disable-<service>.service
+#   tessera-web-unitfile@restart-<service>.service
+# (the polkit rules file from `tessera-web appliance polkit` lists the exact
+# instances for the services under [[appliance.service]] in
+# /etc/tessera/web.toml). The helper re-reads web.toml, refuses anything
+# not in the allowlist, and runs one of
+#   /usr/bin/systemctl enable --now --no-reload <service>.service
+#   /usr/bin/systemctl disable --now --no-reload <service>.service
+#   /usr/bin/systemctl restart <service>.service
+# Its result is in the journal: journalctl -u 'tessera-web-unitfile@*'.
+#
+# The portal reads /etc/tessera/web.toml by default; if it runs with another
+# --config, add a drop-in here with the same path:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/tessera-web --config /path/to/web.toml appliance unitfile %i
+
+[Unit]
+Description=tessera-web appliance helper: %i
+Documentation=file:/usr/share/doc/tessera-web/examples/web.toml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/tessera-web --config /etc/tessera/web.toml appliance unitfile %i
+# Root with CAP_SYS_ADMIN: the symlinks under /etc/systemd/system are
+# written by PID 1 over D-Bus, not by this process, but PID 1 trusts a
+# caller without asking polkit only if it holds CAP_SYS_ADMIN (otherwise a
+# non-interactive enable or disable is refused). Everything else that still
+# lets systemctl talk to PID 1 over AF_UNIX.
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=yes
+ProtectHome=yes
+ProtectProc=invisible
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

@@ -1,0 +1,28 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-audio-ipc"
+description = "Shared-memory audio rings and clock overlay shared between tesserad and audio clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# ADR 0002/0003: this crate depends on nothing but nix (which wraps libc).
+nix = { version = "0.31", default-features = false, features = ["fs", "mman", "socket", "uio", "event", "time", "poll", "resource"] }
+
+[features]
+default = []
+# Test aid: make the clock-overlay reader use its 32-bit split-load path on
+# every target (it is always used on targets narrower than 64 bits).
+force-split-overlay-reads = []
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false

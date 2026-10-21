@@ -1,0 +1,53 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-backend-pipewire"
+description = "PipeWire audio backend with drift compensation"
+version.workspace = true
+edition.workspace = true
+# rubato (through tessera-resample) needs 1.87; the pipewire 0.10 crates need 1.80.
+rust-version = "1.87"
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The PipeWire glue and the `tessera-pw` binary. Not a default feature:
+# `pipewire-sys`/`libspa-sys` run bindgen against the *host* PipeWire headers,
+# which cannot work for the cross-target checks of the merge gate
+# (aarch64/armv7 without a target sysroot). Packaging builds with
+# `--features pw`; the default-feature test run drives that build itself
+# (tests/pw_gate.rs). Flip the default once the cross environment can build
+# libspa-sys.
+pw = ["dep:pipewire", "dep:zerocopy"]
+# Test aid for the PipeWire integration tests: the binary counts heap
+# allocations made inside the real-time process callbacks and reports them in
+# its final counters line (the test asserts zero).
+alloc-check = ["pw"]
+
+[dependencies]
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.0-beta" }
+tessera-control-types = { workspace = true }
+tessera-media = { path = "../tessera-media", version = "0.2.0-beta" }
+tessera-resample = { path = "../tessera-resample", version = "0.2.0-beta" }
+serde_json = "1"
+rtrb = "0.4"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
+pipewire = { version = "0.10", optional = true, features = ["v0_3_50"] }
+zerocopy = { version = "0.8", optional = true }
+
+[[bin]]
+test = false
+name = "tessera-pw"
+path = "src/main.rs"
+required-features = ["pw"]
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false

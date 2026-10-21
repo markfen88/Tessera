@@ -1,0 +1,28 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-network"
+description = "Privileged, recoverable standalone VLAN configuration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-state = { path = "../tessera-state", version = "0.2.0-beta" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+yaml-rust2 = { version = "0.13", default-features = false }
+toml = "1.1"
+getrandom = "0.4"
+nix = { version = "0.31", default-features = false, features = ["fs", "user", "socket"] }
+
+[lints]
+workspace = true
+
+
+[lib]
+test = false
+doctest = false

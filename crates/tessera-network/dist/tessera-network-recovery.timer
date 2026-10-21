@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry unfinished tessera network recovery independently of the portal
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=100ms
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

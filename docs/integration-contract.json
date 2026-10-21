@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "control_wire_version": 1,
+  "standalone_network_api": 1,
+  "features": {
+    "network_profiles_v1": {
+      "component": "tessera-web",
+      "scope": "standalone",
+      "management_ipv4": true,
+      "audio_interface_lock": true,
+      "vlan_ids": [1, 4094],
+      "confirmation_seconds": 60,
+      "apply_delay_seconds": 3,
+      "initial_guard_seconds": 180,
+      "boot_recovery_before_online": true,
+      "backends": ["networkd", "netplan"],
+      "external_network_owner": "ndimon"
+    }
+  },
+  "built_against_ndimon": null,
+  "tested_with_ndimon": []
+}

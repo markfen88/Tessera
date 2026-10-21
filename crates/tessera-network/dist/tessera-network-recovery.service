@@ -1,0 +1,14 @@
+[Unit]
+Description=Retry expired tessera network recovery
+After=tessera-network.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/tessera-network recover-expired
+TimeoutStartSec=120s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=~CAP_SYS_TIME
+ProtectHome=yes
+ProtectClock=yes
+ProtectKernelTunables=yes

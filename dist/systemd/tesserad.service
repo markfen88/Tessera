@@ -1,0 +1,90 @@
+# tessera audio-over-IP daemon, interoperable with Dante(R).
+#
+# Install as /usr/lib/systemd/system/tesserad.service. The users and groups
+# come from dist/sysusers.d/tessera.conf, the directories from
+# dist/tmpfiles.d/tessera.conf (RuntimeDirectory/StateDirectory below also
+# create them on demand).
+#
+# Reload (re-read /etc/tessera): `systemctl reload tesserad`. Type=notify-reload
+# makes systemctl wait for the daemon's RELOADING=1 ... READY=1 pair. A
+# configuration the daemon refuses keeps the old one running and is reported in
+# `systemctl status` (STATUS=reload failed ...); `systemctl reload` itself
+# still exits 0, because the daemon sends READY=1 after a failed reload.
+
+[Unit]
+Description=tessera audio-over-IP daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify-reload needs systemd 253 or newer. On older systems (Debian 12
+# has 252) use a drop-in that sets Type=notify and ExecReload=/bin/kill -HUP
+# MAINPID; the daemon works with both.
+Type=notify-reload
+ReloadSignal=SIGHUP
+NotifyAccess=main
+User=tessera
+Group=tessera
+Slice=tesseraaudio.slice
+ExecStart=/usr/bin/tesserad
+Restart=on-failure
+RestartSec=1s
+# The daemon pings only while its state thread answers.
+WatchdogSec=10s
+# Worst case of a stop: close connections (5 s), the final state flush (the
+# daemon gives up after --shutdown-timeout-secs, default 20 s), cleanup.
+# Keep this above the sum.
+TimeoutStopSec=30s
+
+# Directories (created and owned by the service manager).
+RuntimeDirectory=tessera
+RuntimeDirectoryMode=0755
+StateDirectory=tessera
+StateDirectoryMode=0750
+ConfigurationDirectory=tessera
+
+# Real-time scheduling and locked memory come from limits, not from root
+# (ADR 0004, ADR 0010). The daemon raises its soft RLIMIT_NOFILE itself.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+# No CAP_SYS_TIME, ever: the media clock is virtual and never steers
+# CLOCK_REALTIME (project rule 8). CAP_NET_RAW/CAP_NET_ADMIN would only be
+# added for hardware timestamping (SIOCSHWTSTAMP); add them with a drop-in.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SYS_NICE CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_NICE CAP_IPC_LOCK
+NoNewPrivileges=yes
+
+# Filesystem.
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+PrivateTmp=yes
+UMask=0077
+
+# Kernel and system surface.
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# RestrictRealtime must stay off: the PTP and media threads need SCHED_FIFO.
+RestrictRealtime=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Devices: ALSA cards (hardware bridge) and PTP hardware clocks only.
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+DeviceAllow=char-ptp rw
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-resample"
+description = "rubato-backed resamplers for tessera drift compensation (cubic and sinc quality levels)"
+version.workspace = true
+edition.workspace = true
+# rubato 5.0.1 requires Rust 1.87; tessera-media itself stays at the
+# workspace MSRV (1.85), which is why this lives in its own crate.
+rust-version = "1.87"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tessera-media = { path = "../tessera-media" }
+rubato = { version = "5.0.1", default-features = false }
+
+
+[lib]
+test = false
+doctest = false

@@ -1,0 +1,51 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tesserad"
+description = "tessera audio-over-IP daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+test = false
+doctest = false
+name = "tesserad"
+path = "src/lib.rs"
+
+[[bin]]
+test = false
+name = "tesserad"
+path = "src/main.rs"
+
+[features]
+default = []
+# The in-daemon ALSA hardware-card bridge (`[[bridge]]`, ADR 0007 item 4).
+# Off by default: it links libasound (the `alsa` crate runs pkg-config), so
+# a plain build and the cross-target checks need no ALSA development files.
+# Packaging builds for speakers turn it on (`--features alsa-bridge`).
+alsa-bridge = ["dep:tessera-backend-alsa"]
+# Test hooks for the bridge suites (a bridge thread that panics on request).
+# Only the bridge gate turns it on; never in a product build.
+bridge-test-hooks = ["alsa-bridge"]
+
+[dependencies]
+tessera-backend-alsa = { path = "../tessera-backend-alsa", version = "0.2.0-beta", default-features = false, features = ["bridge"], optional = true }
+tessera-control-types = { workspace = true }
+tessera-state = { path = "../tessera-state", version = "0.2.0-beta" }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.0-beta" }
+tessera-clock = { path = "../tessera-clock", version = "0.2.0-beta", features = ["linux"] }
+tessera-media = { path = "../tessera-media", version = "0.2.0-beta" }
+tessera-discovery = { path = "../tessera-discovery", version = "0.2.0-beta" }
+rtrb = "0.4"
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+nix = { version = "0.31", default-features = false, features = ["user", "resource", "fs", "socket", "time", "net", "sched", "mman"] }

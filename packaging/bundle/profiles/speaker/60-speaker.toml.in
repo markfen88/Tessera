@@ -1,0 +1,12 @@
+[[device]]
+id = "main"
+rx_channels = 2
+tx_channels = 0
+sample_rate = 48000
+
+[[bridge]]
+name = "speaker"
+device = "main"
+alsa_pcm = "@AUDIO_CARD@"
+direction = "playback"
+channels = 2

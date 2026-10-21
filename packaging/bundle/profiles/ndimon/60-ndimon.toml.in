@@ -1,0 +1,9 @@
+[[device]]
+id = "main"
+rx_channels = 2
+tx_channels = 2
+sample_rate = 48000
+encoding = 24
+
+[discovery]
+advertise_devices = false

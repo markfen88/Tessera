@@ -1,0 +1,37 @@
+tessera (0.2.0~beta-1) unstable; urgency=medium
+
+  Tessera 0.2.0-beta adds standalone management/audio VLAN configuration with
+  recoverable apply in the web portal. NDIMon remains the network owner when
+  it hosts Tessera; configure that appliance through NDIMon instead.
+
+  Back up /etc/tessera and /var/lib/tessera before upgrading. A running audio
+  daemon is not silently restarted by package installation. Restart it when
+  an audio interruption is acceptable to activate the new binary.
+
+  The following configuration migration still applies to older installations:
+
+  /etc/tessera/config.toml is now a reference file: every configuration key,
+  commented out at its default, with a short explanation. It used to be an
+  active sample. Your own settings belong in /etc/tessera/config.d/*.toml,
+  which is read after config.toml and which the package never touches.
+
+  IF YOU EDITED /etc/tessera/config.toml: move your settings into a file in
+  /etc/tessera/config.d/ (for example 50-site.toml) BEFORE you take the new
+  version at the dpkg prompt. Then it does not matter whether you take the
+  new reference or keep your file (unattended upgrades with --force-confold
+  keep it). To read the reference of the installed version, run
+  "tesserad --print-default-config"; a copy is also installed as
+  /usr/share/doc/tessera/examples/config.toml, but that file is absent on
+  images that strip /usr/share/doc.
+
+  If you never edited it, the upgrade replaces it silently and the daemon
+  behaves as before, with one exception: the old sample defined the device
+  "main" (a [[device]] entry with id = "main"). The daemon creates that
+  device by itself only while no file defines a device. If a drop-in in
+  config.d/ adds another device (id = "b") and you relied on the sample's
+  "main", then after the upgrade only "b" exists, and its default name loses
+  the "-b" suffix (a device name is visible on the network). Add a
+  [[device]] entry with id = "main" to the drop-in to keep the old device.
+  Check with: tesseractl config show
+
+ -- tessera maintainers <tessera@invalid>  Tue, 20 Oct 2026 12:00:00 +0000

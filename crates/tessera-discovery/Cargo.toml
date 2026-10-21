@@ -1,0 +1,29 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-discovery"
+description = "mDNS/DNS-SD advertisement and browsing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdns-sd = "0.21"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+thiserror = "2"
+serde = { version = "1", default-features = false }
+nix = { version = "0.31", default-features = false, features = ["net"] }
+
+
+[lib]
+test = false
+doctest = false

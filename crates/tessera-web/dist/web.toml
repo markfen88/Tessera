@@ -1,0 +1,107 @@
+# tessera web portal (tessera-web), ADR 0013. Every key is optional; the
+# values shown are the defaults.
+
+# Address and port. The default answers on this machine only. The portal
+# speaks plain HTTP: to reach it from other machines, prefer an SSH tunnel or
+# a TLS reverse proxy (then set cookie_secure = true); listening on
+# 0.0.0.0 exposes the password and the session to the network.
+#listen = "127.0.0.1:8090"
+
+# The daemon's control socket.
+#control_socket = "/run/tessera/control.sock"
+
+# Argon2id hash of the operator password, written by
+# `sudo tessera-web set-password` (root:tessera-web, 0640).
+#password_file = "/etc/tessera/web-password"
+
+# Mark the session cookie Secure (when a TLS reverse proxy is in front).
+#cookie_secure = false
+
+# A session unused for this long ends (seconds).
+#session_idle_secs = 28800
+
+# How long one request to the daemon may take (seconds).
+#daemon_timeout_secs = 5
+
+# ---- Appliance mode ---------------------------------------------------------
+# Off by default. With enabled = true, / is the Speaker page: the host's
+# vitals, the daemon's summary and one switch per service listed below
+# (enable keeps a service running across reboots; disable stops it and
+# keeps it stopped). The overview moves to /device. For a listed unit the
+# switches and the restart button start the root oneshot
+# tessera-web-unitfile@<enable|disable|restart>-<unit>.service as the
+# portal's own user; PID 1 asks polkit, and a rules file generated from this
+# list allows exactly those instances; the helper runs the systemctl
+# enable --now | disable --now | restart after checking this list again:
+#   f=$(mktemp) && tessera-web appliance polkit > "$f" \
+#     && sudo install -m 0644 -o root -g root "$f" /etc/polkit-1/rules.d/49-tessera-web-appliance.rules \
+#     && rm -f "$f"
+# See docs/web-portal.md, "Appliance mode".
+#
+#[appliance]
+#enabled = false              # true: the Speaker page is the landing page
+#hostname_label = ""          # display name on the Speaker page; default: the host name
+
+# One row per entry, in this order. `unit` names one service (`name` or
+# `name.service`); `units` names several that share one switch (status
+# "active" only if all run). Either `unit` or `units`, not both. `label` is
+# required; `description` is shown small under it (default: the unit
+# names). `essential = true` asks for confirmation before the entry is
+# disabled or restarted; tesserad and tessera-web always ask.
+#[[appliance.service]]
+#unit = "tesserad"
+#label = "Network audio"
+#description = "tesserad · interoperable with Dante®"
+#essential = true
+
+#[[appliance.service]]
+#unit = "tessera-web"
+#label = "This portal"
+
+#[[appliance.service]]
+#unit = "camilladsp"
+#label = "EQ engine"
+
+#[[appliance.service]]
+#unit = "shairport-sync"
+#label = "AirPlay"
+
+#[[appliance.service]]
+#label = "Bluetooth"
+#units = ["bluetooth", "bluealsa", "bluealsa-aplay"]   # one switch, all units
+
+# The EQ engine (CamillaDSP). The values shown are the defaults; the whole
+# table is optional. With enabled = true the Speaker page shows
+# Playing/Idle from the engine's websocket (`websocket`, plain ws://, no
+# TLS), the active configuration (`statefile`, its `config_path`), the
+# signal boost (the `gain` of the Gain filter `gain_filter` in the active
+# configuration, 0..+30 dB) and the files of `configs_dir` and `coeffs_dir`
+# (upload, activate after `<binary> -c <file>`, delete, download). The
+# portal's user must be able to write the two directories and the state
+# file: add the paths to the unit (dist/appliance-paths.conf) and the user
+# to the group owning them; see docs/web-portal.md, "EQ engine".
+# `gui_url` adds a link on the Speaker page.
+#[appliance.camilladsp]
+#enabled = false
+#websocket = "ws://127.0.0.1:1234"
+#configs_dir = "/opt/camilladsp/configs"
+#coeffs_dir = "/opt/camilladsp/coeffs"
+#statefile = "/opt/camilladsp/statefile.yml"
+#binary = "/opt/camilladsp/camilladsp"
+#gain_filter = "dashboard_signal_boost"
+#gui_url = "http://speaker.example:5005/gui/index.html"
+#max_upload_bytes = 33554432
+
+# The amplifier's volume: a hardware mixer control set with
+# `amixer -c <card> -- sset <control> <dB>dB` (not the EQ engine's volume).
+# The whole table is optional; without it there is no Volume card. `card`
+# is required (the ALSA card name or index; `aplay -l` lists them);
+# `control` is the simple mixer control (`amixer -c <card> scontrols`);
+# `min_db`..`max_db` is the range the slider offers, in 0.5 dB steps. After
+# a change the portal tries `alsactl store` (best effort; the mixer state is
+# saved at a clean shutdown by alsa-restore.service anyway).
+#[appliance.volume]
+#card = "amp"
+#control = "Digital"
+#min_db = -60
+#max_db = 0

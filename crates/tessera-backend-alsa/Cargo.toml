@@ -1,0 +1,42 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "tessera-backend-alsa"
+description = "ALSA backend: the pcm.tessera PCM plugin and the in-daemon hardware-card bridge with drift compensation"
+version.workspace = true
+edition.workspace = true
+# rubato (through tessera-resample, bridge feature) needs 1.87.
+rust-version = "1.87"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+test = false
+doctest = false
+# `cdylib`: the ALSA plugin (installed as libasound_module_pcm_tessera.so).
+# `rlib`: the bridge for the daemon, and the tests.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["plugin"]
+# The ioplug glue (`pcm.tessera`). Pure Rust FFI, no build script.
+plugin = []
+# The in-daemon hardware-card bridge. NOT linked into the plugin build
+# (`--no-default-features --features plugin`). It needs the `alsa` crate,
+# whose `alsa-sys` runs pkg-config for the host libasound, so it cannot
+# take part in the cross-target checks of the merge gate; see
+# tests/bridge_gate.rs.
+bridge = ["dep:alsa", "dep:tessera-media", "dep:tessera-resample", "dep:rtrb"]
+
+[dependencies]
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.0-beta" }
+libc = "0.2"
+nix = { version = "0.31", default-features = false, features = ["socket", "poll", "fs", "user"] }
+tessera-media = { path = "../tessera-media", version = "0.2.0-beta", optional = true }
+tessera-resample = { path = "../tessera-resample", version = "0.2.0-beta", optional = true }
+alsa = { version = "0.12", optional = true }
+rtrb = { version = "0.4", optional = true }
+
+[lints]
+workspace = true

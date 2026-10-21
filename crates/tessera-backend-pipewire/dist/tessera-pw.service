@@ -1,0 +1,66 @@
+# Sample systemd *user* unit for tessera-pw, the PipeWire client of tesserad.
+#
+# Install as ~/.config/systemd/user/tessera-pw.service (or system-wide in
+# /usr/lib/systemd/user/) and enable with:
+#
+#   systemctl --user enable --now tessera-pw.service
+#
+# On a headless box enable lingering so the user session (and PipeWire) start
+# at boot: `loginctl enable-linger <user>`.
+#
+# tessera-pw exits non-zero when PipeWire goes away, so Restart=on-failure
+# brings it back once PipeWire is up again; a SIGTERM (stop) exits with 0.
+# With BindsTo=pipewire.service below, systemd also stops this unit (SIGTERM,
+# exit 0) when PipeWire stops, and the restart then comes from WantedBy=.
+# It also survives tesserad restarts on its own (the nodes stay, silent, and
+# the client reconnects with back-off), so it needs no ordering against the
+# system service.
+
+[Unit]
+Description=tessera PipeWire client (network audio nodes, interoperable with Dante(R))
+Documentation=https://example.invalid/tessera
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+# Follow PipeWire: stopped and started with it.
+BindsTo=pipewire.service
+
+[Service]
+Type=simple
+# Add --device KEY to expose only some devices, --period / --resampler to tune
+# the graph period and the follower-mode resampler; see `tessera-pw --help`.
+# --rt-priority 20 is the default (0 opts out); --no-mlock skips mlockall.
+ExecStart=/usr/bin/tessera-pw --audio-socket /run/tessera/audio.sock --control-socket /run/tessera/control.sock
+Restart=on-failure
+RestartSec=2s
+# Real-time scheduling for the loop that triggers the PipeWire graph cycles and
+# locked memory (ADR 0004). Without the limits the client runs at normal
+# priority / unlocked and says so in its log.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+# Hardening that works in a user manager. The client only talks to PipeWire
+# (AF_UNIX in $XDG_RUNTIME_DIR) and to tesserad (AF_UNIX in /run/tessera).
+#
+# Left out on purpose (found on Ubuntu 26.04, systemd 259):
+# * ProtectKernelModules= drops CAP_SYS_MODULE from the bounding set, which a
+#   user manager cannot do: the unit then fails with status=218/CAPABILITIES.
+# * PrivateTmp=, ProtectSystem=, ProtectKernelTunables= and
+#   ProtectControlGroups= give the service a private mount namespace, which a
+#   user manager builds inside a user namespace. The service then loses its
+#   supplementary groups and can no longer open the daemon's sockets, which
+#   belong to group `tessera` (connect() fails with EACCES, no node is
+#   created).
+# What remains is checked with `systemd-run --user` and the same properties.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The control loop asks for SCHED_FIFO: RestrictRealtime must stay off.
+RestrictRealtime=no
+
+[Install]
+WantedBy=pipewire.service
