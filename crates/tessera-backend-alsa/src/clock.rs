@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use tessera_audio_ipc::{ClockOverlayReader, ClockSnapshot, monotonic_ns};
+use tessera_audio_ipc::{ClockOverlayReader, ClockSnapshot, raw_monotonic_ns};
 
 /// One reading of the media clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub struct Now {
 /// virtual one.
 pub trait Clock {
     /// The media time now, or `None` if no snapshot was ever readable.
-    /// Never blocks, allocates or makes a system call (`CLOCK_MONOTONIC` is
+    /// Never blocks, allocates or makes a system call (`CLOCK_MONOTONIC_RAW` is
     /// read through the vDSO).
     fn now(&mut self) -> Option<Now>;
 }
@@ -53,7 +53,7 @@ impl Clock for OverlayClock {
             self.last = Some(s);
         }
         let s = self.last?;
-        let mono = monotonic_ns();
+        let mono = raw_monotonic_ns();
         Some(Now {
             samples: s.media_samples_at(mono, self.rate),
             epoch: s.epoch,

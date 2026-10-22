@@ -1,6 +1,6 @@
 # Tessera documentation
 
-Tessera 0.2.0-beta is an experimental audio-over-IP runtime for Linux.
+Tessera 0.2.1 is an experimental audio-over-IP runtime for Linux.
 Start with the [README](../README.md) and [release notes](../CHANGELOG.md).
 
 | Guide | Contents |

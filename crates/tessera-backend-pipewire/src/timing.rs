@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use tessera_audio_ipc::{ClockOverlayReader, ClockSnapshot, ClockState, monotonic_ns};
+use tessera_audio_ipc::{ClockOverlayReader, ClockSnapshot, ClockState, raw_monotonic_ns};
 
-/// Converts a media time to the `CLOCK_MONOTONIC` time at which the overlay's
+/// Converts a media time to the `CLOCK_MONOTONIC_RAW` time at which the overlay's
 /// affine map reaches it (the inverse of `ClockSnapshot::media_ns_at`),
 /// saturating to `[0, u64::MAX]`.
 pub fn mono_for_media_ns(snap: &ClockSnapshot, media_ns: u64) -> u64 {
@@ -20,7 +20,7 @@ pub fn mono_for_media_ns(snap: &ClockSnapshot, media_ns: u64) -> u64 {
     (i128::from(snap.base_mono_ns) + d_mono).clamp(0, i128::from(u64::MAX)) as u64
 }
 
-/// The smallest `CLOCK_MONOTONIC` time at which media sample `sample` (at
+/// The smallest `CLOCK_MONOTONIC_RAW` time at which media sample `sample` (at
 /// `rate_hz`) has been reached.
 pub fn mono_for_media_sample(snap: &ClockSnapshot, sample: u64, rate_hz: u32) -> u64 {
     let rate = u128::from(rate_hz.max(1));
@@ -63,7 +63,7 @@ pub struct MediaNow {
     pub samples: u64,
     /// Discontinuity counter of the source.
     pub epoch: u64,
-    /// The `CLOCK_MONOTONIC` time of the reading.
+    /// The `CLOCK_MONOTONIC_RAW` time of the reading.
     pub mono_ns: u64,
 }
 
@@ -73,7 +73,7 @@ impl MediaClock {
         Self {
             rate_hz,
             source: Source::Local,
-            last: local_snapshot(monotonic_ns()),
+            last: local_snapshot(raw_monotonic_ns()),
         }
     }
 
@@ -88,7 +88,7 @@ impl MediaClock {
     /// Switches back to a local clock that continues from the current media
     /// time, so a detached node does not jump.
     pub fn use_local(&mut self) {
-        let now = monotonic_ns();
+        let now = raw_monotonic_ns();
         let media_ns = self.last.media_ns_at(now);
         let mut snap = local_snapshot(now);
         snap.base_media_ns = media_ns;
@@ -114,7 +114,7 @@ impl MediaClock {
                 self.last = s;
             }
         }
-        let mono = monotonic_ns();
+        let mono = raw_monotonic_ns();
         MediaNow {
             samples: self.last.media_samples_at(mono, self.rate_hz),
             epoch: self.last.epoch,
@@ -180,7 +180,7 @@ pub struct Fire {
     pub epoch: u64,
     /// Session generation (set by the driver).
     pub generation: u32,
-    /// `CLOCK_MONOTONIC` time at which the cycle was fired (set by the
+    /// `CLOCK_MONOTONIC_RAW` time at which the cycle was fired (set by the
     /// driver).
     pub mono_ns: u64,
 }

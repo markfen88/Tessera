@@ -239,7 +239,7 @@ Exact human-readable output may change; use `--json` for integrations.
 
 ```
 $ tesseractl status
-tessera 0.2.0-beta
+tessera 0.2.1
 
 DEVICE  NAME       RATE      BITS  LATENCY  RX  TX  LOCKED
 main    studio-pc  48000 Hz  24    6000 us  4   2   sample_rate
@@ -661,7 +661,7 @@ sudo apt install ./tessera_NEW_amd64.deb ./tessera-pw_NEW_amd64.deb
     `main`, and the daemon creates `main` by itself only while no file defines a device. If a drop-in adds another device (say
     `id = "b"`) and you relied on the sample's `main`, only `b` exists after the upgrade and its default name loses the `-b` suffix,
     which is visible on the network. Add a `[[device]]` entry with `id = "main"` to the drop-in, and check with `tesseractl config show`.
-  * Files in `config.d/` are never touched. The package also prints this in its NEWS (`apt-listchanges`). Details: `packaging/README.md`
+  * Files in `config.d/` are never touched. The package also prints this in its NEWS (`apt-listchanges`). Details: [bundle guide](bundle.md)
     in the sources.
 * An upgrade **does not restart** a running daemon (that would interrupt
   audio). The new version runs after `sudo systemctl restart tesserad`, at a

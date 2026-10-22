@@ -1,11 +1,10 @@
 # tessera web portal (ADR 0013): pages and a JSON API over the daemon's
 # control socket. Install as /usr/lib/systemd/system/tessera-web.service.
 #
-# Before the first start, set the operator password:
+# Fresh package installs initialize the password to tessera; change it with:
 #   sudo tessera-web set-password
-# The portal can change settings only if its user is also in the daemon's
-# admin group (default `tessera-admin`):
-#   sudo usermod -aG tessera-admin tessera-web && sudo systemctl restart tessera-web
+# The package adds its user to the daemon's default admin group, tessera-admin.
+# A custom daemon admin_group needs a matching membership adjustment.
 # Listening address and other settings: /etc/tessera/web.toml.
 # Appliance mode ([appliance] in web.toml) needs nothing here: the portal
 # runs plain systemctl as its own user over D-Bus (AF_UNIX below); a polkit

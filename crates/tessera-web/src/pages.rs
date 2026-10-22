@@ -180,7 +180,7 @@ pub(crate) fn hms(t: SystemTime) -> String {
 
 pub(crate) fn khz(hz: u32) -> String {
     let k = f64::from(hz) / 1000.0;
-    if hz % 1000 == 0 {
+    if hz.is_multiple_of(1000) {
         format!("{k:.0} kHz")
     } else {
         format!("{k:.1} kHz")
@@ -204,7 +204,7 @@ fn sub_class(s: &SubscriptionState) -> &'static str {
 /// The pill navigation: path and label, in order. The current page is the
 /// one whose path equals the page's `active`. Appliance mode prepends a
 /// "Speaker" entry and moves the overview ([`crate::appliance::nav`]).
-const NAV: [(&str, &str); 7] = [
+const NAV: [(&str, &str); 8] = [
     ("/", "Overview"),
     ("/devices", "Device"),
     ("/network", "Network"),
@@ -212,6 +212,7 @@ const NAV: [(&str, &str); 7] = [
     ("/metrics", "Metrics"),
     ("/events", "Events"),
     ("/config", "Config"),
+    ("/services", "Services"),
 ];
 
 /// Pages that answer `GET` besides those in [`NAV`]: where a `POST /theme`

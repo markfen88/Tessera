@@ -1,3 +1,24 @@
+tessera (0.2.1-1) unstable; urgency=medium
+
+  Shipping defaults now include and enable the Controller compatibility
+  runtime with the daemon, and enable device advertisement. The portal and
+  its Services page are included in bundles. Fresh portal installations use
+  password tessera; existing password files are never replaced. The portal's
+  service user joins tessera-admin so authenticated settings controls work
+  without a manual membership step. Existing service lists are retained.
+  Old manually installed username-based Controller instances migrate to
+  @main for the next deliberate daemon restart; installation does not stop
+  the running legacy helper.
+  A local /etc/systemd/system/tessera-controller@.service override is kept
+  and prevents automatic migration. Review/remove it before switching to
+  the packaged service. Retired/unsupported device keys do not retry.
+
+  Media scheduling now uses the raw hardware oscillator independently of
+  NTP adjustments. The local clock overlay is layout 2.0: upgrade and restart
+  the daemon, ALSA clients and PipeWire clients together.
+
+ -- tessera maintainers <tessera@invalid>  Thu, 22 Oct 2026 12:00:00 +0000
+
 tessera (0.2.0~beta-1) unstable; urgency=medium
 
   Tessera 0.2.0-beta adds standalone management/audio VLAN configuration with

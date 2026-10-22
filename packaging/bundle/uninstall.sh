@@ -6,7 +6,7 @@ root=${BUNDLE_ROOT:-/}; root=${root%/}
 DIR=$(cd "$(dirname "$0")" && pwd)
 record_dir=$root/var/lib/tessera-bundle
 record=$record_dir/record.json
-purge=0; keep=0; dry=0; yes=0; remove_dependents=0; step=parse; record_backup=
+purge=0; keep=0; dry=0; yes=0; remove_dependents=0; step=parse; record_backup=; owned_web=0
 files=(); users_modified=(); groups_created=(); users_created=(); dependencies_installed=(); packages=()
 fail() { echo "uninstall: $step: $*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
@@ -35,7 +35,9 @@ if [ -f "$record" ]; then
         users_modified) [[ $value =~ ^[a-z_][a-z0-9_-]*:(tessera|tessera-admin)$ ]] || fail 'invalid membership'; users_modified+=("$value") ;;
         groups_created) [[ $value = tessera || $value = tessera-admin ]] || fail 'invalid group'; groups_created+=("$value") ;;
         users_created) [ "$value" = tessera ] || fail 'invalid user'; users_created+=("$value") ;;
-        packages) [[ $value = tessera || $value = tessera-alsa ]] || fail 'invalid package' ;;
+        packages)
+          [[ $value = tessera || $value = tessera-alsa || $value = tessera-web ]] || fail 'invalid package'
+          [ "$value" != tessera-web ] || owned_web=1 ;;
         dependencies_installed) [[ $value =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || fail 'invalid dependency'; dependencies_installed+=("$value") ;;
         *) fail 'invalid record array' ;;
       esac
@@ -60,14 +62,15 @@ package_status() {
   [[ -n $result && $result != *[[:space:]]* ]] || return 1
   printf '%s' "$result"
 }
-for pkg in tessera-alsa tessera; do
+for pkg in tessera-web tessera-alsa tessera; do
+  [ "$pkg" != tessera-web ] || [ "$owned_web" = 1 ] || continue
   status=$(package_status "$pkg" || true)
   if [ "$status" = installed ] || { [ "$purge" = 1 ] && [ "$status" = config-files ]; }; then packages+=("$pkg"); fi
 done
 extras=()
 if [ "${#packages[@]}" -gt 0 ] && { [ "$dry" = 0 ] || [ "$EUID" = 0 ]; }; then
   simulation=$(apt-get -s remove "${packages[@]}") || fail 'apt removal simulation failed'
-  mapfile -t extras < <(printf '%s\n' "$simulation" | awk '$1 == "Remv" {name=$2; sub(/:.*/,"",name); if(name != "tessera" && name != "tessera-alsa") print $2}')
+  mapfile -t extras < <(printf '%s\n' "$simulation" | awk -v owned_web="$owned_web" '$1 == "Remv" {name=$2; sub(/:.*/,"",name); if(name != "tessera" && name != "tessera-alsa" && !(name == "tessera-web" && owned_web == 1)) print $2}')
 fi
 printf 'Plan: disable daemon; %s packages; remove recorded files; purge=%s keep-users=%s; extra removals: %s\n' "${packages[*]:-no}" "$purge" "$keep" "${extras[*]:-none}"
 [ "$dry" = 0 ] || exit 0
@@ -158,7 +161,7 @@ if [ "$purge" = 0 ] && [ -f "$record" ]; then
   temp=$(mktemp "$record_dir/record.json.XXXXXXXXXX")
   {
     printf '{\n"complete": false,\n'
-    for key in users_modified groups_created users_created dependencies_installed; do
+    for key in packages users_modified groups_created users_created dependencies_installed; do
       printf '"%s": [\n' "$key"
       declare -n values=$key
       for value in "${values[@]}"; do printf '  "%s",\n' "$value"; done | LC_ALL=C sort -u | sed '$s/,$//'

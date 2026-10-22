@@ -1,7 +1,7 @@
 //! Time representations.
 //!
 //! All times inside the sans-IO core are `u64` nanoseconds of the local
-//! monotonic clock (`CLOCK_MONOTONIC` on Linux, [`LocalNs`]) or media-clock /
+//! monotonic clock (`CLOCK_MONOTONIC_RAW` on Linux, [`LocalNs`]) or media-clock /
 //! leader nanoseconds ([`MediaNs`]). The platform layer converts kernel
 //! timestamps (`CLOCK_REALTIME` or PHC) to [`LocalNs`] before they reach the
 //! core, so the core never sees a clock that is stepped by NTP.

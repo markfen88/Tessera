@@ -29,22 +29,30 @@ NDIMon remains the network owner when it hosts Tessera. Code:
 
 ```sh
 sudo apt install ./tessera-web_<version>_<arch>.deb
-sudo tessera-web set-password                 # every page needs it; at least 8 characters
-sudo usermod -aG tessera-admin tessera-web    # only if the portal may change settings
-sudo systemctl enable --now tessera-web
+sudo tessera-web set-password                 # optional: replace the initial tessera password
 xdg-open http://127.0.0.1:8090                # or, from another machine, an SSH tunnel:
 ssh -L 8090:127.0.0.1:8090 user@device        # then open http://127.0.0.1:8090 there
 ```
 
-The package creates the user `tessera-web` (a member of group `tessera`),
+The package creates the user `tessera-web` (a member of groups `tessera` and `tessera-admin`),
 installs `/etc/tessera/web.toml` (a conffile with every key commented out) and
-the unit, and does not start the portal: on a first install it prints how to
-set the password and start it. An upgrade restarts a running portal. Purging
+the unit, enables and starts the portal on a fresh install, and initializes
+the password to **`tessera`** only if no password file exists. Upgrades preserve
+an existing password and restart a running portal. Purging
 the package deletes `web.toml` and the password file.
 
 ---
 
 ## Pages
+
+The **Services** navigation entry (`/services`) is present by default, even
+without Speaker mode. It lists the audio daemon, Controller compatibility
+(`tessera-controller@main`), portal, network configuration and Avahi discovery.
+Status, enable/disable and restart use the existing service allowlist, session,
+CSRF and essential-service confirmation checks. A configured
+`[[appliance.service]]` list replaces these defaults, including on the Services
+page. Package installation generates the matching polkit rules automatically;
+regenerate them with `tessera-web appliance polkit` after editing the list.
 
 Server-rendered HTML with forms. Status pages use a small same-origin browser
 script to read fresh HTML in the background and update values in place, without
@@ -398,7 +406,7 @@ plain confirmed re-submit is used.)
   `--config /etc/tessera/web.toml`; a portal with another `--config` needs
   a drop-in with the same path, as the template's comment shows) re-reads
   the file, refuses an instance that is malformed or names a service
-  outside the allowlist or an appliance mode that is off, and then runs
+  outside the configured service allowlist, and then runs
   exactly `systemctl enable|disable --now --no-reload <name>.service` or
   `systemctl restart <name>.service` as root, exiting with its code. The
   helper unit is hardened as far as a unit that runs `systemctl` allows:

@@ -1,0 +1,12 @@
+[package]
+name = "cmc-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone scratch tool: not part of the tessera workspace.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"

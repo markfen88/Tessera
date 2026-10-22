@@ -1,6 +1,6 @@
 #!/bin/bash
-# Native builds only. BUNDLE_DEB_DIR assembles prebuilt debs; BUNDLE_CHECK_DEB
-# selects an optional package checker. Output: target/bundle/.
+# Native guest builds only. BUNDLE_DEB_DIR assembles prebuilt debs; BUNDLE_CHECK_DEB
+# overrides the checker for isolated test fixtures. Output: target/bundle/.
 set -euo pipefail
 umask 022
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,18 +31,18 @@ if [ -z "${BUNDLE_DEB_DIR:-}" ]; then
 fi
 DEB_DIR=${BUNDLE_DEB_DIR:-$TARGET_DIR/deb}
 shopt -s nullglob
-debs=("$DEB_DIR"/tessera_*.deb "$DEB_DIR"/tessera-alsa_*.deb)
-[ "${#debs[@]}" = 2 ] || { echo 'expected exactly tessera and tessera-alsa debs' >&2; exit 1; }
+debs=("$DEB_DIR"/tessera_*.deb "$DEB_DIR"/tessera-alsa_*.deb "$DEB_DIR"/tessera-web_*.deb)
+[ "${#debs[@]}" = 3 ] || { echo 'expected exactly tessera, tessera-alsa and tessera-web debs' >&2; exit 1; }
 if [ -n "${BUNDLE_CHECK_DEB:-}" ]; then
   "$BUNDLE_CHECK_DEB" "${debs[@]}"
 else
-  for deb in "${debs[@]}"; do dpkg-deb --info "$deb" >/dev/null; done
+  bash "$ROOT/packaging/check-deb.sh" "${debs[@]}"
 fi
 version=$(dpkg-deb -f "${debs[0]}" Version)
 arch=$(dpkg-deb -f "${debs[0]}" Architecture)
 [[ $version =~ ^[0-9A-Za-z.+:~-]+$ && $arch =~ ^(amd64|arm64)$ ]] || exit 1
 [ "$bundle_os" != ubuntu ] || [ "$arch" = arm64 ] || exit 1
-# The normal build-deb path also assembles the portal; only these two debs enter the bundle.
+# The portal and core Controller runtime are part of every bundle.
 for deb in "${debs[@]}"; do
   [ "$(dpkg-deb -f "$deb" Version)" = "$version" ]
   [ "$(dpkg-deb -f "$deb" Architecture)" = "$arch" ]
@@ -107,7 +107,8 @@ json_array() { local sep='' value; printf '['; for value in "$@"; do printf '%s"
 {
   printf 'BUNDLE_NAME=tessera\nBUNDLE_VERSION=%q\nBUNDLE_ARCH=%q\nBUNDLE_BUILT=%q\nBUNDLE_COMMIT=%q\n' "$version" "$arch" "$built" "$commit"
   printf 'BUNDLE_OS_ID=%s\nBUNDLE_OS_CODENAME=%s\nBUNDLE_OS_VERSION_ID=%s\nBUNDLE_SYSTEMD_MIN=253\nBUNDLE_MIN_NDIMON=1.3.0\nBUNDLE_PROFILES="speaker ndimon"\n' "$bundle_os" "$bundle_codename" "$bundle_version_id"
-  printf 'BUNDLE_DEBS=%q\n' "debs/$(basename "${debs[0]}") debs/$(basename "${debs[1]}")"
+  bundle_debs=(); for deb in "${debs[@]}"; do bundle_debs+=("debs/$(basename "$deb")"); done
+  printf 'BUNDLE_DEBS=%q\n' "${bundle_debs[*]}"
   printf 'BUNDLE_DEB_PACKAGES=('
   for deb in "${debs[@]}"; do printf ' %q' "$(dpkg-deb -f "$deb" Package)"; done
   printf ' )\nBUNDLE_DEB_SHA256=('

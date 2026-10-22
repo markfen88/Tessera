@@ -230,29 +230,29 @@
 //! an RX ring the client reads at `now_media - effective_latency - client_offset`
 //! (ADR 0007); in a TX ring the client writes ahead of `now_media`.
 //!
-//! # Clock overlay layout (version 1.0)
+//! # Clock overlay layout (version 2.0)
 //!
 //! ```text
 //! 0x00  [u8;8]  magic = "TSRACLOK"
-//! 0x08  u32     version_major = 1
+//! 0x08  u32     version_major = 2
 //! 0x0C  u32     version_minor = 0
 //! 0x10  u64     total_len              (must equal the memfd size; sizes 128 ..= 1 MiB are accepted so later minors may append fields)
 //! 0x18  ...     reserved up to 0x40
 //! --- seqlock cache line (all u64, atomic) ---
 //! 0x40  seq              even = stable, odd = write in progress
-//! 0x48  epoch            incremented on any discontinuity (step, GM change, holdover entry)
-//! 0x50  base_mono_ns     CLOCK_MONOTONIC ns of the anchor
+//! 0x48  epoch            incremented on a discontinuity of media time (a step)
+//! 0x50  base_mono_ns     CLOCK_MONOTONIC_RAW ns of the anchor
 //! 0x58  base_media_ns    media-clock ns at the anchor
 //! 0x60  rate_ppb         i64 stored as u64; media rate offset, parts per billion
 //! 0x68  state            0 free_running, 1 listening, 2 acquiring, 3 locked, 4 holdover, 5 leader
 //! 0x70  gm_identity      grandmaster identity, big-endian number (shorter ids zero-padded)
-//! 0x78  updated_mono_ns  CLOCK_MONOTONIC ns of the last publish (liveness)
+//! 0x78  updated_mono_ns  CLOCK_MONOTONIC_RAW ns of the last publish (liveness)
 //! ```
 //!
 //! `media_ns(t) = base_media_ns + (t - base_mono_ns) * (1 + rate_ppb * 1e-9)`
 //! evaluated in 128-bit integer arithmetic, truncating the rate term toward
 //! zero and saturating to `[0, 2^64 - 1]`. Readers need only
-//! `clock_gettime(CLOCK_MONOTONIC)`.
+//! `clock_gettime(CLOCK_MONOTONIC_RAW)`.
 //!
 //! **Writer** (single): `store_relaxed(seq, s | 1)`; `atomic_thread_fence(release)`;
 //! relaxed stores of the fields; `store_release(seq, (s | 1) + 1)`.

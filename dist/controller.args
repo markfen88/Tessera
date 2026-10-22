@@ -1,0 +1,11 @@
+# Existing deployment's compatibility preset, one argument per line.
+# The vendor token selects the existing runtime's wire-format namespace.
+--vendor
+Audinate
+--flags
+080050db
+--sub-status
+00000008
+--real-props
+--gm-form
+mac

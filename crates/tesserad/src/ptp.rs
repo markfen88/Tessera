@@ -43,7 +43,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tessera_audio_ipc::{
-    ClockOverlayReader, ClockOverlayWriter, ClockSnapshot, ClockState as IpcState, monotonic_ns,
+    ClockOverlayReader, ClockOverlayWriter, ClockSnapshot, ClockState as IpcState, raw_monotonic_ns,
 };
 use tessera_clock::config::{LocalClock, PortConfig, Role};
 use tessera_clock::media_clock::{ClockPublisher, MediaClockSnapshot};
@@ -428,7 +428,7 @@ impl Domain {
         let reader =
             ClockOverlayReader::attach(writer.try_clone_fd().map_err(std::io::Error::other)?)
                 .map_err(std::io::Error::other)?;
-        let first = initial_snapshot(monotonic_ns());
+        let first = initial_snapshot(raw_monotonic_ns());
         writer.publish(&first);
         let slot = Arc::new(Mutex::new(Some(Handoff {
             writer,
@@ -526,7 +526,7 @@ impl Domain {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
             .ok_or_else(|| "the overlay writer is not available".to_owned())?;
-        let now = monotonic_ns();
+        let now = raw_monotonic_ns();
         let pc = Self::port_config(plan, &info, &handoff, now);
         let leads = !matches!(plan.role, ClockRole::Follower);
         let cont = continuation(handoff.last, handoff.fresh, leads);
@@ -576,7 +576,7 @@ impl Domain {
             if let Some(mut s) = h.last {
                 if usable_state(s.state) {
                     s.state = IpcState::Holdover;
-                    s.updated_mono_ns = monotonic_ns();
+                    s.updated_mono_ns = raw_monotonic_ns();
                     h.writer.publish(&s);
                     h.last = Some(s);
                 }
@@ -710,7 +710,9 @@ impl Domain {
         self.last_fallback = now;
         let mut g = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(h) = g.as_mut() {
-            let mut s = h.last.unwrap_or_else(|| initial_snapshot(monotonic_ns()));
+            let mut s = h
+                .last
+                .unwrap_or_else(|| initial_snapshot(raw_monotonic_ns()));
             // The mapping (anchor, rate, epoch) is kept: media time stays
             // continuous; only the state and the liveness stamp change. A
             // usable clock whose interface just went away is in holdover for a
@@ -724,7 +726,7 @@ impl Domain {
             } else {
                 IpcState::FreeRunning
             };
-            s.updated_mono_ns = monotonic_ns();
+            s.updated_mono_ns = raw_monotonic_ns();
             h.writer.publish(&s);
             h.last = Some(s);
         }
@@ -1300,7 +1302,7 @@ mod tests {
             let mut g = d.slot.lock().unwrap();
             let h = g.as_mut().unwrap();
             let mut s = snap_in(IpcState::Locked, 2);
-            s.updated_mono_ns = monotonic_ns();
+            s.updated_mono_ns = raw_monotonic_ns();
             h.writer.publish(&s);
             h.last = Some(s);
         }

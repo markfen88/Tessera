@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering, Ordering::Relaxed};
 
 use tessera_audio_ipc::{
-    ClockSnapshot, ReadReport, RingConsumer, RingProducer, SampleFormat, monotonic_ns,
+    ClockSnapshot, ReadReport, RingConsumer, RingProducer, SampleFormat, raw_monotonic_ns,
 };
 use tessera_media::{Quality, ResampleError};
 
@@ -379,7 +379,10 @@ fn clock_now(s: &mut RtSession, stats: &RtStats) -> Option<(u64, u64)> {
         }
     }
     let snap: &ClockSnapshot = s.last_clock.as_ref()?;
-    Some((snap.media_samples_at(monotonic_ns(), s.rate), snap.epoch))
+    Some((
+        snap.media_samples_at(raw_monotonic_ns(), s.rate),
+        snap.epoch,
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -436,7 +439,7 @@ fn take_cycle(cycle_rx: &mut rtrb::Consumer<Fire>, stats: &RtStats) -> Option<Fi
 fn cycle_is_current(c: &Fire, epoch_gen: u32, clock_epoch: Option<u64>) -> bool {
     c.generation == epoch_gen
         && clock_epoch == Some(c.epoch)
-        && monotonic_ns().saturating_sub(c.mono_ns) <= MAX_CYCLE_AGE_NS
+        && raw_monotonic_ns().saturating_sub(c.mono_ns) <= MAX_CYCLE_AGE_NS
 }
 
 /// The RX (network to graph, PipeWire `Audio/Source`) engine.

@@ -117,6 +117,9 @@ if [ "${NO_BUILD:-0}" != 1 ]; then
     say "tesserad features: $TESSERA_DAEMON_FEATURES"
   fi
   cargo build --release --locked "${TARGET_FLAG[@]}" -p tesserad -p tesseractl -p tessera-web -p tessera-network "${FEATURE_FLAG[@]}"
+  # Required compatibility runtime; its historical lab location is not an opt-out.
+  cargo build --release --locked --manifest-path lab/cmc-probe/Cargo.toml \
+    --target-dir "$TARGET_DIR/controller" "${TARGET_FLAG[@]}"
   if [ "${SKIP_PW:-0}" != 1 ]; then
     say "building tessera-pw (--features pw)"
     cargo build --release --locked "${TARGET_FLAG[@]}" -p tessera-backend-pipewire --features pw
@@ -243,8 +246,9 @@ License: MPL-2.0
 
 Comment: The binaries statically link Rust crates under permissive licences
  (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0, CC0 and MPL-2.0). The allowed
- set is enforced by `cargo deny check` (deny.toml); the exact crate list is
- in Cargo.lock of the source tree this package was built from.
+ set is enforced for workspace binaries by `cargo deny check` (deny.toml);
+ their exact crate list is in Cargo.lock. The separately built compatibility
+ runtime has its own dependency list in lab/cmc-probe/Cargo.lock.
 EOF
   local commit
   commit=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -258,13 +262,14 @@ EOF
 # <pkgdir> <pkg> <news file>: NEWS.Debian (shown by apt-listchanges before an upgrade). The file is a complete entry with
 # its own version and date (the package version that introduces the change, packaging/NEWS.Debian), copied as it is: an
 # entry stamped with the build's version and date would be shown again on every upgrade. The entry must not be newer
-# than the package being built. Only the tessera package gets one; the other packages do not call this.
+# than the corresponding final release (a preview may carry that release's
+# pending NEWS). Only the tessera package gets one.
 mknews() {
-  local d=$1/usr/share/doc/$2 newsver
+  local d=$1/usr/share/doc/$2 newsver news_ceiling=${DEBVER%%~g*}
   head -n1 "$3" | grep -q "^$2 ([^)]*) " || { echo "$3 must start with a changelog header line: $2 (VERSION) ..." >&2; exit 1; }
   newsver=$(head -n1 "$3" | sed 's/^[^(]*(\([^)]*\)).*/\1/')
-  dpkg --compare-versions "$newsver" le "$DEBVER" || {
-    echo "$3 is for version $newsver, newer than the version being built ($DEBVER): set its first line to the version of this release" >&2
+  dpkg --compare-versions "$newsver" le "$news_ceiling" || {
+    echo "$3 is for version $newsver, newer than release $news_ceiling (build $DEBVER): set its first line to the version of this release" >&2
     exit 1
   }
   mkdir -p "$d"
@@ -314,6 +319,16 @@ install -d "$P/usr/bin" "$P/usr/lib/systemd/system" "$P/usr/lib/sysusers.d" \
   "$P/usr/lib/tmpfiles.d" "$P/usr/lib/sysctl.d" "$P/etc/tessera/config.d" "$P/usr/share/doc/tessera/examples" \
   "$P/usr/share/man/man1" "$P/usr/share/man/man8"
 install -m 0755 "$REL/tesserad" "$REL/tesseractl" "$P/usr/bin/"
+install -m 0755 "$REL/tessera-controller-start" "$P/usr/bin/"
+install -m 0755 "$REL/tessera-controller-command" "$P/usr/bin/"
+install -d "$P/usr/lib/tessera"
+install -d "$P/usr/lib/tessera/controller-bin"
+ln -s /usr/bin/tessera-controller-command "$P/usr/lib/tessera/controller-bin/sudo"
+if [ "${#TARGET_FLAG[@]}" = 0 ]; then CONTROLLER_REL=$TARGET_DIR/controller/release;
+else CONTROLLER_REL=$TARGET_DIR/controller/$TARGET/release; fi
+install -m 0755 "$CONTROLLER_REL/cmc-probe" "$P/usr/lib/tessera/cmc-probe"
+install -m 0644 dist/controller.args "$P/usr/lib/tessera/controller.args"
+install -m 0644 dist/systemd/tessera-controller@.service "$P/usr/lib/systemd/system/"
 install -m 0644 dist/systemd/tesserad.service "$P/usr/lib/systemd/system/tesserad.service"
 install -m 0644 crates/tessera-network/dist/tesseraaudio.slice "$P/usr/lib/systemd/system/tesseraaudio.slice"
 install -m 0644 dist/sysusers.d/tessera.conf "$P/usr/lib/sysusers.d/tessera.conf"
@@ -347,6 +362,29 @@ mknews "$P" tessera packaging/NEWS.Debian
 mkdir -p "$P/DEBIAN"
 echo /etc/tessera/config.toml > "$P/DEBIAN/conffiles"
 
+cat > "$P/DEBIAN/preinst" <<'EOF'
+#!/bin/sh
+set -e
+case "$1" in
+install|upgrade)
+    # Older manual installations used the template instance as a Unix user.
+    # Capture enabled instances before dpkg replaces that template. Do not stop
+    # them: the running helper and daemon stay together until an explicit restart.
+    if [ ! -e /etc/systemd/system/tessera-controller@.service ] &&
+       [ -f /usr/lib/systemd/system/tessera-controller@.service ] &&
+       grep -qx 'User=%i' /usr/lib/systemd/system/tessera-controller@.service; then
+        install -d -m 0700 -o root -g root /var/lib/tessera-package
+        : > /var/lib/tessera-package/controller-legacy-instances
+        for unit in /etc/systemd/system/*.wants/tessera-controller@*.service; do
+            if [ -L "$unit" ]; then
+                printf '%s\n' "${unit##*/}" >> /var/lib/tessera-package/controller-legacy-instances
+            fi
+        done
+    fi
+    ;;
+esac
+exit 0
+EOF
 cat > "$P/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 # Create the tessera user and the tessera/tessera-admin groups, the
@@ -360,8 +398,40 @@ configure)
     if [ -d /run/systemd/system ]; then
         systemd-sysctl 60-tessera.conf >/dev/null 2>&1 || true
     fi
+    legacy_controller=false
+    migrated_controller=false
+    if [ -s /var/lib/tessera-package/controller-legacy-instances ]; then
+        while IFS= read -r unit; do
+            systemctl --no-reload disable "$unit"
+        done < /var/lib/tessera-package/controller-legacy-instances
+        migrated_controller=true
+        echo "tessera: legacy Controller instances migrated to @main on the next daemon restart." >&2
+    elif [ -f /var/lib/tessera-package/controller-legacy-instances ]; then
+        # A legacy template with no enabled instances was deliberately off.
+        legacy_controller=true
+    fi
+    rm -f /var/lib/tessera-package/controller-legacy-instances
+    if [ -e /etc/systemd/system/tessera-controller@.service ]; then
+        legacy_controller=true
+        echo "tessera: local Controller template overrides the packaged unit; review/remove it before switching to @main." >&2
+    fi
     if [ -x /usr/bin/deb-systemd-helper ]; then
         deb-systemd-helper unmask tesserad.service >/dev/null || true
+        for unit in /etc/systemd/system/*.wants/tessera-controller@*.service; do
+            if [ -e "$unit" ] && [ "${unit##*/}" != tessera-controller@main.service ]; then
+                legacy_controller=true
+            fi
+        done
+        if [ "$legacy_controller" = false ]; then
+            deb-systemd-helper unmask tessera-controller@.service >/dev/null || true
+            if [ "$migrated_controller" = true ] || deb-systemd-helper --quiet was-enabled tessera-controller@.service; then
+                deb-systemd-helper enable tessera-controller@.service >/dev/null || true
+            else
+                deb-systemd-helper update-state tessera-controller@.service >/dev/null || true
+            fi
+        else
+            deb-systemd-helper update-state tessera-controller@.service >/dev/null || true
+        fi
         if deb-systemd-helper --quiet was-enabled tesserad.service; then
             deb-systemd-helper enable tesserad.service >/dev/null || true
         else
@@ -372,7 +442,7 @@ configure)
         systemctl daemon-reload || true
         if [ -n "$2" ] && systemctl --quiet is-active tesserad.service 2>/dev/null; then
             echo "tessera: tesserad is running the old version; restart it when convenient:" >&2
-            echo "         systemctl restart tesserad   (a restart drops active audio flows)" >&2
+            echo "         systemctl restart tesserad   (also activates Controller compatibility; drops active audio flows)" >&2
         fi
     fi
     ;;
@@ -387,7 +457,7 @@ set -e
 case "$1" in
 remove|deconfigure)
     if [ -d /run/systemd/system ]; then
-        systemctl stop tesserad.service || true
+        systemctl stop tessera-controller@main.service tesserad.service || true
     fi
     ;;
 esac
@@ -409,9 +479,11 @@ case "$1" in
 purge)
     if [ -x /usr/bin/deb-systemd-helper ]; then
         deb-systemd-helper purge tesserad.service >/dev/null || true
+        deb-systemd-helper purge tessera-controller@.service >/dev/null || true
+        deb-systemd-helper unmask tessera-controller@.service >/dev/null || true
         deb-systemd-helper unmask tesserad.service >/dev/null || true
     fi
-    rm -rf /etc/tessera /var/lib/tessera
+    rm -rf /etc/tessera /var/lib/tessera /var/lib/tessera-package
     ;;
 esac
 if [ -d /run/systemd/system ]; then
@@ -419,12 +491,12 @@ if [ -d /run/systemd/system ]; then
 fi
 exit 0
 EOF
-chmod 0755 "$P/DEBIAN/postinst" "$P/DEBIAN/prerm" "$P/DEBIAN/postrm"
+chmod 0755 "$P/DEBIAN/preinst" "$P/DEBIAN/postinst" "$P/DEBIAN/prerm" "$P/DEBIAN/postrm"
 
 normalise "$P"
-SHL=$(shlibdeps "$P/usr/bin/tesserad" "$P/usr/bin/tesseractl")
-RECOMMENDS=avahi-daemon SUGGESTS='tessera-pw, tessera-alsa, rt-tests, linuxptp' \
-mkcontrol "$P" tessera "$SHL, systemd (>= ${SYSTEMD_MIN:-253}), init-system-helpers (>= 1.62)" \
+SHL=$(shlibdeps "$P/usr/bin/tesserad" "$P/usr/bin/tesseractl" "$P/usr/bin/tessera-controller-start" "$P/usr/lib/tessera/cmc-probe")
+SUGGESTS='tessera-pw, tessera-alsa, rt-tests, linuxptp' \
+mkcontrol "$P" tessera "$SHL, avahi-daemon, systemd (>= ${SYSTEMD_MIN:-253}), init-system-helpers (>= 1.62)" \
 "Description: tessera audio-over-IP daemon and control tool
  tesserad is a Linux daemon that makes this machine an audio-over-IP device
  on the local network: named channels, subscriptions, a PTP-synchronised
@@ -522,11 +594,17 @@ echo /etc/tessera/web.toml > "$P/DEBIAN/conffiles"
 cat > "$P/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 # Create the tessera-web user (member of group tessera) and enable the
-# service. It is not started: it needs an operator password first.
+# service. Fresh installs use the owner-selected default password.
 set -e
 case "$1" in
 configure)
     systemd-sysusers tessera.conf tessera-web.conf
+    tessera-web init-password
+    install -d -m 0755 /etc/polkit-1/rules.d
+    rules=$(mktemp /etc/polkit-1/rules.d/.tessera-web.XXXXXX)
+    tessera-web appliance polkit > "$rules"
+    chmod 0644 "$rules"
+    mv -f "$rules" /etc/polkit-1/rules.d/49-tessera-web-appliance.rules
     if [ -x /usr/bin/deb-systemd-helper ]; then
         deb-systemd-helper enable tessera-network.service tessera-network-recovery.timer >/dev/null || true
     fi
@@ -542,8 +620,7 @@ configure)
         systemctl daemon-reload || true
         if [ -z "$2" ]; then
             systemctl start tessera-network-recovery.timer || true
-            echo "tessera-web: set a password, then start the portal:" >&2
-            echo "             sudo tessera-web set-password && sudo systemctl enable --now tessera-web" >&2
+            systemctl start tessera-web.service || true
         elif systemctl --quiet is-active tessera-web.service 2>/dev/null; then
             systemctl restart tessera-web.service || true
         fi
@@ -578,7 +655,7 @@ purge)
         deb-systemd-helper purge tessera-network.service tessera-network-recovery.timer >/dev/null || true
         deb-systemd-helper unmask tessera-web.service >/dev/null || true
     fi
-    rm -f /etc/tessera/web.toml /etc/tessera/web-password
+    rm -f /etc/tessera/web.toml /etc/tessera/web-password /etc/polkit-1/rules.d/49-tessera-web-appliance.rules
     ;;
 esac
 if [ -d /run/systemd/system ]; then
@@ -589,7 +666,7 @@ EOF
 chmod 0755 "$P/DEBIAN/postinst" "$P/DEBIAN/prerm" "$P/DEBIAN/postrm"
 normalise "$P"
 SHL=$(shlibdeps "$P/usr/bin/tessera-web" "$P/usr/bin/tessera-network")
-mkcontrol "$P" tessera-web "$SHL, tessera (= $DEBVER), systemd (>= ${SYSTEMD_MIN:-253}), init-system-helpers (>= 1.62), iproute2, nftables, iputils-arping, coreutils" \
+mkcontrol "$P" tessera-web "$SHL, tessera (= $DEBVER), polkitd, systemd (>= ${SYSTEMD_MIN:-253}), init-system-helpers (>= 1.62), iproute2, nftables, iputils-arping, coreutils" \
 "Description: web portal for the tessera daemon
  tessera-web serves pages and a JSON API for a tessera device: status, the
  signal path, the network interface, device settings, subscriptions, the
@@ -597,8 +674,8 @@ mkcontrol "$P" tessera-web "$SHL, tessera (= $DEBVER), systemd (>= ${SYSTEMD_MIN
  daemon over its local control socket. Standalone VLAN configuration uses a
  separate privileged Rust helper with device-side recovery.
  .
- Every page needs the operator password (set it with
- 'tessera-web set-password'). By default it listens on 127.0.0.1:8090 only;
+ Every page needs the operator password (initially tessera on fresh installs;
+ change it with 'tessera-web set-password'). By default it listens on 127.0.0.1:8090 only;
  see /etc/tessera/web.toml."
 mkmd5 "$P"
 build_deb "$P" tessera-web

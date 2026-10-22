@@ -21,7 +21,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
-use tessera_audio_ipc::monotonic_ns;
+use tessera_audio_ipc::raw_monotonic_ns;
 use tessera_backend_alsa::bridge::{Bridge, BridgeError, ErrorSleep};
 
 use crate::rtsys;
@@ -155,7 +155,7 @@ impl<'a> LoopRunner<'a> {
             self.health.backoffs.fetch_add(1, Relaxed);
             let pause = self.health.error_sleep.get().wait(self.streak);
             let ns = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
-            rtsys::sleep_until(monotonic_ns().saturating_add(ns));
+            rtsys::sleep_until(raw_monotonic_ns().saturating_add(ns));
         } else {
             self.streak = 0;
         }

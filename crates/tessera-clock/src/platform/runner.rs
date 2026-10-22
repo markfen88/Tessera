@@ -19,7 +19,7 @@ use nix::poll::{PollFd, PollFlags, ppoll};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::time::TimeSpec;
 
-use super::clockconv::{RealtimeToMono, mono_ns};
+use super::clockconv::{RealtimeToRaw, TimestampQueue, raw_ns};
 use super::socket::{PtpSocket, Received, SocketConfig, Stamps};
 use super::status::SharedStatus;
 use super::tsinfo::{Phc, TsCaps, enable_hw_timestamping, query_ts_caps};
@@ -222,7 +222,7 @@ struct IoSink<'a, P: ClockPublisher> {
 impl<P: ClockPublisher> IoSink<'_, P> {
     fn emit(&mut self, kind: RunnerEventKind) {
         let ev = RunnerEvent {
-            at_mono_ns: mono_ns(),
+            at_mono_ns: raw_ns(),
             kind,
         };
         if self.events.push(ev).is_err() {
@@ -239,7 +239,7 @@ impl<P: ClockPublisher> ActionSink for IoSink<'_, P> {
                 data,
                 tx_token,
             } => {
-                let before = mono_ns();
+                let before = raw_ns();
                 let (sock, is_event) = match channel {
                     Channel::Event => (self.event, true),
                     Channel::General => (self.general, false),
@@ -431,11 +431,18 @@ impl<P: ClockPublisher + Send + 'static> Runner<P> {
         mut commands: rtrb::Consumer<RunnerCommand>,
     ) -> RunnerFinal {
         self.apply_thread_settings();
-        let mut port: Port<8> = Port::new(self.cfg.port, mono_ns());
-        let mut conv = RealtimeToMono::new(self.cfg.realtime_step_threshold_ns);
+        let mut port: Port<8> = Port::new(self.cfg.port, raw_ns());
+        let mut conv = RealtimeToRaw::new(self.cfg.realtime_step_threshold_ns);
+        let mut rx_queue = TimestampQueue::default();
+        let mut tx_queue = TimestampQueue::default();
         let mut tx = TxSlots::new();
         let mut dropped_events = 0u64;
         let mut buf = [0u8; 2048];
+        // Fixed buffers let us validate the clock conversion on both sides
+        // of a receive batch before any timestamp can reach the servo.
+        let mut rx_bufs = [[0u8; 2048]; RX_BATCH];
+        let mut rx_meta = [(0usize, Stamps::default()); RX_BATCH];
+        let mut tx_stamps = [None; RX_BATCH];
         let status = Arc::clone(&self.status);
         let mut hw = self.hw_active;
         let Runner {
@@ -457,7 +464,7 @@ impl<P: ClockPublisher + Send + 'static> Runner<P> {
                 events: &mut events,
                 dropped_events: &mut dropped_events,
             };
-            port.start(mono_ns(), &mut sink);
+            port.start(raw_ns(), &mut sink);
         }
         let ev_fd = event.fd();
         let gen_fd = general.fd();
@@ -465,7 +472,7 @@ impl<P: ClockPublisher + Send + 'static> Runner<P> {
         let mut deadline_stuck = false;
         while !stop.load(Ordering::Relaxed) {
             // Sleep until the next timer, a packet, an error-queue entry or a stop.
-            let now = mono_ns();
+            let now = raw_ns();
             let mut sleep = port
                 .next_deadline()
                 .map_or(cfg.max_poll_ns, |d| d.saturating_sub(now))
@@ -505,7 +512,7 @@ impl<P: ClockPublisher + Send + 'static> Runner<P> {
                 while let Ok(cmd) = commands.pop() {
                     let ok = match cmd.port_command() {
                         Some(pc) => {
-                            port.apply_command(mono_ns(), pc, &mut sink);
+                            port.apply_command(raw_ns(), pc, &mut sink);
                             true
                         }
                         None => match cmd {
@@ -533,24 +540,11 @@ impl<P: ClockPublisher + Send + 'static> Runner<P> {
                     .store(u64::from(hw), Ordering::Relaxed);
             }
 
-            let ok = conv.refresh();
-            if !ok {
-                status.realtime_steps.fetch_add(1, Ordering::Relaxed);
-            }
-            let phc_pair = if hw {
-                phc.as_ref().and_then(|p| p.read_pair().ok())
-            } else {
-                None
-            };
-            let to_mono = |s: &Stamps| -> Option<u64> {
-                if hw {
-                    if let (Some(h), Some((real_mid, phc_mid))) = (s.hardware_ns, phc_pair) {
-                        let real = i128::from(h) + i128::from(real_mid) - i128::from(phc_mid);
-                        return conv.convert(u64::try_from(real).ok()?);
-                    }
-                }
-                conv.convert(s.software_ns?)
-            };
+            let steps_before = conv.steps_detected();
+            let rejected_before = conv.calibration_rejections();
+            conv.refresh();
+            rx_queue.before_batch(&conv);
+            tx_queue.before_batch(&conv);
             let mut sink = IoSink {
                 event: &event,
                 general: &general,
@@ -560,54 +554,99 @@ impl<P: ClockPublisher + Send + 'static> Runner<P> {
                 events: &mut events,
                 dropped_events: &mut dropped_events,
             };
-            if !ok {
-                sink.emit(RunnerEventKind::RealtimeStep);
-            }
-
+            let mut nrx = 0;
+            let mut rx_drained = false;
             for _ in 0..RX_BATCH {
-                match event.recv(&mut buf, false) {
+                match event.recv(&mut rx_bufs[nrx], false) {
                     Ok(Some(Received::Data { len, stamps })) => {
-                        let rx = to_mono(&stamps);
-                        if rx.is_none() {
-                            status.rx_timestamp_missing.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let data = buf.get(..len).unwrap_or(&[]);
-                        port.handle_packet(mono_ns(), data, rx, &mut sink);
+                        rx_meta[nrx] = (len, stamps);
+                        nrx += 1;
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => {
+                        rx_drained = true;
+                        break;
+                    }
+                    Err(_) => break,
                 }
             }
+            let mut ntx = 0;
+            let mut tx_drained = false;
             for _ in 0..RX_BATCH {
                 match event.recv(&mut buf, true) {
                     Ok(Some(Received::TxStamp { id, len, stamps })) => {
                         let key = buf.get(..len).and_then(find_event_key);
                         if let Some(slot) = sink.tx.take(key, id) {
                             if let Some(tok) = slot.token {
-                                let ts = to_mono(&stamps);
-                                if ts.is_some() {
-                                    status.tx_timestamps.fetch_add(1, Ordering::Relaxed);
-                                }
-                                port.handle_tx_timestamp(mono_ns(), tok, ts, &mut sink);
+                                tx_stamps[ntx] = Some((tok, stamps));
+                                ntx += 1;
                             }
                         }
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => {
+                        tx_drained = true;
+                        break;
+                    }
+                    Err(_) => break,
                 }
+            }
+            let phc_pair = if hw {
+                phc.as_ref().and_then(|p| p.read_pair().ok())
+            } else {
+                None
+            };
+            conv.refresh();
+            let valid_rx = rx_queue.finish_batch(&conv, rx_drained);
+            let valid_tx = tx_queue.finish_batch(&conv, tx_drained);
+            let steps = conv.steps_detected() - steps_before;
+            if steps > 0 {
+                status.realtime_steps.fetch_add(steps, Ordering::Relaxed);
+                sink.emit(RunnerEventKind::RealtimeStep);
+            }
+            status.timestamp_calibration_rejections.fetch_add(
+                conv.calibration_rejections() - rejected_before,
+                Ordering::Relaxed,
+            );
+            let to_raw = |s: &Stamps, valid_batch: bool| -> Option<u64> {
+                if !valid_batch {
+                    return None;
+                }
+                if hw {
+                    if let (Some(h), Some((real_mid, phc_mid))) = (s.hardware_ns, phc_pair) {
+                        let real = i128::from(h) + i128::from(real_mid) - i128::from(phc_mid);
+                        return conv.convert(u64::try_from(real).ok()?);
+                    }
+                }
+                conv.convert(s.software_ns?)
+            };
+            for (data, &(len, stamps)) in rx_bufs.iter().zip(&rx_meta).take(nrx) {
+                let rx = to_raw(&stamps, valid_rx);
+                if rx.is_none() {
+                    status.rx_timestamp_missing.fetch_add(1, Ordering::Relaxed);
+                }
+                port.handle_packet(raw_ns(), data.get(..len).unwrap_or(&[]), rx, &mut sink);
+            }
+            for entry in tx_stamps.iter().take(ntx).flatten() {
+                let (tok, stamps) = *entry;
+                let ts = to_raw(&stamps, valid_tx);
+                if ts.is_some() {
+                    status.tx_timestamps.fetch_add(1, Ordering::Relaxed);
+                }
+                port.handle_tx_timestamp(raw_ns(), tok, ts, &mut sink);
             }
             for _ in 0..RX_BATCH {
                 match general.recv(&mut buf, false) {
                     Ok(Some(Received::Data { len, .. })) => {
                         let data = buf.get(..len).unwrap_or(&[]);
-                        port.handle_packet(mono_ns(), data, None, &mut sink);
+                        port.handle_packet(raw_ns(), data, None, &mut sink);
                     }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 }
             }
             // TX stamps that never arrived: use the send time (counted).
-            let now = mono_ns();
+            let now = raw_ns();
             while let Some(slot) = sink.tx.take_expired(now, cfg.tx_stamp_wait_ns) {
                 if let Some(tok) = slot.token {
                     status
@@ -628,7 +667,7 @@ impl<P: ClockPublisher + Send + 'static> Runner<P> {
         }
         // Graceful stop: one final overlay state (FreeRunning, mapping and
         // epoch unchanged) so clients never keep seeing a stale Locked/Leader.
-        let now = mono_ns();
+        let now = raw_ns();
         {
             let mut sink = IoSink {
                 event: &event,

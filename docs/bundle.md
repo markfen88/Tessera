@@ -34,7 +34,10 @@ sudo /root/tessera-addon/uninstall.sh --purge --yes
 ```
 
 The bundle has its own SHA256SUMS over every payload file. Installation rejects
-corruption before apt. It includes `tessera` and `tessera-alsa` only. Dependencies
+corruption before apt. It includes `tessera`, `tessera-alsa` and `tessera-web`.
+Controller compatibility is included in the core package and enabled with the
+daemon. The portal includes a Services page and initializes a fresh password
+to `tessera`; existing passwords are preserved. Dependencies
 are derived from their Debian Depends, plus `avahi-daemon` and `alsa-utils`;
 Trixie's systemd and init-system-helpers are platform prerequisites.
 
@@ -47,7 +50,7 @@ Trixie's systemd and init-system-helpers are platform prerequisites.
   an unintended ALSA route. A missing card warns, leaves the bridge reopening,
   and succeeds.
 - `ndimon`: main device, two receive and two transmit channels, 48 kHz, 24-bit,
-  device advertisement off (the default). NDIMon-R >= 1.3.0 writes its own
+  device advertisement enabled by default. NDIMon-R >= 1.3.0 writes its own
   `61-ndimon-flows.toml`; the bundle supplies no flows.
 - `none` (default): installs without adding profile files.
 - `--admin-user`: grants tessera and tessera-admin memberships; log in again.

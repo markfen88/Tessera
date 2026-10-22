@@ -300,7 +300,7 @@ fn encode_impl(
 /// [`ConvertError::OutputTooSmall`] if `dst` is too short.
 pub fn decode(fmt: WireFormat, src: &[u8], dst: &mut [i32]) -> Result<usize, ConvertError> {
     let b = fmt.bytes_per_sample();
-    if src.len() % b != 0 {
+    if !src.len().is_multiple_of(b) {
         return Err(ConvertError::Misaligned);
     }
     let n = src.len() / b;

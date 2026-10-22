@@ -318,6 +318,7 @@ pub fn build_rx(
         metrics: Arc::clone(&metrics),
         counters: Arc::clone(&counters),
         rt: Box::new(RxRt {
+            stamp_queue: Default::default(),
             key,
             device: device_ix,
             rate: p.rate,

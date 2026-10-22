@@ -15,7 +15,7 @@ use crate::memfd;
 /// `"TSRACLOK"` as bytes at offset 0.
 pub const OVERLAY_MAGIC: [u8; 8] = *b"TSRACLOK";
 /// Overlay layout major version.
-pub const OVERLAY_VERSION_MAJOR: u32 = 1;
+pub const OVERLAY_VERSION_MAJOR: u32 = 2;
 /// Overlay layout minor version.
 pub const OVERLAY_VERSION_MINOR: u32 = 0;
 /// Size of the overlay mapping in bytes.
@@ -42,7 +42,7 @@ mod off {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClockState {
-    /// Running at rate 0 against `CLOCK_MONOTONIC`, no leader.
+    /// Running at rate 0 against `CLOCK_MONOTONIC_RAW`, no leader.
     FreeRunning,
     /// Listening for a leader.
     Listening,
@@ -89,21 +89,21 @@ impl ClockState {
 /// `media_ns(t) = base_media_ns + (t - base_mono_ns) * (1 + rate_ppb * 1e-9)`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockSnapshot {
-    /// Incremented on any discontinuity (step, grandmaster change, holdover
-    /// entry); consumers re-anchor when it changes.
+    /// Incremented on a discontinuity of media time; consumers re-anchor
+    /// when it changes. Continuous state or grandmaster changes keep it.
     pub epoch: u64,
-    /// `CLOCK_MONOTONIC` nanoseconds of the anchor point.
+    /// `CLOCK_MONOTONIC_RAW` nanoseconds of the anchor point (layout 2).
     pub base_mono_ns: u64,
     /// Media-clock nanoseconds at the anchor point.
     pub base_media_ns: u64,
-    /// Rate offset against `CLOCK_MONOTONIC` in parts per billion.
+    /// Rate offset against `CLOCK_MONOTONIC_RAW` in parts per billion.
     pub rate_ppb: i64,
     /// Clock state.
     pub state: ClockState,
     /// Grandmaster identity as a big-endian number (8 bytes; shorter
     /// identities are zero-padded on the left).
     pub gm_identity: u64,
-    /// `CLOCK_MONOTONIC` nanoseconds when the writer last published
+    /// `CLOCK_MONOTONIC_RAW` nanoseconds when the writer last published
     /// (liveness indicator).
     pub updated_mono_ns: u64,
 }
@@ -129,7 +129,19 @@ impl ClockSnapshot {
 
 /// Reads `CLOCK_MONOTONIC` in nanoseconds (vDSO; no real syscall).
 pub fn monotonic_ns() -> u64 {
-    match clock_gettime(ClockId::CLOCK_MONOTONIC) {
+    clock_ns(ClockId::CLOCK_MONOTONIC)
+}
+
+/// Reads the unslewed hardware timebase used by layout-2 media clocks.
+/// Unlike `CLOCK_MONOTONIC`, its speed is independent of NTP adjustments.
+/// This clock also stops during suspend; wall time is never used to advance
+/// audio through a suspended interval.
+pub fn raw_monotonic_ns() -> u64 {
+    clock_ns(ClockId::CLOCK_MONOTONIC_RAW)
+}
+
+fn clock_ns(id: ClockId) -> u64 {
+    match clock_gettime(id) {
         Ok(ts) => (ts.tv_sec() as u64)
             .saturating_mul(1_000_000_000)
             .saturating_add(ts.tv_nsec() as u64),
@@ -432,10 +444,10 @@ impl ClockOverlayReader {
     }
 
     /// Current media time in nanoseconds: one seqlock read plus
-    /// `clock_gettime(CLOCK_MONOTONIC)`.
+    /// `clock_gettime(CLOCK_MONOTONIC_RAW)`.
     pub fn now_media_ns(&self) -> Result<u64, OverlayError> {
         let s = self.read()?;
-        Ok(s.media_ns_at(monotonic_ns()))
+        Ok(s.media_ns_at(raw_monotonic_ns()))
     }
 }
 
@@ -469,6 +481,32 @@ mod tests {
             w.publish(&snap(k));
             assert_eq!(r.read().unwrap(), snap(k));
         }
+    }
+
+    #[test]
+    fn legacy_monotonic_overlay_is_rejected_before_reading_a_raw_clock() {
+        let w = ClockOverlayWriter::create().unwrap();
+        w.map.u32s(off::VERSION_MAJOR, 1)[0].store(1, Ordering::Relaxed);
+        let error = ClockOverlayReader::attach(w.try_clone_fd().unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported overlay layout version")
+        );
+    }
+
+    #[test]
+    fn now_media_ns_uses_the_raw_timebase() {
+        let (mut w, r) = pair();
+        let raw = raw_monotonic_ns();
+        w.publish(&ClockSnapshot {
+            base_mono_ns: raw,
+            base_media_ns: 10_000_000_000,
+            updated_mono_ns: raw,
+            ..snap(0)
+        });
+        let media = r.now_media_ns().unwrap();
+        assert!((10_000_000_000..10_050_000_000).contains(&media));
     }
 
     #[test]
