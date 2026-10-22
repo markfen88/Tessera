@@ -778,12 +778,12 @@ pub const KEYS: &[KeySpec] = &[
     k!(
         "discovery",
         "advertise_devices",
-        Value("false"),
+        Value("true"),
         "",
         "true|false",
         Reload,
         NONE,
-        "Advertise the logical devices. Off by default: the records name control ports nothing listens on yet."
+        "Advertise the logical devices. Enabled by default with the packaged Controller compatibility runtime."
     ),
     // [backends]
     k!(

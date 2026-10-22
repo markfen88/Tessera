@@ -209,7 +209,7 @@ mlock = true                       # mlockall after start-up; a refusal is repor
 
 [discovery]
 mdns = "auto"                      # auto | avahi | builtin | off
-advertise_devices = false          # advertise the devices with mDNS (off until ARC/CMC have a listener; when on, the daemon warns about advertised ports nobody listens on)
+advertise_devices = true           # advertise devices with mDNS; the packaged Controller runtime serves the advertised ports
 
 [backends]
 enabled = ["pipewire", "alsa"]     # clients meant to attach; today only "empty = no audio.sock" (with `[audio] socket = "auto"`) is enforced
@@ -596,7 +596,7 @@ What is applied live (reload, `tesseractl`, the portal) and what needs a restart
   override them ("`tesserad` command line" above).
 * **Real-time scheduling is requested, never silently missing.** If `SCHED_FIFO`, the CPU pin or `mlockall` is refused the daemon logs a warning at
   start and reports it in `tesseractl metrics` (`engine.rt_degraded`, `engine.mlock_failed`).
-* **Discovery.** Off unless `[discovery] advertise_devices = true`: the records carry ARC, CMC and flow ports that nothing listens on yet, so a controller that found the device could not talk to it. When on, each device is advertised with `tessera-discovery` (ARC, CMC and one channel record per transmit channel; a renamed channel gets its factory record and a friendly record) by the backend `[discovery] mdns` selects, and withdrawn (goodbye packets) when the daemon stops. The records and their ports are provisional . While the ARC, CMC and flow-control protocols are not served by the daemon, it logs a warning once per advertised port that no socket is bound to on the wildcard address or a media interface's current address (and an info line when a listener appears): a separate process may answer for it, so this never stops the advertisement. See `troubleshooting.md`.
+* **Discovery.** Enabled by default; set `[discovery] advertise_devices = false` to disable device records. Each device is advertised with `tessera-discovery` (ARC, CMC and one channel record per transmit channel; a renamed channel gets its factory record and a friendly record) by the backend `[discovery] mdns` selects, and withdrawn (goodbye packets) when the daemon stops. The packaged Controller compatibility runtime serves the first logical device's base control ports; additional logical devices' offset control ports remain unsupported. The daemon logs a warning once per advertised port that no socket is bound to on the wildcard address or a media interface's current address (and an info line when a listener appears). A separate process may answer for it, so this never stops the advertisement. See `troubleshooting.md`.
 * **Socket buffers.** Each media socket asks for `[engine] socket_buffer_kib` (2048) KiB. The unit has no `CAP_NET_ADMIN`, so the kernel caps the request at
   `net.core.rmem_max` / `wmem_max` (about 208 KiB by default); `dist/sysctl.d/tessera.conf` raises them to 8 MiB; the `tessera` package installs it as `/usr/lib/sysctl.d/60-tessera.conf` and applies it in the postinst (from a source tree: `sudo install -m 0644 dist/sysctl.d/tessera.conf /etc/sysctl.d/` and `sudo sysctl --system`). The daemon logs the effective size
   of every socket, warns when it was capped, and reports the smallest one and the number of capped sockets in `tesseractl metrics`
@@ -798,7 +798,7 @@ mDNS advertisement of the logical devices.
 |---|---|---|---|---|---|---|---|
 | `enabled` | boolean | `true` |  | true\|false | restart | daemon | Discovery at all. false advertises nothing whatever advertise_devices says (--no-discovery). Read at start only. |
 | `mdns` | string | `"auto"` |  | auto\|avahi\|builtin\|off | reload | none | mDNS implementation: auto uses Avahi if it is on the bus, else the built-in responder. |
-| `advertise_devices` | boolean | `false` |  | true\|false | reload | none | Advertise the logical devices. Off by default: the records name control ports nothing listens on yet. |
+| `advertise_devices` | boolean | `true` |  | true\|false | reload | none | Advertise the logical devices. Enabled by default with the packaged Controller compatibility runtime. |
 
 #### `[backends]`
 

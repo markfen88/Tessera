@@ -35,6 +35,25 @@ pub async fn root() -> Response {
     Redirect::to("/speaker").into_response()
 }
 
+/// `GET /services`: core services are visible without enabling Speaker mode.
+pub async fn services_page(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    let (token, s) = match need(&st, &headers) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let a = st.appliance.as_ref().unwrap_or(&st.service_manager);
+    let rows = services::query_all(&*a.runner, &a.config).await;
+    let body = html! { div.grid { (services_card(&rows, &s.csrf, "/services")) } };
+    layout(
+        &view("Services", "/services").every(REFRESH),
+        &Chrome::of(&st, &headers),
+        Some(&s),
+        crate::pages::live_flash(&st, &token, &headers),
+        &body,
+    )
+    .into_response()
+}
+
 /// `GET /speaker`.
 pub async fn speaker(State(st): State<Shared>, headers: HeaderMap) -> Response {
     let (token, s) = match need(&st, &headers) {
@@ -87,7 +106,7 @@ pub async fn speaker(State(st): State<Shared>, headers: HeaderMap) -> Response {
             @if let (Some(v), Some(cur)) = (a.config.volume.as_ref(), vol.as_ref()) {
                 (volume::card(v, cur, &s.csrf))
             }
-            (services_card(&rows, &s.csrf))
+            (services_card(&rows, &s.csrf, "/speaker/services"))
             (sources_card(&status, bluetooth.as_ref(), eq.as_ref(), &s.csrf))
             @if let Some(eq) = eq.as_ref() {
                 (files::card(&a.config.camilladsp, &eq.active, &eq.configs, &eq.coeffs, &s.csrf))
@@ -184,7 +203,7 @@ fn hero(
     }
 }
 
-fn services_card(rows: &[Row], csrf: &str) -> Markup {
+fn services_card(rows: &[Row], csrf: &str, target: &str) -> Markup {
     html! {
         section.card.c6 id="services" {
             h2 { "Services " span.n { "enable keeps a service running across reboots" } }
@@ -192,14 +211,14 @@ fn services_card(rows: &[Row], csrf: &str) -> Markup {
                 p.muted { "No services are configured: add " code { "[[appliance.service]]" } " entries to " code { "web.toml" } "." }
             } @else {
                 div.rows {
-                    @for r in rows { (service_row(r, csrf)) }
+                    @for r in rows { (service_row(r, csrf, target)) }
                 }
             }
         }
     }
 }
 
-fn service_row(r: &Row, csrf: &str) -> Markup {
+fn service_row(r: &Row, csrf: &str, target: &str) -> Markup {
     let e = &r.entry;
     let key = e.key();
     let on = r.on();
@@ -215,7 +234,7 @@ fn service_row(r: &Row, csrf: &str) -> Markup {
                 // A static unit has no boot state to switch.
                 span.muted title="static: started by what needs it, no switch" { "static" }
             } @else {
-                form method="post" action="/speaker/services" {
+                form method="post" action=(target) {
                     input type="hidden" name="csrf" value=(csrf);
                     input type="hidden" name="unit" value=(key);
                     input type="hidden" name="action" value=(action.name());
@@ -237,7 +256,7 @@ fn service_row(r: &Row, csrf: &str) -> Markup {
                 span {}
             }
             @if r.restartable() {
-                form method="post" action="/speaker/services" {
+                form method="post" action=(target) {
                     input type="hidden" name="csrf" value=(csrf);
                     input type="hidden" name="unit" value=(key);
                     input type="hidden" name="action" value="restart";
@@ -383,12 +402,44 @@ pub async fn services(
     headers: HeaderMap,
     Form(f): Form<ServiceForm>,
 ) -> Response {
+    service_action(st, headers, f, false).await
+}
+
+/// `POST /services`: the same allowlist, authentication and confirmations.
+pub async fn services_post(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Form(f): Form<ServiceForm>,
+) -> Response {
+    service_action(st, headers, f, true).await
+}
+
+async fn service_action(
+    st: Shared,
+    headers: HeaderMap,
+    f: ServiceForm,
+    standalone: bool,
+) -> Response {
     let (token, s) = match need_post(&st, &headers, &f.csrf) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let Some(a) = st.appliance.as_ref() else {
+    let a = if standalone {
+        st.appliance.as_ref().unwrap_or(&st.service_manager)
+    } else if let Some(a) = st.appliance.as_ref() {
+        a
+    } else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let target = if standalone {
+        "/services"
+    } else {
+        "/speaker/services"
+    };
+    let anchor = if standalone {
+        "/services#services"
+    } else {
+        SERVICES_ANCHOR
     };
     // The allowlist decides before anything is run. The refused value is
     // untrusted input: logged quoted, never raw.
@@ -401,7 +452,7 @@ pub async fn services(
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
     if entry.essential && action.asks_when_essential() && f.confirm != "yes" {
-        return confirm_page(&st, &headers, &s, entry, action);
+        return confirm_page(&st, &headers, &s, entry, action, target, anchor);
     }
     // The current state decides which units of a group a switch touches
     // (static ones are left alone); one more read, no privilege.
@@ -439,7 +490,7 @@ pub async fn services(
         Ok(()) => st.set_flash(&token, true, format!("{} {}.", entry.label, action.done())),
         Err(m) => st.set_flash(&token, false, m),
     }
-    Redirect::to(SERVICES_ANCHOR).into_response()
+    Redirect::to(anchor).into_response()
 }
 
 /// The confirmation page for disabling or restarting an essential entry.
@@ -449,6 +500,8 @@ fn confirm_page(
     s: &Session,
     e: &ServiceEntry,
     action: Action,
+    target: &str,
+    anchor: &str,
 ) -> Response {
     let (gerund, does, button) = match action {
         Action::Disable => (
@@ -466,14 +519,14 @@ fn confirm_page(
                 " " (essential_warning(e, action))
             }
             p { "Units: " code { (e.canonical_units().join(" ")) } }
-            form method="post" action="/speaker/services" {
+            form method="post" action=(target) {
                 input type="hidden" name="csrf" value=(s.csrf);
                 input type="hidden" name="unit" value=(e.key());
                 input type="hidden" name="action" value=(action.name());
                 input type="hidden" name="confirm" value="yes";
                 button.btn.danger type="submit" { (button) " " (e.label) }
                 " "
-                a href=(SERVICES_ANCHOR) { "Cancel" }
+                a href=(anchor) { "Cancel" }
             }
             p.muted { "Cancel changes nothing." }
         }
@@ -481,7 +534,14 @@ fn confirm_page(
     (
         StatusCode::OK,
         layout(
-            &view("Confirm the change", "/speaker"),
+            &view(
+                "Confirm the change",
+                if target == "/services" {
+                    "/services"
+                } else {
+                    "/speaker"
+                },
+            ),
             &Chrome::of(st, headers),
             Some(s),
             None,

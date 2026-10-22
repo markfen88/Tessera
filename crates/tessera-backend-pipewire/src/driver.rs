@@ -15,7 +15,7 @@ use crate::timing::{Decision, Fire, Lead, MediaClock, Scheduler};
 pub enum Tick {
     /// Trigger a graph cycle now (the position is already published).
     Fire(Fire),
-    /// Look again at this `CLOCK_MONOTONIC` time (ns).
+    /// Look again at this `CLOCK_MONOTONIC_RAW` time (ns).
     Wait {
         /// Monotonic time of the next check.
         mono_ns: u64,

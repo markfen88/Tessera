@@ -1,0 +1,47 @@
+[Unit]
+Description=Tessera Controller compatibility (%i)
+Requires=tesserad.service
+Wants=network-online.target avahi-daemon.service
+After=network-online.target tesserad.service avahi-daemon.service
+PartOf=tesserad.service
+
+[Service]
+Type=simple
+User=tessera
+Group=tessera
+SupplementaryGroups=tessera-admin
+Environment=PATH=/usr/lib/tessera/controller-bin:/usr/bin:/bin
+StateDirectory=tessera-controller
+WorkingDirectory=/var/lib/tessera-controller
+ExecStart=/usr/bin/tessera-controller-start %i
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/tessera
+ReadWritePaths=/etc/tessera/config.d/90-probe-flows.toml
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=tesserad.service
+DefaultInstance=main

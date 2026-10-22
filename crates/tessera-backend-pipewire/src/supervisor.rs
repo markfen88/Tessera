@@ -20,7 +20,7 @@ use pipewire as pw;
 use pw::loop_::{IoSource, Signal, TimerSource};
 use pw::main_loop::MainLoopRc;
 use pw::spa::support::system::IoFlags;
-use tessera_audio_ipc::{Direction, WakeWait, monotonic_ns};
+use tessera_audio_ipc::{Direction, WakeWait, raw_monotonic_ns};
 
 use crate::backoff::Backoff;
 use crate::config::Config;
@@ -150,7 +150,7 @@ impl Node {
             }
             Tick::Wait { mono_ns } => mono_ns,
         };
-        let wait = Duration::from_nanos(wake.saturating_sub(monotonic_ns()));
+        let wait = Duration::from_nanos(wake.saturating_sub(raw_monotonic_ns()));
         arm(&self.tick_timer, wait.min(MAX_WAIT));
     }
 
@@ -358,7 +358,7 @@ impl Node {
                             .filter(|snap| {
                                 !stale.is_zero()
                                     && a.since.elapsed() >= stale
-                                    && monotonic_ns().saturating_sub(snap.updated_mono_ns)
+                                    && raw_monotonic_ns().saturating_sub(snap.updated_mono_ns)
                                         > stale.as_nanos() as u64
                             })
                             .map(|_| "the clock overlay stopped updating (hung daemon)".to_string())

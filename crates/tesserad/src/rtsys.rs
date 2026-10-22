@@ -10,20 +10,33 @@
 use nix::sys::mman::{MlockAllFlags, mlockall};
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, ClockNanosleepFlags, clock_nanosleep};
+use tessera_audio_ipc::{monotonic_ns, raw_monotonic_ns};
 
-/// Sleep until the absolute `CLOCK_MONOTONIC` time `mono_ns` (returns at once
-/// if it is already past). Interrupted sleeps resume towards the same
-/// deadline.
-pub fn sleep_until(mono_ns: u64) {
-    let ts = TimeSpec::new(
-        i64::try_from(mono_ns / 1_000_000_000).unwrap_or(i64::MAX) as _,
-        (mono_ns % 1_000_000_000) as _,
-    );
-    while let Err(nix::errno::Errno::EINTR) = clock_nanosleep(
-        ClockId::CLOCK_MONOTONIC,
-        ClockNanosleepFlags::TIMER_ABSTIME,
-        &ts,
-    ) {}
+/// Sleep until a raw media-clock deadline. Linux cannot sleep on
+/// `CLOCK_MONOTONIC_RAW`: translate a short deadline at each arm, then
+/// recheck raw time after waking. NTP cannot change the media deadline or
+/// make an early timer fire an audio tick early.
+pub fn sleep_until(raw_deadline: u64) {
+    loop {
+        let r1 = raw_monotonic_ns();
+        if r1 >= raw_deadline {
+            return;
+        }
+        let mono = monotonic_ns();
+        let r2 = raw_monotonic_ns();
+        let raw_mid = r1 + r2.saturating_sub(r1) / 2;
+        let wait = raw_deadline.saturating_sub(raw_mid).min(100_000_000);
+        let target = mono.saturating_add(wait);
+        let ts = TimeSpec::new(
+            i64::try_from(target / 1_000_000_000).unwrap_or(i64::MAX) as _,
+            (target % 1_000_000_000) as _,
+        );
+        let _ = clock_nanosleep(
+            ClockId::CLOCK_MONOTONIC,
+            ClockNanosleepFlags::TIMER_ABSTIME,
+            &ts,
+        );
+    }
 }
 
 /// `SCHED_FIFO` at `prio` for the calling thread. `false` if refused.
@@ -65,23 +78,22 @@ pub fn prefault_stack() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_audio_ipc::monotonic_ns;
 
     #[test]
     fn sleeping_to_an_absolute_deadline_neither_returns_early_nor_hangs() {
-        let target = monotonic_ns() + 5_000_000;
+        let target = raw_monotonic_ns() + 5_000_000;
         sleep_until(target);
-        let now = monotonic_ns();
+        let now = raw_monotonic_ns();
         assert!(now >= target, "woke {} ns early", target - now);
         assert!(
             now < target + 200_000_000,
             "woke {} ms late",
             (now - target) / 1_000_000
         );
-        let t = monotonic_ns();
+        let t = raw_monotonic_ns();
         sleep_until(t.saturating_sub(1_000_000));
         assert!(
-            monotonic_ns() - t < 50_000_000,
+            raw_monotonic_ns() - t < 50_000_000,
             "a past deadline returns at once"
         );
     }

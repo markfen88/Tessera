@@ -64,6 +64,8 @@ pub struct AppState {
     pub host: Mutex<Option<String>>,
     /// Appliance mode, when `[appliance] enabled = true`.
     pub appliance: Option<Arc<appliance::Appliance>>,
+    /// Core service controls, also available outside appliance mode.
+    pub service_manager: Arc<appliance::Appliance>,
     /// Standalone host networking, kept outside the audio daemon's privileges.
     pub network: Arc<dyn network_profiles::Backend>,
     /// Per-session browser drafts; no host changes until explicitly applied.
@@ -102,6 +104,10 @@ impl AppState {
             flash: Mutex::new(HashMap::new()),
             host: Mutex::new(None),
             appliance: None,
+            service_manager: Arc::new(appliance::Appliance::new(
+                config::WebConfig::default().services_config(),
+                Arc::new(appliance::services::ProcessRunner),
+            )),
             network: Arc::new(network_profiles::SocketBackend),
             network_drafts: Mutex::new(HashMap::new()),
         }
@@ -111,6 +117,13 @@ impl AppState {
     #[must_use]
     pub fn with_appliance(mut self, a: appliance::Appliance) -> Self {
         self.appliance = Some(Arc::new(a));
+        self
+    }
+
+    /// Configure the Services page independently of the Speaker landing page.
+    #[must_use]
+    pub fn with_services(mut self, a: appliance::Appliance) -> Self {
+        self.service_manager = Arc::new(a);
         self
     }
 
@@ -154,40 +167,44 @@ pub fn router(state: Shared) -> Router {
         Some(a) => appliance::routes(&a.config),
         None => Router::new().route("/", get(pages::overview)),
     };
-    root.route("/login", get(pages::login_form).post(pages::login))
-        .route("/logout", post(pages::logout))
-        .route("/network", get(pages::network))
-        .route("/network/primary", post(pages::set_primary))
-        .route("/network/profiles/edit", post(network_profiles::edit))
-        .route("/network/profiles/preview", post(network_profiles::preview))
-        .route("/network/profiles/apply", post(network_profiles::apply))
-        .route("/network/pending/{token}", get(network_profiles::pending))
-        .route(
-            "/network/pending/{token}/{action}",
-            post(network_profiles::finish),
-        )
-        .route("/devices", get(pages::devices))
-        .route("/devices/{key}/settings", post(pages::device_settings))
-        .route("/devices/{key}/channels", post(pages::device_channels))
-        .route("/confirm", post(pages::confirm))
-        .route("/devices/{key}/label", post(pages::device_label))
-        .route("/devices/{key}/subscribe", post(pages::subscribe))
-        .route("/devices/{key}/unsubscribe", post(pages::unsubscribe))
-        .route("/clock", get(pages::clock).post(pages::clock_settings))
-        .route("/metrics", get(pages::metrics))
-        .route("/events", get(pages::events))
-        .route("/config", get(pages::config))
-        .route("/config/reload", post(pages::reload))
-        .route("/theme", post(theme::set_theme))
-        .route("/assets/{hash}/style.css", get(theme::stylesheet_immutable))
-        .route("/style.css", get(theme::stylesheet))
-        .route("/live.js", get(live::script))
-        .route("/static/style.css", get(theme::stylesheet))
-        .nest("/api/v1", api::routes())
-        .fallback(pages::not_found)
-        .layer(middleware::from_fn(same_origin))
-        .layer(middleware::from_fn(security_headers))
-        .with_state(state)
+    root.route(
+        "/services",
+        get(appliance::pages::services_page).post(appliance::pages::services_post),
+    )
+    .route("/login", get(pages::login_form).post(pages::login))
+    .route("/logout", post(pages::logout))
+    .route("/network", get(pages::network))
+    .route("/network/primary", post(pages::set_primary))
+    .route("/network/profiles/edit", post(network_profiles::edit))
+    .route("/network/profiles/preview", post(network_profiles::preview))
+    .route("/network/profiles/apply", post(network_profiles::apply))
+    .route("/network/pending/{token}", get(network_profiles::pending))
+    .route(
+        "/network/pending/{token}/{action}",
+        post(network_profiles::finish),
+    )
+    .route("/devices", get(pages::devices))
+    .route("/devices/{key}/settings", post(pages::device_settings))
+    .route("/devices/{key}/channels", post(pages::device_channels))
+    .route("/confirm", post(pages::confirm))
+    .route("/devices/{key}/label", post(pages::device_label))
+    .route("/devices/{key}/subscribe", post(pages::subscribe))
+    .route("/devices/{key}/unsubscribe", post(pages::unsubscribe))
+    .route("/clock", get(pages::clock).post(pages::clock_settings))
+    .route("/metrics", get(pages::metrics))
+    .route("/events", get(pages::events))
+    .route("/config", get(pages::config))
+    .route("/config/reload", post(pages::reload))
+    .route("/theme", post(theme::set_theme))
+    .route("/assets/{hash}/style.css", get(theme::stylesheet_immutable))
+    .route("/style.css", get(theme::stylesheet))
+    .route("/live.js", get(live::script))
+    .route("/static/style.css", get(theme::stylesheet))
+    .nest("/api/v1", api::routes())
+    .fallback(pages::not_found)
+    .layer(middleware::from_fn(same_origin))
+    .layer(middleware::from_fn(security_headers))
+    .with_state(state)
 }
 
 /// Headers on every response.

@@ -70,7 +70,7 @@ pub mod status;
 pub mod tsinfo;
 mod txmatch;
 
-pub use clockconv::{mono_ns, realtime_ns, tai_ns};
+pub use clockconv::{mono_ns, raw_ns, realtime_ns, tai_ns};
 pub use overlay::OverlaySnapshot;
 pub use publisher::OverlayPublisher;
 pub use runner::{

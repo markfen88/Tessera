@@ -33,6 +33,8 @@ enum Cmd {
     /// Set the operator password (read from standard input, never from the
     /// command line). Run as root.
     SetPassword,
+    /// Initialize a fresh install with password `tessera`; preserve an existing file.
+    InitPassword,
     /// Check the configuration file and exit.
     Check,
     /// Appliance mode helpers.
@@ -74,6 +76,7 @@ fn main() -> ExitCode {
     match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Serve => serve(cfg),
         Cmd::SetPassword => set_password(&cfg),
+        Cmd::InitPassword => init_password(&cfg),
         Cmd::Check => {
             println!(
                 "listen {}; control socket {}; password file {}; appliance mode {}",
@@ -91,7 +94,7 @@ fn main() -> ExitCode {
         Cmd::Appliance {
             cmd: ApplianceCmd::Polkit,
         } => {
-            print!("{}", polkit_rules(&cfg.appliance));
+            print!("{}", polkit_rules(&cfg.services_config()));
             ExitCode::SUCCESS
         }
         Cmd::Appliance {
@@ -113,7 +116,11 @@ fn unitfile(cfg: &WebConfig, instance: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match rt.block_on(run_unitfile(&ProcessRunner, &cfg.appliance, instance)) {
+    match rt.block_on(run_unitfile(
+        &ProcessRunner,
+        &cfg.services_config(),
+        instance,
+    )) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {
             eprintln!("tessera-web appliance unitfile: refused: {e}");
@@ -141,7 +148,7 @@ fn serve(cfg: WebConfig) -> ExitCode {
             PasswordFile(cfg.password_file.clone()),
             cfg.session_idle,
             cfg.cookie_secure,
-        );
+        ).with_services(Appliance::new(cfg.services_config(), Arc::new(ProcessRunner)));
         if cfg.appliance.enabled {
             tracing::info!(
                 services = cfg.appliance.services.len(),
@@ -271,6 +278,63 @@ fn set_password(cfg: &WebConfig) -> ExitCode {
     }
 }
 
+fn init_password(cfg: &WebConfig) -> ExitCode {
+    let result = nix::unistd::Group::from_name("tessera-web")
+        .map_err(std::io::Error::from)
+        .and_then(|g| initialize_password_file(&cfg.password_file, g.map(|g| g.gid)));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("tessera-web: initialize password: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn initialize_password_file(
+    path: &std::path::Path,
+    group: Option<nix::unistd::Gid>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // Publish a complete hash without replacing a file created by another
+    // initializer. A crash before publication cannot leave an empty password.
+    if let Ok(metadata) = path.symlink_metadata() {
+        return if metadata.file_type().is_file() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("password path is not a regular file"))
+        };
+    }
+    let hash = hash_password("tessera").map_err(std::io::Error::other)?;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".tessera-password-{}",
+        tessera_web::auth::random_hex(16)
+    ));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o640)
+        .open(&tmp)?;
+    let result = (|| -> std::io::Result<()> {
+        f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+        if let Some(gid) = group {
+            nix::unistd::fchown(&f, None, Some(gid))?;
+        }
+        writeln!(f, "{hash}")?;
+        f.sync_all()?;
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(tmp);
+    result
+}
+
 /// Write atomically, mode 0640, group `tessera-web` when it exists (so the
 /// service can read it and nobody else can).
 fn write_password_file(path: &std::path::Path, hash: &str) -> std::io::Result<()> {
@@ -304,4 +368,38 @@ fn write_password_file(path: &std::path::Path, hash: &str) -> std::io::Result<()
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod shipping_tests {
+    use super::*;
+    use tessera_web::auth::verify_password;
+
+    #[test]
+    fn initial_password_is_tessera_and_reinstall_keeps_operator_password() {
+        let dir = std::env::temp_dir().join(format!(
+            "tessera-password-{}",
+            tessera_web::auth::random_hex(8)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("password");
+        initialize_password_file(&path, None).unwrap();
+        let hash = std::fs::read_to_string(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(verify_password("tessera", &hash));
+        assert!(!verify_password("wrong", &hash));
+        let custom = hash_password("operator password").unwrap();
+        std::fs::write(&path, &custom).unwrap();
+        initialize_password_file(&path, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.join("absent"), &path).unwrap();
+        assert!(initialize_password_file(&path, None).is_err());
+        assert!(!dir.join("absent").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

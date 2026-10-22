@@ -12,6 +12,7 @@
 
 # Argon2id hash of the operator password, written by
 # `sudo tessera-web set-password` (root:tessera-web, 0640).
+# Fresh packages initialize this file with password `tessera` only when absent.
 #password_file = "/etc/tessera/web-password"
 
 # Mark the session cookie Secure (when a TLS reverse proxy is in front).
@@ -24,6 +25,9 @@
 #daemon_timeout_secs = 5
 
 # ---- Appliance mode ---------------------------------------------------------
+# The Services page (/services) is always available. If no service list is
+# configured, it lists Network audio, Controller compatibility, This portal,
+# Network configuration and Device discovery. Speaker mode remains optional.
 # Off by default. With enabled = true, / is the Speaker page: the host's
 # vitals, the daemon's summary and one switch per service listed below
 # (enable keeps a service running across reboots; disable stops it and

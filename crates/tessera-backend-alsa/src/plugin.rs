@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tessera_audio_ipc::{ClockOverlayReader, Ring, RingParams, SampleFormat, monotonic_ns};
+use tessera_audio_ipc::{
+    ClockOverlayReader, Ring, RingParams, SampleFormat, monotonic_ns, raw_monotonic_ns,
+};
 
 use crate::client::{Link, connect_session};
 use crate::clock::OverlayClock;
@@ -63,7 +65,7 @@ struct Inner {
     sock_ticks: u32,
     /// The tick assumed until the wake ticks have been measured.
     default_tick: u64,
-    /// The deadline the poll timer is armed for (absolute `CLOCK_MONOTONIC`
+    /// The deadline the poll timer is armed for (absolute `CLOCK_MONOTONIC_RAW`
     /// ns; [`EXPIRED`] fires at once), `None` when disarmed.
     armed: Option<u64>,
     /// When `pointer` last drained the wake socket.
@@ -282,7 +284,7 @@ unsafe fn fail(p: &Plugin, io: *mut snd_pcm_ioplug_t, g: &mut Inner, e: StreamEr
 const EXPIRED: u64 = 1;
 
 /// Added to every computed wake-up. The media clock is the daemon's overlay
-/// (an affine map of `CLOCK_MONOTONIC` it keeps correcting); a wake-up a
+/// (an affine map of `CLOCK_MONOTONIC_RAW` it keeps correcting); a wake-up a
 /// little late is harmless, one too early makes an application that acts on
 /// raw poll events transfer less than it asked for.
 const WAKE_MARGIN_NS: u64 = 100_000;
@@ -346,7 +348,7 @@ fn wait_ns(g: &Inner, frames: u64) -> u64 {
     let rate = u128::from(g.params.sample_rate_hz.max(1));
     let frames = u128::from(frames.max(tick_for(g)));
     let media_ns = (frames * 1_000_000_000).div_ceil(rate);
-    // The media clock runs `rate_ppb` faster than CLOCK_MONOTONIC.
+    // The media clock runs `rate_ppb` faster than CLOCK_MONOTONIC_RAW.
     let ppb = g
         .overlay
         .try_read()
@@ -364,12 +366,14 @@ fn wait_ns(g: &Inner, frames: u64) -> u64 {
 /// timerfd clears an expiry that was not read, so a descriptor that no longer
 /// means "ready" stops being readable. Skips the syscall when nothing changes.
 fn arm(p: &Plugin, g: &mut Inner, wake: Wake) {
-    let now = monotonic_ns();
+    let now = raw_monotonic_ns();
     let at = match wake {
         Wake::Never => None,
         Wake::Now => Some(EXPIRED),
         Wake::After(frames) => {
-            let at = now.saturating_add(wait_ns(g, frames));
+            // timerfd uses MONOTONIC; keep media deadlines in RAW and
+            // bound how long a projected timer can run before rechecking.
+            let at = now.saturating_add(wait_ns(g, frames).min(200_000_000));
             // Already armed a little later than needed (within one tick and
             // the margin): waking that late is harmless, so keep it and save
             // the syscall. Armed *earlier* always re-arms: an early wake-up
@@ -387,7 +391,17 @@ fn arm(p: &Plugin, g: &mut Inner, wake: Wake) {
         (Some(t), Some(EXPIRED)) if t <= now => return,
         _ => {}
     }
-    let v = at.unwrap_or(0);
+    let v = match at {
+        None => 0,
+        Some(EXPIRED) => EXPIRED,
+        Some(target) => {
+            let r1 = raw_monotonic_ns();
+            let mono = monotonic_ns();
+            let r2 = raw_monotonic_ns();
+            let raw_mid = r1 + r2.saturating_sub(r1) / 2;
+            mono.saturating_add(target.saturating_sub(raw_mid)).max(1)
+        }
+    };
     let its = libc::itimerspec {
         it_interval: libc::timespec {
             tv_sec: 0,
@@ -435,7 +449,7 @@ fn hung_up(fd: c_int) -> bool {
 /// hang-up now (one more syscall) instead of at the next drain; for
 /// `poll_revents`, which a hang-up may be the reason for.
 fn check_daemon(p: &Plugin, g: &mut Inner, prompt: bool) {
-    g.last_drain_ns = monotonic_ns();
+    g.last_drain_ns = raw_monotonic_ns();
     g.link.drain_wake();
     if prompt && hung_up(g.link.wake_fd()) {
         g.link.mark_lost();
@@ -540,7 +554,7 @@ unsafe extern "C" fn cb_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t 
         };
         // An application that never calls `poll_revents` must still notice a
         // daemon that is gone: look now and then.
-        if monotonic_ns().saturating_sub(g.last_drain_ns) >= DRAIN_EVERY_NS {
+        if raw_monotonic_ns().saturating_sub(g.last_drain_ns) >= DRAIN_EVERY_NS {
             check_daemon(p, &mut g, false);
         }
         let lost = g.link.is_lost();
@@ -1545,6 +1559,15 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn poll_descriptor_uses_a_supported_kernel_timer_clock() {
+        let (signal, wait) = tessera_audio_ipc::wake_pair().unwrap();
+        let (poll, timer) = poll_set(wait.as_fd().as_raw_fd()).unwrap();
+        assert!(poll.as_raw_fd() >= 0 && timer.as_raw_fd() >= 0);
+        drop(signal);
+    }
 
     #[test]
     fn guard_turns_a_panic_into_the_fallback() {

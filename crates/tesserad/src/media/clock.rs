@@ -13,7 +13,7 @@
 
 use std::cell::Cell;
 
-use tessera_audio_ipc::{ClockOverlayReader, monotonic_ns};
+use tessera_audio_ipc::{ClockOverlayReader, raw_monotonic_ns};
 use tessera_clock::media_clock::ClockState;
 use tessera_clock::platform::OverlaySnapshot;
 use tessera_media::{ClockSnapshot, MediaClock};
@@ -98,7 +98,7 @@ impl FrozenClock {
 
 impl MediaClock for FrozenClock {
     fn now(&self) -> ClockSnapshot {
-        self.at_local(monotonic_ns())
+        self.at_local(raw_monotonic_ns())
     }
 
     fn at_local(&self, local_ns: u64) -> ClockSnapshot {
@@ -117,7 +117,7 @@ impl MediaClock for FrozenClock {
 
 impl MediaClock for OverlayClock {
     fn now(&self) -> ClockSnapshot {
-        self.at_local(monotonic_ns())
+        self.at_local(raw_monotonic_ns())
     }
 
     fn at_local(&self, local_ns: u64) -> ClockSnapshot {

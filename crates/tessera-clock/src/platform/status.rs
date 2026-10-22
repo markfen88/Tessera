@@ -46,6 +46,9 @@ pub struct SharedStatus {
     pub tx_timestamp_fallbacks: AtomicU64,
     /// Realtime-clock steps detected (batches discarded).
     pub realtime_steps: AtomicU64,
+    /// Timestamp batches discarded because no sufficiently narrow clock
+    /// calibration bracket was available.
+    pub timestamp_calibration_rejections: AtomicU64,
     /// Sends dropped because the socket buffer was full.
     pub send_would_block: AtomicU64,
     /// 1 if hardware timestamping is active.

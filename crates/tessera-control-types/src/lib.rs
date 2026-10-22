@@ -434,7 +434,7 @@ pub struct ClockStatus {
     pub timestamping: Timestamping,
     /// Offset from the leader, if following.
     pub offset_ns: Option<i64>,
-    /// Media clock rate relative to `CLOCK_MONOTONIC`, parts per billion.
+    /// Media clock rate relative to `CLOCK_MONOTONIC_RAW`, parts per billion.
     pub rate_ppb: i64,
     pub grandmaster: Option<String>,
     /// Increments on every clock discontinuity.

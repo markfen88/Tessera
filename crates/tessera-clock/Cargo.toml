@@ -24,7 +24,7 @@ linux = ["std", "dep:tessera-audio-ipc", "dep:socket2", "dep:nix", "dep:libc", "
 
 [dependencies]
 # Read-only dependency: only the clock-overlay writer is used (publisher adapter).
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.0-beta", optional = true }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.1", optional = true }
 socket2 = { version = "0.6", optional = true, features = ["all"] }
 nix = { version = "0.31", optional = true, default-features = false, features = ["socket", "net", "poll", "event", "time", "signal", "sched", "uio"] }
 libc = { version = "0.2", optional = true }

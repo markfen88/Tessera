@@ -313,10 +313,10 @@
 # (range: auto|avahi|builtin|off; apply: reload; restart scope: none)
 #mdns = "auto"
 #
-# Advertise the logical devices. Off by default: the records name control
-# ports nothing listens on yet.
+# Advertise the logical devices. Enabled by default with the packaged
+# Controller compatibility runtime.
 # (range: true|false; apply: reload; restart scope: none)
-#advertise_devices = false
+#advertise_devices = true
 
 #[backends]
 # Which audio-client backends may attach, and the resampler.

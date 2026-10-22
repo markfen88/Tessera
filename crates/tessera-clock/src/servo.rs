@@ -113,9 +113,12 @@ pub enum ServoOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     First,
+    Rebaseline,
     Second {
         t0: LocalNs,
         e0: i64,
+        last_t: LocalNs,
+        last_e: i64,
     },
     Tracking {
         last_t: LocalNs,
@@ -128,6 +131,7 @@ enum Phase {
 pub struct Servo {
     cfg: ServoConfig,
     phase: Phase,
+    calibrated: bool,
     /// Integrator, ppb in Q16.
     integ: i128,
     /// Running mean |e| in ns (outlier threshold).
@@ -152,6 +156,7 @@ impl Servo {
         Servo {
             cfg,
             phase: Phase::First,
+            calibrated: false,
             integ: 0,
             dev_ns: cfg.lock_threshold_ns,
             rejects: 0,
@@ -174,10 +179,11 @@ impl Servo {
         self.locked
     }
 
-    /// True once the initial step and frequency initialisation are done.
+    /// True once a frequency estimate is available, including while it is
+    /// being reacquired after a later phase step.
     #[must_use]
     pub fn is_calibrated(&self) -> bool {
-        matches!(self.phase, Phase::Tracking { .. })
+        self.calibrated
     }
 
     /// The last accepted error in ns.
@@ -198,7 +204,12 @@ impl Servo {
         match self.phase {
             Phase::First => {
                 if e.unsigned_abs() >= self.cfg.step_threshold_ns.unsigned_abs() {
-                    self.phase = Phase::Second { t0: t, e0: 0 };
+                    self.phase = Phase::Second {
+                        t0: t,
+                        e0: 0,
+                        last_t: t,
+                        last_e: 0,
+                    };
                     self.last_error = 0;
                     ServoOutput::Step {
                         correction_ns: e.saturating_neg(),
@@ -207,14 +218,68 @@ impl Servo {
                 } else {
                     // Below the step threshold: no discontinuity; the error is
                     // slewed out once the frequency is known.
-                    self.phase = Phase::Second { t0: t, e0: e };
+                    self.phase = Phase::Second {
+                        t0: t,
+                        e0: e,
+                        last_t: t,
+                        last_e: e,
+                    };
                     self.last_error = e;
                     ServoOutput::Hold
                 }
             }
-            Phase::Second { t0, e0 } => {
+            Phase::Rebaseline => {
+                // The first observation after the step is the baseline. A
+                // transient delay may have disappeared since the step; do not
+                // interpret that constant phase error as an oscillator rate.
+                self.phase = Phase::Second {
+                    t0: t,
+                    e0: e,
+                    last_t: t,
+                    last_e: e,
+                };
+                self.last_error = e;
+                ServoOutput::Hold
+            }
+            Phase::Second {
+                t0,
+                e0,
+                last_t,
+                last_e,
+            } => {
+                // A discontinuity within the calibration window is phase,
+                // not frequency. Preserve the learned rate and start a fresh
+                // baseline instead of folding a delay edge into holdover.
+                let dt = i128::from(t.saturating_sub(last_t));
+                let rate_bound =
+                    i128::from(self.cfg.max_rate_ppb).abs() + i128::from(rate_ppb).abs();
+                let max_change = rate_bound.saturating_mul(dt) / 1_000_000_000
+                    + 2 * i128::from(self.cfg.outlier_floor_ns).abs();
+                if self.calibrated && (i128::from(e) - i128::from(last_e)).abs() > max_change {
+                    self.last_error = e;
+                    if e.unsigned_abs() >= self.cfg.step_threshold_ns.unsigned_abs() {
+                        self.phase = Phase::Rebaseline;
+                        return ServoOutput::Step {
+                            correction_ns: e.saturating_neg(),
+                            rate_ppb: self.rate_from_integ(0, false),
+                        };
+                    }
+                    self.phase = Phase::Second {
+                        t0: t,
+                        e0: e,
+                        last_t: t,
+                        last_e: e,
+                    };
+                    return ServoOutput::Hold;
+                }
                 let span = t.saturating_sub(t0);
                 if span < self.cfg.freq_init_min_span_ns || span == 0 {
+                    self.phase = Phase::Second {
+                        t0,
+                        e0,
+                        last_t: t,
+                        last_e: e,
+                    };
                     return ServoOutput::Hold;
                 }
                 // Error accumulated over `span` at the old rate: our clock
@@ -222,6 +287,7 @@ impl Servo {
                 let slope_ppb = (i128::from(e) - i128::from(e0)) * 1_000_000_000 / i128::from(span);
                 let new_rate = clamp_i64(i128::from(rate_ppb) - slope_ppb, self.cfg.max_rate_ppb);
                 self.integ = -(i128::from(new_rate) << GAIN_SHIFT);
+                self.calibrated = true;
                 self.phase = Phase::Tracking {
                     last_t: t,
                     settle_until: t.saturating_add(self.cfg.settle_ns),
@@ -260,11 +326,15 @@ impl Servo {
             settle_until,
         };
         if abs > self.cfg.step_threshold_ns {
-            // A genuine jump: step, keep the frequency estimate, lose lock.
+            // Reacquire frequency from fresh post-step observations over the
+            // normal calibration span. Keeping the old integrator in Tracking
+            // would reject three samples and step the fourth forever. Jitter
+            // and phase jumps among rejected samples are not a speed estimate.
             self.locked = false;
             self.recent_n = 0;
             self.recent_head = 0;
             self.dev_ns = self.cfg.lock_threshold_ns;
+            self.phase = Phase::Rebaseline;
             return ServoOutput::Step {
                 correction_ns: e.saturating_neg(),
                 rate_ppb: self.rate_from_integ(0, false),
@@ -378,6 +448,43 @@ mod tests {
     }
 
     #[test]
+    fn transient_delay_sweep_preserves_frequency_and_holdover() {
+        for interval in [1_000_000_000u64, 250_000_000] {
+            for delayed_syncs in 1..=12 {
+                let mut clock = MediaClock::new(0, 0);
+                let mut servo = Servo::new(ServoConfig::default());
+                let first_delayed = 40_000_000_000 / interval;
+                for i in 1..=65_000_000_000 / interval {
+                    let t = i * interval;
+                    let delay = if (first_delayed..first_delayed + delayed_syncs).contains(&i) {
+                        1_500_000
+                    } else {
+                        0
+                    };
+                    let error = i64::try_from(i128::from(clock.media_ns_at(t)) - i128::from(t))
+                        .unwrap()
+                        + delay;
+                    apply(&mut servo, &mut clock, t, error);
+                    assert!(
+                        clock.rate_ppb().abs() < 1_000,
+                        "false rate for {delayed_syncs} Syncs at {interval} ns, sample {i}: {}",
+                        clock.rate_ppb()
+                    );
+                    if let Some(rate) = servo.frequency_ppb() {
+                        assert!(rate.abs() < 1_000, "false holdover rate: {rate}");
+                    }
+                    if i >= first_delayed {
+                        assert!(servo.is_calibrated());
+                        assert!(servo.frequency_ppb().is_some());
+                    }
+                }
+                assert_eq!(clock.epoch(), if delayed_syncs >= 4 { 2 } else { 0 });
+                assert!(servo.is_locked());
+            }
+        }
+    }
+
+    #[test]
     fn converges_on_drift_and_offset_without_noise() {
         let (servo, clock, e) = run(50_000, 123_456_789_012, 60, |_| 0);
         assert!(servo.is_calibrated());
@@ -417,11 +524,44 @@ mod tests {
             apply(&mut servo, &mut clock, t, e);
         }
         assert!(servo.is_locked());
+        assert!(clock.rate_ppb().abs() < 1_000, "a phase jump is not drift");
         assert_eq!(
             clock.epoch(),
             1,
             "no initial step (zero offset), one step for the jump"
         );
+    }
+
+    #[test]
+    fn persistent_frequency_change_relearns_rate_instead_of_stepping_forever() {
+        for (old_rate, new_rate) in [(0, 350_000), (0, -350_000), (211_930, -138_070)] {
+            let mut clock = MediaClock::new(0, 0);
+            let mut servo = Servo::new(ServoConfig::default());
+            let mut before = 0;
+            let mut last_error = 0;
+            for sec in 1..=160u64 {
+                let t = sec * 1_000_000_000;
+                let after = t.saturating_sub(60_000_000_000);
+                let leader = i128::from(t)
+                    + i128::from(t) * i128::from(old_rate) / 1_000_000_000
+                    + i128::from(after) * i128::from(new_rate - old_rate) / 1_000_000_000;
+                let e = (i128::from(clock.media_ns_at(t)) - leader) as i64;
+                apply(&mut servo, &mut clock, t, e);
+                if sec == 60 {
+                    assert!(servo.is_locked(), "baseline failed to lock");
+                    before = clock.epoch();
+                }
+                last_error = e;
+            }
+            assert!(servo.is_locked(), "{old_rate} -> {new_rate}: not locked");
+            assert!(
+                clock.epoch() <= before + 2,
+                "{old_rate} -> {new_rate}: repeated steps: {}",
+                clock.epoch() - before
+            );
+            assert!((clock.rate_ppb() - new_rate).abs() < 1_000);
+            assert!(last_error.abs() < 1_000, "residual {last_error} ns");
+        }
     }
 
     #[test]
@@ -432,6 +572,69 @@ mod tests {
             [40_000, -35_000, 60_000, -20_000, 10_000][(i % 5) as usize]
         });
         assert!(servo.is_locked());
+    }
+
+    #[test]
+    fn frequency_change_with_subsecond_jitter_relocks() {
+        for new_rate in [-350_000i64, 350_000] {
+            let mut clock = MediaClock::new(0, 0);
+            let mut servo = Servo::new(ServoConfig::default());
+            let mut before = 0;
+            for i in 1..=1_600u64 {
+                let t = i * 125_000_000;
+                let after = t.saturating_sub(60_000_000_000);
+                let leader =
+                    i128::from(t) + i128::from(after) * i128::from(new_rate) / 1_000_000_000;
+                let noise = [40_000, -35_000, 60_000, -20_000, 10_000][(i % 5) as usize];
+                let e = (i128::from(clock.media_ns_at(t)) - leader) as i64 + noise;
+                apply(&mut servo, &mut clock, t, e);
+                if i == 480 {
+                    assert!(servo.is_locked());
+                    before = clock.epoch();
+                }
+            }
+            assert!(servo.is_locked(), "jittery {new_rate} ppb did not relock");
+            assert!(clock.epoch() <= before + 2, "repeated phase steps");
+            assert!((clock.rate_ppb() - new_rate).abs() < 20_000);
+        }
+    }
+
+    #[test]
+    fn an_outlier_before_a_phase_jump_does_not_become_a_frequency_estimate() {
+        let mut clock = MediaClock::new(0, 0);
+        let mut servo = Servo::new(ServoConfig::default());
+        for sec in 1..=120u64 {
+            let t = sec * 1_000_000_000;
+            let jump = if sec >= 61 { 2_000_000 } else { 0 };
+            let noise = if sec == 60 { 150_000 } else { 0 };
+            let e = (i128::from(clock.media_ns_at(t)) - i128::from(t) - jump) as i64 + noise;
+            apply(&mut servo, &mut clock, t, e);
+        }
+        assert!(servo.is_locked());
+        assert_eq!(clock.epoch(), 1);
+        assert!(clock.rate_ppb().abs() < 1_000);
+    }
+
+    #[test]
+    fn reset_in_a_rejected_streak_forgets_its_samples() {
+        let (mut servo, mut clock, _) = run(0, 0, 40, |_| 0);
+        assert!(matches!(
+            servo.sample(41_000_000_000, 150_000, 0),
+            ServoOutput::Rejected
+        ));
+        assert!(matches!(
+            servo.sample(42_000_000_000, 200_000, 0),
+            ServoOutput::Rejected
+        ));
+        servo.reset();
+        for sec in 43..=100u64 {
+            let t = sec * 1_000_000_000;
+            let e = (i128::from(clock.media_ns_at(t)) - i128::from(t)) as i64;
+            apply(&mut servo, &mut clock, t, e);
+        }
+        assert!(servo.is_locked());
+        assert_eq!(clock.epoch(), 0);
+        assert_eq!(clock.rate_ppb(), 0);
     }
 
     #[test]

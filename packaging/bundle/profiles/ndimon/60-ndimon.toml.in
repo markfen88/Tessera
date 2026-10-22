@@ -6,4 +6,4 @@ sample_rate = 48000
 encoding = 24
 
 [discovery]
-advertise_devices = false
+advertise_devices = true

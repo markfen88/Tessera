@@ -1,14 +1,17 @@
-# Tessera 0.2.0-beta
+# Tessera 0.2.1
 
 Tessera is an experimental, open audio-over-IP stack for Linux, written in Rust
 and licensed under MPL-2.0. It provides a PTPv1 media clock, UDP audio flows,
 local audio backends, a command-line client and a web control portal.
 
 The project targets interoperability with Dante® media networks. It is not
-vendor-certified and does not implement the vendor's controller/subscription
-protocols. Configure matching static flows. External hardware audio content,
+vendor-certified. Packages include and enable the existing Controller
+compatibility runtime alongside the daemon; device advertisement is on by
+default. The web portal lists core services and initially accepts password
+`tessera` on fresh installs, preserving existing passwords on upgrades.
+Matching static flows remain available. External hardware audio content,
 sustained clock stability and automatic routing interoperability are not
-certified by this beta. Dante is a trademark of Audinate; this project is not
+certified by this release. Dante is a trademark of Audinate; this project is not
 affiliated with or endorsed by Audinate.
 
 [Release notes](CHANGELOG.md) · [Documentation](docs/index.md) ·
@@ -195,8 +198,7 @@ SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge TESSERA_DEB_REVISION=1 packaging/b
 ```
 
 Build on the target OS/architecture. `TESSERA_DEB_REVISION` makes the package
-revision explicit in source archives. `0.2.0-beta` is packaged as `0.2.0~beta-*`
-so Debian orders it before the eventual final `0.2.0` release. To create an
+revision explicit in source archives. Version `0.2.1` is packaged as `0.2.1-*`. To create an
 add-on bundle, use `packaging/build-bundle.sh`, or its explicit Ubuntu opt-in.
 See [build/package options](docs/bundle.md#building).
 
@@ -214,8 +216,10 @@ before using purge or dependent-package removal.
 
 ## Known limitations
 
-This beta does not provide vendor-controller subscriptions/device control,
-AES67, JACK, Bluetooth latency calibration, ARC/eARC capture or automatic lip-sync.
+The Controller compatibility runtime serves the first logical device only.
+Additional logical devices’ offset control ports are not yet supported.
+AES67, JACK, Bluetooth latency calibration, ARC/eARC capture and automatic lip-sync
+are not implemented.
 Static flow and packet settings remain provisional for external hardware.
 Standalone VLAN changes support networkd and Netplan/networkd only; Wi-Fi,
 IPv6 configuration, bonds/bridges and arbitrary policy routing are not managed.

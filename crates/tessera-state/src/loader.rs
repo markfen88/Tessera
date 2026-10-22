@@ -452,6 +452,22 @@ pub fn load_from_sources_with(
     for s in sources {
         match s.text.parse::<Table>() {
             Ok(t) => {
+                // The Controller runtime can write this reserved drop-in.
+                // Enforce its scope here too, even if it bypasses its adapter.
+                if s.path.file_name().is_some_and(|n| n == "90-probe-flows.toml")
+                    && (t.keys().any(|key| key != "flow")
+                        || t.get("flow").is_some_and(|flows| {
+                            !matches!(flows, Value::Array(a) if a.iter().all(Value::is_table))
+                        }))
+                {
+                    let mut issue = Issue::error(
+                        "",
+                        "reserved Controller drop-in accepts only [[flow]] entries",
+                    );
+                    issue.source = Some(s.path.clone());
+                    issues.push(issue);
+                    continue;
+                }
                 if let (Some(Value::Array(_)), Some(Value::Array(new))) =
                     (merged.get("device"), t.get("device"))
                 {

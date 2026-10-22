@@ -30,7 +30,7 @@ pub enum ClockState {
 }
 
 /// One consistent set of media-clock values: the data published through the
-/// clock overlay (`tessera-audio-ipc`, layout 1.0).
+/// clock overlay (`tessera-audio-ipc`, layout 2.0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaClockSnapshot {
     /// Incremented when media time is stepped (a discontinuity of the

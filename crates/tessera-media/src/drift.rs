@@ -303,7 +303,7 @@ impl PiController {
 
 /// Smoothed estimate of the rate offset between a device clock and the media
 /// clock, from frame counts accumulated over the same interval of
-/// `CLOCK_MONOTONIC` time (ADR 0006).
+/// `CLOCK_MONOTONIC_RAW` time (ADR 0006).
 #[derive(Debug, Clone)]
 pub struct RateEstimator {
     alpha: f64,

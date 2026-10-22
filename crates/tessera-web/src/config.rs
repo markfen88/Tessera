@@ -48,7 +48,7 @@ impl Default for WebConfig {
 /// `[appliance]`: appliance mode (off by default). When on, `/` is the
 /// Speaker page with one switch per configured service; the overview moves
 /// to `/device`.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApplianceConfig {
     /// The Speaker page exists and is the landing page.
     pub enabled: bool,
@@ -62,6 +62,47 @@ pub struct ApplianceConfig {
     /// `[appliance.volume]`: the amplifier's mixer control. `None`: no
     /// Volume card.
     pub volume: Option<VolumeConfig>,
+}
+
+impl Default for ApplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hostname_label: None,
+            services: [
+                ("tesserad", "Network audio", "Tessera audio daemon", true),
+                (
+                    "tessera-controller@main",
+                    "Controller compatibility",
+                    "Interoperable with Dante® Controller",
+                    true,
+                ),
+                ("tessera-web", "This portal", "Tessera web portal", true),
+                (
+                    "tessera-network",
+                    "Network configuration",
+                    "Standalone network configuration",
+                    true,
+                ),
+                (
+                    "avahi-daemon",
+                    "Device discovery",
+                    "Local network service discovery",
+                    true,
+                ),
+            ]
+            .into_iter()
+            .map(|(unit, label, description, essential)| ServiceEntry {
+                units: vec![unit.into()],
+                label: label.into(),
+                description: description.into(),
+                essential,
+            })
+            .collect(),
+            camilladsp: CamillaDspConfig::default(),
+            volume: None,
+        }
+    }
 }
 
 /// `[appliance.volume]`: the hardware mixer control the Volume card sets
@@ -243,7 +284,7 @@ struct ApplianceFile {
     enabled: Option<bool>,
     hostname_label: Option<String>,
     #[serde(default, rename = "service")]
-    services: Vec<ServiceFile>,
+    services: Option<Vec<ServiceFile>>,
     camilladsp: Option<CamillaFile>,
     volume: Option<VolumeFile>,
 }
@@ -324,8 +365,9 @@ struct CamillaFile {
 
 impl ApplianceConfig {
     fn from_file(f: ApplianceFile) -> Result<Self, String> {
-        let mut services: Vec<ServiceEntry> = Vec::with_capacity(f.services.len());
-        for (i, s) in f.services.into_iter().enumerate() {
+        let use_defaults = f.services.is_none();
+        let mut services: Vec<ServiceEntry> = Vec::new();
+        for (i, s) in f.services.unwrap_or_default().into_iter().enumerate() {
             let at = format!("`appliance.service[{i}]`");
             let units = match (s.unit, s.units) {
                 (Some(_), Some(_)) => {
@@ -448,7 +490,11 @@ impl ApplianceConfig {
                 .hostname_label
                 .map(|h| h.trim().to_owned())
                 .filter(|h| !h.is_empty()),
-            services,
+            services: if use_defaults {
+                Self::default().services
+            } else {
+                services
+            },
             camilladsp,
             volume: f.volume.map(VolumeConfig::from_file).transpose()?,
         })
@@ -468,6 +514,14 @@ struct File {
 }
 
 impl WebConfig {
+    /// Service controls are available even without the Speaker landing page.
+    #[must_use]
+    pub fn services_config(&self) -> ApplianceConfig {
+        ApplianceConfig {
+            enabled: true,
+            ..self.appliance.clone()
+        }
+    }
     /// Parse the file's text.
     ///
     /// # Errors
@@ -522,7 +576,12 @@ mod tests {
         assert_eq!(c, WebConfig::default());
         assert!(c.listen.ip().is_loopback());
         assert!(!c.appliance.enabled);
-        assert!(c.appliance.services.is_empty());
+        assert!(
+            c.appliance
+                .services
+                .iter()
+                .any(|s| s.has_unit("tessera-controller@main"))
+        );
     }
 
     #[test]

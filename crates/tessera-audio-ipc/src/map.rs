@@ -63,7 +63,7 @@ impl Mapping {
     /// internal-invariant check, not an input check.
     pub(crate) fn u32s(&self, off: usize, count: usize) -> &[AtomicU32] {
         assert!(
-            off % align_of::<AtomicU32>() == 0
+            off.is_multiple_of(align_of::<AtomicU32>())
                 && count
                     .checked_mul(size_of::<AtomicU32>())
                     .and_then(|b| b.checked_add(off))
@@ -89,7 +89,7 @@ impl Mapping {
     /// (which must be a multiple of 8). See [`Mapping::u32s`].
     pub(crate) fn u64s(&self, off: usize, count: usize) -> &[AtomicU64] {
         assert!(
-            off % align_of::<AtomicU64>() == 0
+            off.is_multiple_of(align_of::<AtomicU64>())
                 && count
                     .checked_mul(size_of::<AtomicU64>())
                     .and_then(|b| b.checked_add(off))

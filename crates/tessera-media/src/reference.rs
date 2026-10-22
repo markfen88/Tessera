@@ -89,7 +89,7 @@ impl PacketFormat for ReferenceFormat {
         out: &mut [u8],
         dither: Option<&mut Dither>,
     ) -> Result<usize, FormatError> {
-        if samples.len() % self.channels != 0 {
+        if !samples.len().is_multiple_of(self.channels) {
             return Err(FormatError::BadSamples);
         }
         let frames = samples.len() / self.channels;

@@ -30,10 +30,10 @@ pub struct ClockSnapshot {
 /// every engine call takes exactly one snapshot, so time and epoch are never
 /// torn.
 pub trait MediaClock {
-    /// Media time now (reads `CLOCK_MONOTONIC` and maps it).
+    /// Media time now (reads `CLOCK_MONOTONIC_RAW` and maps it).
     fn now(&self) -> ClockSnapshot;
 
-    /// Maps a local `CLOCK_MONOTONIC` reading (for example a packet receive
+    /// Maps a local `CLOCK_MONOTONIC_RAW` reading (for example a packet receive
     /// timestamp) to media time under the current mapping.
     fn at_local(&self, local_ns: u64) -> ClockSnapshot;
 }

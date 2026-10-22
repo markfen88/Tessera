@@ -1,5 +1,23 @@
 # Tessera changelog
 
+## 0.2.1
+
+- Enable Controller interoperability and device discovery by default.
+- Include the portal in bundles and list core Services without Speaker mode.
+- Initialize fresh portal installations with password `tessera`, preserving
+  existing passwords and configured service lists.
+- Migrate legacy helper enablement and preserve separate portal ownership
+  during bundle removal.
+
+- Drive PTP and media scheduling from the raw hardware oscillator so NTP
+  frequency adjustments cannot change the audio clock. Safely convert Linux
+  software timestamps and operating-system timer deadlines at their boundaries.
+- Reacquire frequency after a sustained clock error instead of repeatedly
+  stepping at the stale rate.
+- Bump the local clock overlay to layout 2.0. Upgrade and restart the daemon,
+  ALSA clients and PipeWire clients together; older local clients reject the
+  new layout. Network packets and control APIs are unchanged.
+
 ## 0.2.0-beta
 
 ### Standalone network configuration

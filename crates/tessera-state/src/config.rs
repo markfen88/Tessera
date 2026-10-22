@@ -625,9 +625,7 @@ pub struct DiscoveryConfig {
     /// mDNS implementation.
     pub mdns: MdnsMode,
     /// Advertise the logical devices (ARC, CMC and channel records) with
-    /// mDNS. Off by default: the records carry control and flow ports that
-    /// nothing listens on yet, so a controller that found the device could not
-    /// talk to it.
+    /// mDNS. Enabled by default with the packaged Controller runtime.
     pub advertise_devices: bool,
     /// Discovery at all; `false` advertises nothing whatever
     /// `advertise_devices` says (`--no-discovery`).
@@ -639,7 +637,7 @@ impl Default for DiscoveryConfig {
         Self {
             enabled: true,
             mdns: MdnsMode::Auto,
-            advertise_devices: false,
+            advertise_devices: true,
         }
     }
 }

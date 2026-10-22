@@ -1,11 +1,11 @@
 //! The bridge's time base: the daemon's media clock, with a free-running local
 //! clock as the fallback (ADR 0005/0006).
 
-use tessera_audio_ipc::monotonic_ns;
+use tessera_audio_ipc::raw_monotonic_ns;
 
 use crate::clock::{Clock, Now};
 
-/// A free-running media clock: `CLOCK_MONOTONIC` scaled to the sample rate,
+/// A free-running media clock: `CLOCK_MONOTONIC_RAW` scaled to the sample rate,
 /// started at media time 0. Never steered.
 #[derive(Debug, Clone)]
 pub struct LocalClock {
@@ -19,7 +19,7 @@ impl LocalClock {
     pub fn new(rate: u32) -> Self {
         Self {
             rate,
-            base_mono: monotonic_ns(),
+            base_mono: raw_monotonic_ns(),
             base_samples: 0,
         }
     }
@@ -27,7 +27,7 @@ impl LocalClock {
 
 impl Clock for LocalClock {
     fn now(&mut self) -> Option<Now> {
-        let ns = monotonic_ns().saturating_sub(self.base_mono);
+        let ns = raw_monotonic_ns().saturating_sub(self.base_mono);
         let s = u128::from(ns) * u128::from(self.rate) / 1_000_000_000;
         Some(Now {
             samples: self

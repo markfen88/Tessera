@@ -2,7 +2,7 @@
 //!
 //! One thread owns every socket, flow engine and audio ring of the daemon's
 //! media path. Its loop sleeps to an **absolute deadline**
-//! (`clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`) that is the earlier of
+//! (raw deadlines translated to Linux's monotonic sleep clock) that is the earlier of
 //! the next *grid tick* and the instant the next TX packet becomes due (mapped
 //! from media time to local time through the clock overlay), and then runs
 //! [`Worker::tick`]:
@@ -44,8 +44,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rtrb::{Consumer, Producer};
-use tessera_audio_ipc::{RingConsumer, RingProducer, SampleFormat, WakeSignal, monotonic_ns};
-use tessera_clock::platform::{OverlaySnapshot, realtime_ns};
+use tessera_audio_ipc::{RingConsumer, RingProducer, SampleFormat, WakeSignal, raw_monotonic_ns};
+use tessera_clock::platform::{
+    OverlaySnapshot,
+    clockconv::{RealtimeToRaw, TimestampQueue},
+};
 use tessera_media::convert::{f32_to_i32, i32_to_f32};
 use tessera_media::time::samples_to_ns;
 use tessera_media::{FrameSource, IngestOutcome, MediaClock, RxFlow, RxMetrics, TxFlow, TxPoll};
@@ -124,6 +127,8 @@ pub struct RxRt {
     pub keepalive: Keepalive,
     /// Keepalive counters (shared with the control plane).
     pub counters: Arc<RxFlowCounters>,
+    /// Invalidates queued kernel stamps across wall-clock discontinuities.
+    pub stamp_queue: TimestampQueue,
 }
 
 /// A running TX flow.
@@ -323,6 +328,7 @@ const MIN_GAP_NS: u64 = 50_000;
 /// The worker. Build it on the control thread, then move it to its thread and
 /// call [`run`](Self::run) (or drive [`tick`](Self::tick) directly in tests).
 pub struct Worker {
+    stamp_clock: RealtimeToRaw,
     cfg: WorkerConfig,
     clock: OverlayClock,
     t: Tables,
@@ -422,9 +428,10 @@ impl Worker {
         events: Producer<EngineEvent>,
         stats: Arc<MediaStats>,
     ) -> Self {
-        let now = monotonic_ns();
+        let now = raw_monotonic_ns();
         Self {
             next_grid: now + cfg.tick_ns,
+            stamp_clock: RealtimeToRaw::new(2_000_000),
             cfg,
             clock,
             t: tables,
@@ -443,7 +450,7 @@ impl Worker {
 
     /// Runs until `stop` is set or a [`Cmd::Stop`] arrives.
     pub fn run(&mut self, stop: &AtomicBool) {
-        let mut deadline = monotonic_ns();
+        let mut deadline = raw_monotonic_ns();
         while !self.stopping && !stop.load(Ordering::Relaxed) {
             rtsys::sleep_until(deadline);
             self.slept_to = deadline;
@@ -593,7 +600,7 @@ impl Worker {
 
     /// One engine tick. Returns the local monotonic time to sleep until.
     pub fn tick(&mut self) -> u64 {
-        let t0 = monotonic_ns();
+        let t0 = raw_monotonic_ns();
         self.stats.engine.ticks.inc();
         if self.slept_to != 0 {
             let late_us = t0.saturating_sub(self.slept_to) / 1_000;
@@ -673,7 +680,7 @@ impl Worker {
         }
 
         // When to wake next.
-        let now = monotonic_ns();
+        let now = raw_monotonic_ns();
         let mut next = if idle {
             t0 + self.cfg.idle_ns
         } else {
@@ -702,22 +709,35 @@ impl Worker {
 
     fn rx_phase(&mut self, now: u64, frozen: &FrozenClock) {
         let st = &self.stats.engine;
-        // Kernel stamps are CLOCK_REALTIME; one paired reading maps them.
-        let (m1, r, m2) = (monotonic_ns(), realtime_ns(), monotonic_ns());
-        let real_off = i128::from(m1 / 2 + m2 / 2) - i128::from(r);
-        let Self { t, cfg, events, .. } = self;
+        let Self {
+            t,
+            cfg,
+            events,
+            stamp_clock,
+            ..
+        } = self;
         for f in &mut t.rx {
             let mut got = false;
             let mut batches = 0;
             loop {
+                // A wall-clock step during recvmmsg invalidates timestamps,
+                // not the media payload. Fall back to the raw receive time.
+                stamp_clock.refresh();
+                f.stamp_queue.before_batch(stamp_clock);
                 let n = match f.sock.recv() {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        f.stamp_queue.finish_batch(stamp_clock, true);
+                        break;
+                    }
                     Ok(n) => n,
                     Err(_) => {
                         st.rx_errors.inc();
                         break;
                     }
                 };
+                stamp_clock.refresh();
+                let valid_batch = f.stamp_queue.finish_batch(stamp_clock, n < f.sock.batch());
+                let received_at = raw_monotonic_ns();
                 st.rx_batches.inc();
                 st.rx_datagrams.add(n as u64);
                 for i in 0..n {
@@ -733,15 +753,12 @@ impl Worker {
                         st.rx_filtered.inc();
                         continue;
                     }
-                    let local = match d.stamp_realtime_ns {
-                        Some(s) => {
-                            let m = i128::from(s) + real_off;
-                            u64::try_from(m)
-                                .unwrap_or(now)
-                                .clamp(now.saturating_sub(1_000_000_000), now)
-                        }
-                        None => now,
-                    };
+                    let local = d
+                        .stamp_realtime_ns
+                        .filter(|_| valid_batch)
+                        .and_then(|s| stamp_clock.convert(s))
+                        .unwrap_or(received_at)
+                        .clamp(received_at.saturating_sub(1_000_000_000), received_at);
                     let outcome = f.flow.ingest(d.data, local, frozen);
                     if let IngestOutcome::Accepted {
                         timestamp, frames, ..

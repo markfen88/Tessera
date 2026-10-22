@@ -9,7 +9,7 @@ root=${BUNDLE_ROOT:-/}; root=${root%/}
 record_dir=$root/var/lib/tessera-bundle
 record=$record_dir/record.json
 profile=none; card=default; restart=0; offline=0; dry=0; yes=0; reinstall=0; allow_ubuntu=0
-admins=(); files=(); users_modified=(); groups_created=(); users_created=(); dependencies_installed=(); packages=(tessera tessera-alsa)
+admins=(); files=(); users_modified=(); groups_created=(); users_created=(); dependencies_installed=(); packages=(tessera tessera-alsa); old_web_owned=false
 step=parse; started=0; complete=false; old_profile=; old_version=; old_commit=; old_complete=false; restart_pending=false
 fail() { echo "install: $step: $*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || fail "missing value for $1"; }
@@ -63,7 +63,7 @@ step=checksum
 (cd "$DIR" && sha256sum --quiet --strict -c SHA256SUMS) || fail 'checksum mismatch'
 read -r -a deb_files <<< "$BUNDLE_DEBS"
 for deb in "${deb_files[@]}"; do
-  [[ $deb =~ ^debs/tessera(-alsa)?_[a-zA-Z0-9.+:~_-]+\.deb$ ]] || fail 'invalid deb path'
+  [[ $deb =~ ^debs/tessera(-alsa|-web)?_[a-zA-Z0-9.+:~_-]+\.deb$ ]] || fail 'invalid deb path'
   awk -v path="./$deb" '$2 == path {found=1} END {exit !found}' "$DIR/SHA256SUMS" || fail "unchecked deb: $deb"
 done
 # Read only our canonical JSON record, never execute it. All values are restricted
@@ -83,7 +83,7 @@ read_record() {
         users_modified) users_modified+=("$value") ;;
         groups_created) groups_created+=("$value") ;;
         users_created) users_created+=("$value") ;;
-        packages) : ;;
+        packages) [ "$value" != tessera-web ] || old_web_owned=true ;;
         dependencies_installed) dependencies_installed+=("$value") ;;
         '') fail 'invalid record array' ;;
       esac
@@ -182,6 +182,8 @@ package_version() {
 }
 installed_version=$(package_version tessera || true)
 alsa_version=$(package_version tessera-alsa || true)
+web_version=$(package_version tessera-web || true)
+if [ "$old_web_owned" = true ] || [ -z "$web_version" ]; then packages+=(tessera-web); fi
 step=version
 if [ -n "$installed_version" ] && dpkg --compare-versions "$installed_version" gt "$BUNDLE_VERSION"; then fail 'refusing downgrade'; fi
 if [ "$installed_version" = "$BUNDLE_VERSION" ] && [ "$old_commit" != "$BUNDLE_COMMIT" ] && [ "$reinstall" = 0 ]; then
@@ -195,7 +197,7 @@ for user in "${admins[@]}"; do
   done
 done
 if [ "$old_complete" = true ] && [ "$old_version" = "$BUNDLE_VERSION" ] &&
-   [ "$installed_version" = "$BUNDLE_VERSION" ] && [ "$alsa_version" = "$BUNDLE_VERSION" ] &&
+   [ "$installed_version" = "$BUNDLE_VERSION" ] && [ "$alsa_version" = "$BUNDLE_VERSION" ] && [ "$web_version" = "$BUNDLE_VERSION" ] &&
    [ "$restart" = 0 ] && [ "$reinstall" = 0 ] && [ "$admins_satisfied" = 1 ]; then
   check_dependencies
   step=verification
@@ -227,7 +229,7 @@ if [[ " ${files[*]} " != *' /var/lib/tessera-bundle/record.json '* ]]; then file
 if [ "$running" = 1 ] && { [ "$installed_version" != "$BUNDLE_VERSION" ] || [ "$reinstall" = 1 ]; }; then restart_pending=true; fi
 started=1
 write_record
-if [ "$installed_version" != "$BUNDLE_VERSION" ] || [ "$alsa_version" != "$BUNDLE_VERSION" ] || [ "$reinstall" = 1 ]; then
+if [ "$installed_version" != "$BUNDLE_VERSION" ] || [ "$alsa_version" != "$BUNDLE_VERSION" ] || [ "$web_version" != "$BUNDLE_VERSION" ] || [ "$reinstall" = 1 ]; then
   apt_options=(); [ "$offline" = 0 ] || apt_options+=(--no-download)
   [ "$reinstall" = 0 ] || apt_options+=(--reinstall)
   paths=(); for deb in "${deb_files[@]}"; do paths+=("$DIR/$deb"); done
