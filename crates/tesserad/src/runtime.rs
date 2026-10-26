@@ -173,7 +173,7 @@ pub fn derive_with(
             )));
         }
     }
-    // Off unless asked for: the records carry ports nothing listens on yet.
+    // Advertise by default; honour configuration/runtime opt-outs and skip loopback.
     let off =
         opts.no_discovery || !cfg.discovery.advertise_devices || netif::only_loopback(&ifaces);
     let discovery = DiscoveryPlan {
@@ -263,7 +263,11 @@ type BridgeSet = (Vec<BridgePlan>, Vec<crate::bridge::plan::PlanError>);
 fn relevant(e: &Event) -> bool {
     !matches!(
         e,
-        Event::ClockStateChanged { .. } | Event::SubscriptionChanged { .. }
+        Event::ClockStateChanged { .. }
+            | Event::SubscriptionChanged { .. }
+            | Event::SubscriptionChangedWithOrigin { .. }
+            | Event::LockedValueRefused { .. }
+            | Event::RuntimeValueChanged { .. }
     )
 }
 
@@ -495,6 +499,7 @@ mod tests {
         });
         RuntimePlan {
             model: Model {
+                flows: config.flows.clone(),
                 devices: vec![dev],
                 clock: ClockModel {
                     role: ClockRole::Leader,
@@ -531,10 +536,16 @@ mod tests {
     }
 
     #[test]
-    fn devices_are_advertised_only_when_asked_for() {
-        let d = derive_with(&rp(), RuntimeOpts::default(), &lookup, &[]);
-        assert_eq!(d.discovery.mode, MdnsMode::Off, "off by default");
+    fn devices_are_advertised_by_default_and_can_be_disabled() {
         let mut r = rp();
+        assert!(r.config.discovery.advertise_devices);
+        let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
+        assert_eq!(d.discovery.mode, MdnsMode::Auto, "on by default");
+        assert_eq!(d.discovery.devices.len(), 1);
+        r.config.discovery.advertise_devices = false;
+        let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
+        assert_eq!(d.discovery.mode, MdnsMode::Off);
+        assert_eq!(d.discovery.devices.len(), 1);
         r.config.discovery.advertise_devices = true;
         let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
         assert_eq!(d.discovery.mode, MdnsMode::Auto);

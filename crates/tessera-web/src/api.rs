@@ -33,8 +33,26 @@ pub fn routes() -> Router<Shared> {
         .route("/session", post(login).delete(logout))
 }
 
-fn error(code: StatusCode, msg: impl Into<String>) -> Response {
-    (code, Json(json!({ "error": { "message": msg.into() } }))).into_response()
+pub(crate) fn error(code: StatusCode, msg: impl Into<String>) -> Response {
+    let message = msg.into();
+    let code = match code {
+        StatusCode::UNPROCESSABLE_ENTITY
+        | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        | StatusCode::PAYLOAD_TOO_LARGE => StatusCode::BAD_REQUEST,
+        other if other.is_server_error() => StatusCode::INTERNAL_SERVER_ERROR,
+        other => other,
+    };
+    let kind = match code {
+        StatusCode::UNAUTHORIZED => json!("unauthorized"),
+        StatusCode::FORBIDDEN => json!("permission_denied"),
+        StatusCode::TOO_MANY_REQUESTS => json!("rate_limited"),
+        StatusCode::NOT_FOUND => json!({ "not_found": { "what": message } }),
+        StatusCode::BAD_REQUEST => {
+            json!({ "invalid": { "field": "request", "reason": message } })
+        }
+        _ => json!({ "internal": { "message": message } }),
+    };
+    (code, Json(json!({ "error": kind, "message": message }))).into_response()
 }
 
 fn unauthorized() -> Response {
@@ -182,8 +200,12 @@ struct LoginBody {
 async fn login(
     State(st): State<Shared>,
     ext: axum::http::Extensions,
-    Json(body): Json<LoginBody>,
+    body: Result<Json<LoginBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(e) => return error(e.status(), e.body_text()),
+    };
     let addr = peer(&ext);
     let now = Instant::now();
     if !st.limiter.allowed(addr, now) {

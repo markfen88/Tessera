@@ -1,0 +1,11 @@
+# tessera web portal: when a sound card's control device appears, have the portal's unit pick it up.
+# Install as /usr/lib/udev/rules.d/60-tessera-web-sound.rules (the package does).
+#
+# systemd resolves the portal's DeviceAllow=/dev/snd/controlC<n> lines when the portal starts, so
+# a card that appears later stays out of its reach until it restarts. tessera-web-sound.service
+# restarts the portal (only where its unit lists such devices) and explains the choice.
+#
+# add only: a card that goes away needs nothing, and the card's change events (jack detection) are
+# not a new device. The control device is the one the Volume pane's amixer opens; the other nodes
+# of a card (PCM, timer) appear with it.
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC[0-9]*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="tessera-web-sound.service"

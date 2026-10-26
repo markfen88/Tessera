@@ -1,0 +1,67 @@
+# tessera web portal: pick up a sound card that appeared after the portal started.
+# Install as /usr/lib/systemd/system/tessera-web-sound.service (the package does).
+# udev starts it (60-tessera-web-sound.rules) when a sound card's control device appears.
+#
+# Why. The Volume pane runs amixer inside the portal's unit. That unit keeps
+# PrivateDevices=yes and lists the control devices it may open (DeviceAllow=/dev/snd/controlC<n>
+# and BindPaths=-/dev/snd, appliance-paths.conf or the bundle's drop-in). systemd binds /dev/snd
+# and turns every DeviceAllow= path into a device number when the unit starts, and a path that
+# does not exist then is dropped. A card that appears later (a USB DAC, a HAT that enumerates after
+# the portal, a card that takes another index) therefore stays out of reach, and the Volume pane
+# says the card was not found, until the portal is restarted.
+#
+# What. Restart the portal once when the first control device of a burst appears. The settle time
+# below merges the events of one card (and of a flapping one) into one restart and keeps the restarts
+# apart far enough for the portal's start limit (5 starts in 10 s). try-restart leaves a portal that is
+# not running alone, and the ExecCondition leaves a portal whose unit lists no /dev/snd device (no
+# Volume pane) alone too. At boot the cards are normally there before the portal starts, so the
+# portal is found stopped and nothing happens. The portal's sessions are in memory, so the operator
+# signs in again after a restart.
+#
+# Weighed against:
+#  - DeviceAllow=char-alsa rw would cover every node that will ever exist, but also the PCM,
+#    sequencer and timer devices: the portal (reachable over the network, in the group that owns
+#    the nodes) could play and record. Not acceptable for a volume slider.
+#  - systemctl set-property --runtime tessera-web.service DevicePolicy=closed makes systemd resolve
+#    the paths again without a restart (checked on systemd 257), but it cannot create the /dev/snd
+#    bind mount of a unit that started while no sound card existed at all, and it leaves a runtime
+#    drop-in behind. A restart covers both.
+# The unit does only what its ExecStart says: nothing from the event reaches it, and it runs with
+# the helper's sandbox (tessera-web-unitfile@.service).
+
+[Unit]
+Description=tessera web portal: pick up a new sound card
+Documentation=file:/usr/share/doc/tessera-web/examples/appliance-paths.conf
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/grep -rqs -e DeviceAllow=/dev/snd/ /etc/systemd/system/tessera-web.service.d
+ExecStartPre=/usr/bin/sleep 5
+ExecStart=/usr/bin/systemctl try-restart tessera-web.service
+# Root with CAP_SYS_ADMIN, as the unitfile helper: PID 1 trusts a caller without asking polkit only
+# if it holds CAP_SYS_ADMIN. Everything else that still lets systemctl talk to PID 1 over AF_UNIX.
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=yes
+ProtectHome=yes
+ProtectProc=invisible
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

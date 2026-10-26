@@ -79,7 +79,7 @@ fn main() -> ExitCode {
         Cmd::InitPassword => init_password(&cfg),
         Cmd::Check => {
             println!(
-                "listen {}; control socket {}; password file {}; appliance mode {}",
+                "listen {}; control socket {}; password file {}; appliance mode {}; {} drop-in file(s)",
                 cfg.listen,
                 cfg.control_socket.display(),
                 cfg.password_file.display(),
@@ -87,7 +87,8 @@ fn main() -> ExitCode {
                     format!("on ({} service entries)", cfg.appliance.services.len())
                 } else {
                     "off".to_owned()
-                }
+                },
+                tessera_web::config::dropins(&cli.config).map_or(0, |files| files.len())
             );
             ExitCode::SUCCESS
         }
@@ -160,6 +161,10 @@ fn serve(cfg: WebConfig) -> ExitCode {
             ));
         }
         let state = Arc::new(state);
+        if let Some(appliance) = &state.appliance {
+            // The amplifier's saved volume, set again as soon as its card is there.
+            tessera_web::appliance::volume::spawn_restore(Arc::clone(appliance));
+        }
         state.hub.follow(backend, Duration::from_secs(2));
         let listener = match tokio::net::TcpListener::bind(cfg.listen).await {
             Ok(l) => l,

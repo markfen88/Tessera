@@ -25,17 +25,23 @@ impl LocalClock {
     }
 }
 
-impl Clock for LocalClock {
-    fn now(&mut self) -> Option<Now> {
-        let ns = raw_monotonic_ns().saturating_sub(self.base_mono);
+impl LocalClock {
+    fn at(&self, mono_ns: u64) -> Now {
+        let ns = mono_ns.saturating_sub(self.base_mono);
         let s = u128::from(ns) * u128::from(self.rate) / 1_000_000_000;
-        Some(Now {
+        Now {
             samples: self
                 .base_samples
                 .saturating_add(u64::try_from(s).unwrap_or(u64::MAX)),
             epoch: 0,
             age_ns: 0,
-        })
+        }
+    }
+}
+
+impl Clock for LocalClock {
+    fn now(&mut self) -> Option<Now> {
+        Some(self.at(raw_monotonic_ns()))
     }
 }
 
@@ -193,10 +199,9 @@ mod tests {
 
     #[test]
     fn local_clock_runs_at_the_sample_rate() {
-        let mut c = LocalClock::new(48_000);
-        let a = c.now().unwrap().samples;
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let b = c.now().unwrap().samples;
+        let c = LocalClock::new(48_000);
+        let a = c.at(c.base_mono).samples;
+        let b = c.at(c.base_mono + 20_000_000).samples;
         assert!((900..2500).contains(&(b - a)), "{}", b - a);
     }
 }

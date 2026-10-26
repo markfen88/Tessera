@@ -120,8 +120,8 @@ mod tests {
         // old `lock_memory` succeeded here (`mlockall` only checks what exists
         // now) and every later mapping then failed, which is what broke
         // PipeWire loading its modules on stock Debian and Ubuntu user
-        // sessions. A limit below the process's own size would make even the
-        // old code refuse and prove nothing.
+        // sessions. When the inherited hard limit is smaller, the child
+        // checks that our guard refuses before mlockall can fail instead.
         let exe = std::env::current_exe().unwrap();
         let out = std::process::Command::new(exe)
             .args([
@@ -158,17 +158,23 @@ mod tests {
     #[test]
     #[ignore = "child process"]
     fn limited_child() {
-        // Room for what is mapped now plus 16 MiB, less than the 64 MiB below.
-        let limit = libc::rlim_t::try_from(vm_size() + 16 * 1024 * 1024).unwrap();
+        // Prefer room for current mappings plus 16 MiB, but an unprivileged
+        // child cannot raise its inherited hard limit (often only 8 MiB).
+        let (_, hard) = memlock_limit().unwrap();
+        let limit = libc::rlim_t::try_from(vm_size() + 16 * 1024 * 1024)
+            .unwrap()
+            .min(hard);
         let lim = libc::rlimit {
             rlim_cur: limit,
-            rlim_max: limit,
+            rlim_max: hard,
         };
         // SAFETY: `setrlimit` only reads the `rlimit` on this stack frame.
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) }, 0);
-        assert!(
-            lock_memory().is_err(),
-            "a limited process must not be locked"
+        let error = lock_memory().expect_err("a limited process must not be locked");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::Other,
+            "the partial-limit guard must refuse before mlockall: {error}"
         );
         // Mapping and touching 64 MiB afterwards must work: with the old
         // `lock_memory` (everything locked, 16 MiB left) this aborts.

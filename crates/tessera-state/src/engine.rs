@@ -26,10 +26,14 @@ use tessera_control_types::{
 };
 
 use crate::bus::{EventBus, Subscription};
-use crate::config::{BridgeConfig, BridgeDirection, ClockLock, Config, DeviceLock, NetworkLock};
+use crate::config::{
+    BridgeConfig, BridgeDirection, ClockLock, Config, ControlLock, DeviceLock, NetworkLock,
+};
 use crate::env::{Clock, Environment, RateLimit, validate_name};
 use crate::error::{Issue, StartError, StateError};
-use crate::loader::{ConfigPaths, LoadedConfig, Overrides, load_config_with};
+use crate::loader::{
+    ConfigPaths, LoadedConfig, Overrides, load_from_sources_for_state, read_sources,
+};
 use crate::model::{
     DeviceModel, Model, SubscriptionEntry, WireDeviceId, latency_allowed, reconcile,
 };
@@ -294,8 +298,11 @@ impl StateEngine {
         overrides: Overrides,
         clock: Arc<dyn Clock>,
     ) -> Result<(Self, StartupReport), StartError> {
-        let loaded =
-            load_config_with(&paths.config, &env, &overrides).map_err(StartError::Config)?;
+        let sources = read_sources(&paths.config).map_err(StartError::Config)?;
+        // Resolve state_dir without consulting legacy controller intent. Read
+        // sources once so a concurrent file edit cannot split the two passes.
+        let mut loaded = load_from_sources_for_state(&sources, &env, &overrides, true)
+            .map_err(StartError::Config)?;
         let host: Vec<Issue> = validate_for_start(&loaded.config, &env)
             .into_iter()
             .filter(Issue::is_error)
@@ -311,6 +318,13 @@ impl StateEngine {
         // No writer can be active yet: drop leftovers of an interrupted write.
         remove_stale_temporaries(&state_path);
         let (mut intent, load) = load_state(&state_path).map_err(StartError::State)?;
+        loaded = load_from_sources_for_state(
+            &sources,
+            &env,
+            &overrides,
+            intent.protocol_flows.is_some(),
+        )
+        .map_err(StartError::Config)?;
 
         let new_identities: Vec<DeviceKey> = loaded
             .config
@@ -520,6 +534,7 @@ impl StateEngine {
                 d.tx_channel_labels.clone_from(&m.tx_labels);
             }
         }
+        cfg.flows.clone_from(&self.model.flows);
         cfg.clock.role = self.model.clock.role;
         cfg.clock.priority = self.model.clock.priority;
         if let Some(p) = &self.model.network.selected {
@@ -527,6 +542,15 @@ impl StateEngine {
             cfg.network.interfaces.insert(0, p.clone());
         }
         cfg.to_toml()
+    }
+
+    /// Configuration with the effective flow set, for the runtime reconciler.
+    /// Device and clock runtime values remain available through `model()`.
+    #[must_use]
+    pub fn runtime_config(&self) -> Config {
+        let mut config = self.config.config.clone();
+        config.flows.clone_from(&self.model.flows);
+        config
     }
 
     /// Snapshot of one device.
@@ -607,7 +631,12 @@ impl StateEngine {
         self.runtime_subs.insert(key, new);
         self.bus.publish(&Event::SubscriptionChanged {
             device: device.clone(),
+            status: status.clone(),
+        });
+        self.bus.publish(&Event::SubscriptionChangedWithOrigin {
+            device: device.clone(),
             status,
+            origin: Origin::Internal,
         });
         Ok(())
     }
@@ -918,7 +947,23 @@ impl StateEngine {
 
         let dry_run = matches!(cmd, Command::SetDeviceChannels { dry_run: true, .. });
         let mut intent = self.intent.clone();
-        if !self.mutate(&mut intent, &cmd)? {
+        let changed = match self.mutate(&mut intent, &cmd) {
+            Ok(changed) => changed,
+            Err(error) => {
+                if !dry_run {
+                    if let CommandError::Locked { field, .. } = &error {
+                        let (field, attempted) = command_field(&cmd, field);
+                        self.bus.publish(&Event::LockedValueRefused {
+                            field,
+                            origin,
+                            attempted,
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if !changed {
             return Ok(Applied {
                 impact: dry_run.then(|| crate::impact::no_impact(&cmd)),
                 ..Applied::default()
@@ -942,7 +987,8 @@ impl StateEngine {
         if let Some(c) = gate {
             c.check(&impact)?;
         }
-        let events = self.diff_models(&self.model, &model, &origin);
+        let mut events = self.diff_models(&self.model, &model, &origin);
+        events.extend(runtime_changes(&self.intent, &intent, &origin));
         let effects: Vec<Effect> = model
             .devices
             .iter()
@@ -984,6 +1030,41 @@ impl StateEngine {
     /// anything changed. Never modifies `intent` on error.
     fn mutate(&self, intent: &mut StateFile, cmd: &Command) -> Result<bool, CommandError> {
         match cmd {
+            Command::SetProtocolFlows { flows } => {
+                if self
+                    .config
+                    .config
+                    .control
+                    .locked
+                    .contains(&ControlLock::Flows)
+                {
+                    return Err(locked("flows"));
+                }
+                let converted = crate::flows::from_specs(flows, &self.env).map_err(flow_invalid)?;
+                let mut config = self.config.config.clone();
+                config.flows.extend(converted);
+                for dc in &mut config.devices {
+                    if let Some(d) = self.model.device(&dc.id) {
+                        dc.rx_channels = d.rx_channels;
+                        dc.tx_channels = d.tx_channels;
+                        dc.sample_rate = d.sample_rate;
+                        dc.encoding = d.encoding;
+                        dc.latency_us = d.latency_us;
+                    }
+                }
+                let issues: Vec<Issue> = crate::validate::validate(&config, &self.env)
+                    .into_iter()
+                    .filter(Issue::is_error)
+                    .collect();
+                if !issues.is_empty() {
+                    return Err(flow_invalid(issues));
+                }
+                if intent.protocol_flows.as_ref() == Some(flows) {
+                    return Ok(false);
+                }
+                intent.protocol_flows = Some(flows.clone());
+                Ok(true)
+            }
             Command::SetDeviceName { device, name } => {
                 let d = self.device_for(device)?;
                 if d.locked.contains(&DeviceLock::Name) {
@@ -1375,7 +1456,7 @@ impl StateEngine {
             return Ok(false);
         }
         let (problems, _) = crate::impact::channel_problems(
-            &self.config.config,
+            &self.runtime_config(),
             dc,
             d.sample_rate,
             d.latency_us,
@@ -1491,8 +1572,16 @@ impl StateEngine {
 
     /// Everything a reload would do, without doing it.
     fn prepare_reload(&self) -> Result<PreparedReload, CommandError> {
-        let mut loaded =
-            load_config_with(&self.paths.config, &self.env, &self.overrides).map_err(|e| {
+        let mut loaded = read_sources(&self.paths.config)
+            .and_then(|sources| {
+                load_from_sources_for_state(
+                    &sources,
+                    &self.env,
+                    &self.overrides,
+                    self.intent.protocol_flows.is_some(),
+                )
+            })
+            .map_err(|e| {
                 let reason = match &e {
                     crate::error::ConfigError::Invalid { issues } => issues
                         .iter()
@@ -1674,6 +1763,20 @@ impl StateEngine {
             effects.push(Effect::RestartKeysChanged(restart_keys));
         }
         events.extend(Self::diff_clock(&self.model, &model, &origin));
+        if self.model.flows != model.flows {
+            effects.push(Effect::ConfigSectionChanged("flow"));
+            events.push(Event::ProtocolFlowsChanged {
+                flows: model
+                    .flows
+                    .iter()
+                    .filter(|f| !loaded.config.flows.iter().any(|host| host.id == f.id))
+                    .map(|f| f.id.clone())
+                    .collect(),
+                origin: origin.clone(),
+            });
+        }
+        events.extend(runtime_changes(&self.intent, &intent, &origin));
+        events.push(Event::ConfigReloadedWithOrigin { origin });
         events.push(Event::ConfigReloaded);
         let impact = crate::impact::reload_impact(
             &self.config.config,
@@ -1705,6 +1808,17 @@ impl StateEngine {
             }
         }
         out.extend(Self::diff_clock(old, new, origin));
+        if old.flows != new.flows {
+            out.push(Event::ProtocolFlowsChanged {
+                flows: new
+                    .flows
+                    .iter()
+                    .filter(|f| !self.config.config.flows.iter().any(|host| host.id == f.id))
+                    .map(|f| f.id.clone())
+                    .collect(),
+                origin: origin.clone(),
+            });
+        }
         if old.network.selected != new.network.selected {
             out.push(Event::NetworkSettingsChanged {
                 selected: new.network.selected.clone(),
@@ -1817,6 +1931,20 @@ impl StateEngine {
                 }
             }
         }
+        let companions: Vec<Event> = ev
+            .iter()
+            .filter_map(|event| match event {
+                Event::SubscriptionChanged { device, status } => {
+                    Some(Event::SubscriptionChangedWithOrigin {
+                        device: device.clone(),
+                        status: status.clone(),
+                        origin: origin.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        ev.extend(companions);
         ev
     }
 
@@ -2031,6 +2159,19 @@ impl StateEngine {
         {
             return Err("locked primary interface has a runtime selection".into());
         }
+        let mut effective = self.runtime_config();
+        for dc in &mut effective.devices {
+            if let Some(d) = self.model.device(&dc.id) {
+                dc.rx_channels = d.rx_channels;
+                dc.tx_channels = d.tx_channels;
+            }
+        }
+        if let Some(issue) = crate::validate::validate(&effective, &self.env)
+            .into_iter()
+            .find(|i| i.is_error() && i.path.starts_with("flow["))
+        {
+            return Err(issue.to_string());
+        }
         let mut again = self.intent.clone();
         let (model, _, changed) = reconcile(cfg, &mut again, &self.env);
         if changed || model != self.model {
@@ -2065,6 +2206,122 @@ enum Confirm {
     Blind,
     /// Confirmed for the impact with this token.
     Expecting(ImpactToken),
+}
+
+fn flow_invalid(issues: Vec<Issue>) -> CommandError {
+    let field = issues
+        .iter()
+        .find(|i| i.is_error())
+        .map_or("flows", |i| i.path.as_str());
+    invalid(
+        field,
+        issues
+            .iter()
+            .filter(|i| i.is_error())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// Expand legacy short error fields into paths without changing their wire shape.
+fn command_field(cmd: &Command, refused: &str) -> (String, Option<String>) {
+    let (path, value) = match cmd {
+        Command::SetProtocolFlows { .. } => ("flows".into(), None),
+        Command::SetClockRole { role } => ("clock.role".into(), Some(format!("{role:?}"))),
+        Command::SetClockPriority { priority } => {
+            ("clock.priority".into(), Some(priority.to_string()))
+        }
+        Command::SetPrimaryInterface { interface } => {
+            ("network.primary".into(), Some(format!("{interface:?}")))
+        }
+        Command::SetDeviceName { device, name } => {
+            (format!("device.{}.name", device.0), Some(name.clone()))
+        }
+        Command::SetChannelLabel {
+            device,
+            direction,
+            channel,
+            label,
+        } => {
+            let side = match direction {
+                Direction::Rx => "rx",
+                Direction::Tx => "tx",
+            };
+            (
+                format!("device.{}.{side}_channel_labels.{channel}", device.0),
+                Some(format!("{label:?}")),
+            )
+        }
+        Command::SetSampleRate { device, rate } => (
+            format!("device.{}.sample_rate", device.0),
+            Some(rate.0.to_string()),
+        ),
+        Command::SetEncoding { device, encoding } => (
+            format!("device.{}.encoding", device.0),
+            Some(encoding.0.to_string()),
+        ),
+        Command::SetLatency { device, latency } => (
+            format!("device.{}.latency_us", device.0),
+            Some(latency.0.to_string()),
+        ),
+        Command::SetDeviceChannels { device, rx, tx, .. } => (
+            format!("device.{}.{refused}", device.0),
+            Some(if refused == "rx_channels" { rx } else { tx }.to_string()),
+        ),
+        _ => (refused.into(), None),
+    };
+    (path, value.filter(|s| s.len() <= 128))
+}
+
+fn runtime_changes(before: &StateFile, after: &StateFile, origin: &Origin) -> Vec<Event> {
+    let mut fields = Vec::new();
+    if before.protocol_flows != after.protocol_flows {
+        fields.push("flows".to_owned());
+    }
+    if before.clock.role != after.clock.role {
+        fields.push("clock.role".to_owned());
+    }
+    if before.clock.priority != after.clock.priority {
+        fields.push("clock.priority".to_owned());
+    }
+    if before.network.primary != after.network.primary {
+        fields.push("network.primary".to_owned());
+    }
+    let keys: BTreeSet<&String> = before.device.keys().chain(after.device.keys()).collect();
+    for key in keys {
+        let empty = crate::persist::DeviceIntent::default();
+        let a = before.device.get(key).unwrap_or(&empty);
+        let b = after.device.get(key).unwrap_or(&empty);
+        for (name, changed) in [
+            ("name", a.name != b.name),
+            ("sample_rate", a.sample_rate != b.sample_rate),
+            ("encoding", a.encoding != b.encoding),
+            ("latency_us", a.latency_us != b.latency_us),
+            ("rx_channels", a.rx_channels != b.rx_channels),
+            ("tx_channels", a.tx_channels != b.tx_channels),
+            (
+                "rx_channel_labels",
+                a.rx_channel_labels != b.rx_channel_labels,
+            ),
+            (
+                "tx_channel_labels",
+                a.tx_channel_labels != b.tx_channel_labels,
+            ),
+            ("subscription", a.subscription != b.subscription),
+        ] {
+            if changed {
+                fields.push(format!("device.{key}.{name}"));
+            }
+        }
+    }
+    fields
+        .into_iter()
+        .map(|field| Event::RuntimeValueChanged {
+            field,
+            origin: origin.clone(),
+        })
+        .collect()
 }
 
 impl Confirm {

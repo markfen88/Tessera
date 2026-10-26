@@ -1,0 +1,31 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: tessera-dsp
+Source: https://github.com/markfen88/Tessera
+
+Files: *
+Copyright: 2026 Tessera contributors
+License: MPL-2.0
+
+Files: usr/lib/tessera-dsp/camilladsp
+Copyright: Henrik Enquist and the CamillaDSP contributors
+License: GPL-3.0+
+
+Files: usr/lib/tessera-dsp/gui/* etc/camilladsp/*
+Copyright: Henrik Enquist and the CamillaGUI contributors
+License: GPL-3.0+
+Comment: The GUI backend is the official PyInstaller bundle; it carries its own Python runtime and
+ third-party libraries under their own licences (see the files inside the bundle).
+
+License: MPL-2.0
+ This Source Code Form is subject to the terms of the Mozilla Public
+ License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ You can obtain one at https://mozilla.org/MPL/2.0/.
+ .
+ On Debian systems the full text is in /usr/share/common-licenses/MPL-2.0.
+
+License: GPL-3.0+
+ This program is free software: you can redistribute it and/or modify it under the terms of the
+ GNU General Public License as published by the Free Software Foundation, either version 3 of the
+ License, or (at your option) any later version.
+ .
+ On Debian systems the full text is in /usr/share/common-licenses/GPL-3.

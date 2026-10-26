@@ -1,0 +1,7 @@
+# Speaker with the CamillaDSP stage: tesserad serves the PCM "tessera" and CamillaDSP plays to the
+# card (see docs/dsp.md). No in-daemon bridge: the card has one owner.
+[[device]]
+id = "main"
+rx_channels = 2
+tx_channels = 0
+sample_rate = 48000

@@ -10,19 +10,28 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+test = false
+bench = false
+doctest = false
+
+[[bin]]
+name = "tessera-network"
+path = "src/main.rs"
+test = false
+bench = false
+
 [dependencies]
-tessera-state = { path = "../tessera-state", version = "0.2.1" }
+tessera-state = { path = "../tessera-state", version = "0.3.0" }
+tessera-control-types = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 yaml-rust2 = { version = "0.13", default-features = false }
 toml = "1.1"
 getrandom = "0.4"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 nix = { version = "0.31", default-features = false, features = ["fs", "user", "socket"] }
 
 [lints]
 workspace = true
-
-
-[lib]
-test = false
-doctest = false

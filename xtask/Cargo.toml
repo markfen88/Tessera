@@ -1,0 +1,27 @@
+[package]
+autotests = false
+autoexamples = false
+autobenches = false
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Rust build, packaging and validation tasks for Tessera"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+minisign = "=0.7.9"
+sha2 = "0.10"
+tessera-bundle = { path = "../crates/tessera-bundle" }
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+serde_json = "1"
+
+[lints]
+workspace = true

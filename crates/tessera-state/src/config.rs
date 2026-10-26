@@ -177,6 +177,14 @@ string_enum! {
 }
 
 string_enum! {
+    /// `[control] locked`: host-owned runtime domains (ADR 0015).
+    ControlLock {
+        /// Configuration owns flows; controller flow commands are refused.
+        Flows = "flows",
+    }
+}
+
+string_enum! {
     /// `[network] locked` entries: the network values that config can pin
     /// (ADR 0012).
     NetworkLock {
@@ -283,6 +291,8 @@ impl Default for DaemonConfig {
 /// `[control]`: the local control socket (ADR 0008, ADR 0010).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlConfig {
+    /// Runtime domains owned by the host configuration.
+    pub locked: BTreeSet<ControlLock>,
     /// Largest request or response frame, bytes.
     pub max_frame_bytes: u64,
     /// Most simultaneous control connections.
@@ -325,6 +335,7 @@ fn serialize_mode<S: Serializer>(m: &u32, s: S) -> Result<S::Ok, S::Error> {
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
+            locked: BTreeSet::new(),
             max_frame_bytes: 1 << 20,
             max_connections: 256,
             max_connections_per_uid: 16,
@@ -1029,6 +1040,10 @@ pub struct Config {
     /// `[[flow]]` (PROVISIONAL static flows).
     #[serde(rename = "flow")]
     pub flows: Vec<FlowConfig>,
+    /// Transitional controller-file flows; omitted from rendered host config.
+    /// The effective model includes them only before a protocol set is stored.
+    #[serde(skip)]
+    pub legacy_protocol_flows: Vec<FlowConfig>,
 }
 
 impl Config {
@@ -1463,6 +1478,9 @@ pub(crate) fn extract(table: Table, env: &Environment) -> (Config, Vec<Issue>) {
             }
         });
         root.section("control", &mut cfg.control, |r, c| {
+            if let Some(v) = r.enum_list("locked", ControlLock::parse, &ControlLock::names()) {
+                c.locked = v.into_iter().collect();
+            }
             if let Some(v) = r.u64("max_frame_bytes") {
                 c.max_frame_bytes = v;
             }

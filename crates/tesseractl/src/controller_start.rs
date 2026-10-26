@@ -14,6 +14,17 @@ impl std::fmt::Display for UnsupportedDevice {
 
 impl std::error::Error for UnsupportedDevice {}
 
+#[derive(Debug)]
+struct PendingIdentity;
+
+impl std::fmt::Display for PendingIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("waiting for the daemon to persist its device identity")
+    }
+}
+
+impl std::error::Error for PendingIdentity {}
+
 fn failure_exit(error: &(dyn std::error::Error + 'static)) -> ExitCode {
     if error.is::<UnsupportedDevice>() {
         ExitCode::from(78)
@@ -49,7 +60,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(toml::Value::as_str)
         .ok_or("missing daemon state directory")?;
     let state_path = std::path::Path::new(state_dir).join("state.toml");
-    let args = runtime_args(&status, &std::fs::read_to_string(state_path)?, &key)?;
+    let mut announced = false;
+    let args = wait_for_identity(&status, &state_path, &key, || {
+        if !announced {
+            eprintln!("tessera-controller: {PendingIdentity}");
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    })?;
     let preset = std::fs::read_to_string("/usr/lib/tessera/controller.args")?;
     let error = Command::new("/usr/lib/tessera/cmc-probe")
         .args(args)
@@ -60,6 +78,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .exec();
     Err(error.into())
+}
+
+fn wait_for_identity(
+    status: &serde_json::Value,
+    path: &std::path::Path,
+    key: &str,
+    mut wait: impl FnMut(),
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(state) => match runtime_args(status, &state, key) {
+                Err(error) if error.is::<PendingIdentity>() => {}
+                result => return result,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Never invent an identity while the daemon's atomic first flush is
+        // pending. Keep this process alive rather than restarting the unit.
+        wait();
+    }
 }
 
 fn runtime_args(
@@ -114,7 +153,7 @@ fn runtime_args(
         .and_then(|d| d.get(key))
         .and_then(|d| d.get("wire_device_id"))
         .and_then(toml::Value::as_str)
-        .ok_or("daemon has not persisted its device identity yet")?;
+        .ok_or(PendingIdentity)?;
     if id.len() != 16 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid device identity".into());
     }
@@ -138,6 +177,38 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_flush_waits_in_process_and_invalid_state_is_not_hidden() {
+        let path =
+            std::env::temp_dir().join(format!("tessera-controller-state-{}", std::process::id()));
+        let status = serde_json::json!({
+            "network": {"primary":"eth0", "interfaces":[
+                {"name":"eth0", "ipv4":"192.0.2.3", "mac":"00:11:22:33:44:55", "wireless":false,"carrier":true}]},
+            "devices":[{"key":"main","name":"Studio"}]
+        });
+        let mut waits = 0;
+        let args = wait_for_identity(&status, &path, "main", || {
+            waits += 1;
+            std::fs::write(
+                &path,
+                if waits == 1 {
+                    ""
+                } else {
+                    "[device.main]\nwire_device_id = '0123456789abcdef'\n"
+                },
+            )
+            .unwrap();
+        })
+        .unwrap();
+        assert_eq!(waits, 2);
+        assert_eq!(args[3], "0123456789abcdef");
+        std::fs::write(&path, "invalid = [").unwrap();
+        assert!(
+            wait_for_identity(&status, &path, "main", || panic!("invalid state must fail"))
+                .is_err()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn unsupported_device_stops_retries_but_transient_errors_retry() {
         assert_eq!(

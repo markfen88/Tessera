@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "control_wire_version": 1,
   "standalone_network_api": 1,
   "features": {
@@ -8,15 +8,80 @@
       "scope": "standalone",
       "management_ipv4": true,
       "audio_interface_lock": true,
-      "vlan_ids": [1, 4094],
+      "vlan_ids": [
+        1,
+        4094
+      ],
       "confirmation_seconds": 60,
+      "confirmation_policies": [
+        "require_management_address",
+        "token_only"
+      ],
+      "default_confirmation_policy": "require_management_address",
+      "typed_confirmation_errors": true,
       "apply_delay_seconds": 3,
       "initial_guard_seconds": 180,
       "boot_recovery_before_online": true,
-      "backends": ["networkd", "netplan"],
-      "external_network_owner": "ndimon"
+      "backends": [
+        "networkd",
+        "netplan"
+      ],
+      "external_network_owner": "ndimon",
+      "token_json_aliases": [
+        "/api/net-pending",
+        "/api/net-confirm",
+        "/api/net-revert"
+      ],
+      "shared_token_failure_budget": {
+        "failures": 5,
+        "rolling_seconds": 60,
+        "routes": [
+          "pending",
+          "keep",
+          "revert"
+        ]
+      },
+      "server_owned_keep_decision": true,
+      "staged_confirmation_policy": true,
+      "pending_phases": [
+        "staged",
+        "applying",
+        "applied",
+        "failed"
+      ],
+      "apply_runtime_seconds": 90,
+      "recovery_retry_seconds": 10
+    },
+    "network_engine_adr15": {
+      "documentation": "network-vlans.md",
+      "status": "implemented",
+      "live_acceptance": "pending",
+      "backend_candidates": [
+        "networkd",
+        "netplan",
+        "networkmanager",
+        "ifupdown"
+      ],
+      "wired_ethernet_only": true,
+      "foreign_vlan_adoption": false,
+      "networkd_exact_pins": true,
+      "foreign_configuration_drift": true,
+      "networkmanager_parent_identity": "uuid",
+      "netplan_networkmanager_files_untouched": true,
+      "ifupdown_explicit_handoff": true,
+      "ifupdown_dhcp_client": "isc_dhclient",
+      "semantic_document_version": 1,
+      "revision_encoding": "canonical_decimal_string_u64",
+      "legacy_revision_max": "9007199254740991",
+      "ifupdown_dhcp_activation": "proven_isc_nowait",
+      "private_directory_mode": "0700",
+      "private_record_mode": "0600",
+      "private_owner": "root:root",
+      "handoff_preparation": true,
+      "ownership_transfer": true
     }
   },
   "built_against_ndimon": null,
-  "tested_with_ndimon": []
+  "tested_with_ndimon": [],
+  "standalone_network_document_api": 2
 }

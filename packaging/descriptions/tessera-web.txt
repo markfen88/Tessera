@@ -1,0 +1,11 @@
+Description: web portal for the tessera daemon
+ tessera-web serves pages and a JSON API for a tessera device: status, the
+ signal path, the network interface, device settings, subscriptions, the
+ clock, metrics, events and the configuration in effect. It talks to the
+ daemon over its local control socket. Standalone VLAN configuration uses a
+ separate privileged Rust helper with device-side recovery.
+ .
+ Every page needs the operator password (initially tessera on fresh installs;
+ change it with 'tessera-web set-password'). By default it listens only on
+ 127.0.0.1:8090;
+ see /etc/tessera/web.toml.

@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::User;
+use tessera_network::handoff::{
+    Command as HandoffCommand, ControlRequest, Product, Request as HandoffRequest,
+};
 use tessera_network::{SOCKET, engine::Engine, read_line};
-use tessera_state::network_profiles::Request;
 
 fn main() -> ExitCode {
     // Netplan's generated networkd files must retain their intended group
@@ -23,14 +25,81 @@ fn main() -> ExitCode {
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
     let engine = Engine::default();
+    let handoff = match args.as_slice() {
+        [op, action, owner] if op == "handoff" && action == "prepare" && owner == "ndimon" => {
+            Some(HandoffCommand::HandoffPrepare {
+                receiver: Product::Ndimon,
+            })
+        }
+        [op, action, id] if op == "handoff" && action == "cancel" => {
+            Some(HandoffCommand::HandoffCancel { id: id.clone() })
+        }
+        [op, action, product, id]
+            if op == "handoff" && action == "import" && product == "ndimon" =>
+        {
+            Some(HandoffCommand::HandoffImport {
+                product: Product::Ndimon,
+                id: id.clone(),
+            })
+        }
+        [op, action, product, id, impact]
+            if op == "handoff" && action == "commit" && product == "ndimon" =>
+        {
+            Some(HandoffCommand::HandoffCommit {
+                product: Product::Ndimon,
+                id: id.clone(),
+                expect_impact: (impact != "--yes").then(|| impact.clone()),
+                confirm: impact == "--yes",
+            })
+        }
+        [op, action] if op == "handoff" && action == "status" => {
+            Some(HandoffCommand::HandoffStatus {})
+        }
+        _ => None,
+    };
+    if let Some(command) = handoff {
+        let reply =
+            engine.handle_control(ControlRequest::Handoff(HandoffRequest { api: 2, command }));
+        println!("{reply}");
+        return if reply.get("error").is_some_and(|v| !v.is_null()) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+    // Protected JSON stdin supports the same typed requests as control.sock,
+    // including Keep/Revert without placing a secret token in process arguments.
+    if args == ["request"] {
+        return match read_line::<ControlRequest>(std::io::stdin().lock()) {
+            Ok(req) => {
+                let reply = engine.handle_control(req);
+                println!("{reply}");
+                if reply.get("error").is_some_and(|v| !v.is_null()) {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = match args.as_slice() {
         [op] if op == "serve" => serve(engine),
         [op] if op == "boot-recover" => engine.boot(),
         [op] if op == "recover-expired" => engine.recover(None, true),
         [op, token] if op == "apply" => engine.apply(token),
         [op, token] if op == "recover" => engine.recover(Some(token), false),
+        [op] if op == "accept-current" => engine
+            .accept_current(false)
+            .map(|report| print!("{report}")),
+        [op, yes] if op == "accept-current" && yes == "--yes" => engine
+            .accept_current(true)
+            .map(|report| print!("{report}")),
         _ => Err(
-            "usage: tessera-network serve|boot-recover|recover-expired|apply TOKEN|recover TOKEN"
+            "usage: tessera-network serve|boot-recover|recover-expired|apply JOB|recover JOB|accept-current [--yes]|handoff prepare ndimon|handoff cancel ID|handoff import ndimon ID|handoff commit ndimon ID IMPACT|handoff status|request"
                 .into(),
         ),
     };
@@ -85,8 +154,9 @@ fn respond(engine: &Engine, mut stream: UnixStream) -> Result<(), String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
-    let request: Request = read_line(&stream)?;
-    let mut data = serde_json::to_vec(&engine.handle(request)).map_err(|e| e.to_string())?;
+    let request: ControlRequest = read_line(&stream)?;
+    let mut data =
+        serde_json::to_vec(&engine.handle_control(request)).map_err(|e| e.to_string())?;
     data.push(b'\n');
     stream.write_all(&data).map_err(|e| e.to_string())
 }

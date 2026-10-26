@@ -1,0 +1,2 @@
+# The compatibility instance follows the daemon lifetime by design.
+tessera: systemd-service-file-refers-to-unusual-wantedby-target tesserad.service [usr/lib/systemd/system/tessera-controller@.service]

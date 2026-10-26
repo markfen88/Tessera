@@ -22,7 +22,7 @@ default = ["std"]
 alloc = []
 std = ["alloc"]
 
-
 [lib]
 test = false
+bench = false
 doctest = false

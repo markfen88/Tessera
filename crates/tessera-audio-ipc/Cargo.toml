@@ -10,6 +10,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 # ADR 0002/0003: this crate depends on nothing but nix (which wraps libc).
 nix = { version = "0.31", default-features = false, features = ["fs", "mman", "socket", "uio", "event", "time", "poll", "resource"] }
@@ -22,7 +27,3 @@ force-split-overlay-reads = []
 
 [lints]
 workspace = true
-
-[lib]
-test = false
-doctest = false

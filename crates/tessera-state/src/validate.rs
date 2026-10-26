@@ -524,10 +524,18 @@ fn check_bridges(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
 fn check_flows(config: &Config, out: &mut Vec<Issue>) {
     let err = |out: &mut Vec<Issue>, key: String, msg: String| out.push(Issue::error(key, msg));
     let mut ids = BTreeSet::new();
+    let mut endpoints = std::collections::HashMap::new();
     // rx flows seen so far: (index, device, channels (explicit), flow).
     let mut rx_seen: Vec<(usize, &crate::config::FlowConfig)> = Vec::new();
     for (i, f) in config.flows.iter().enumerate() {
         let p = format!("flow[{i}]");
+        if let Some(previous) = endpoints.insert((f.peer, f.port, f.direction), i) {
+            err(
+                out,
+                format!("{p}.peer"),
+                format!("one flow per peer, port and direction: duplicates flow[{previous}]"),
+            );
+        }
         let valid_id = !f.id.is_empty()
             && f.id
                 .chars()

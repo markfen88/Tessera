@@ -18,6 +18,7 @@ pub mod convert;
 pub mod error;
 pub mod settings;
 pub mod stream;
+mod tick;
 
 #[cfg(feature = "plugin")]
 #[doc(hidden)]

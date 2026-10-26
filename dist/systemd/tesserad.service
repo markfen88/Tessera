@@ -2,8 +2,8 @@
 #
 # Install as /usr/lib/systemd/system/tesserad.service. The users and groups
 # come from dist/sysusers.d/tessera.conf, the directories from
-# dist/tmpfiles.d/tessera.conf (RuntimeDirectory/StateDirectory below also
-# create them on demand).
+# dist/tmpfiles.d/tessera.conf. tmpfiles is the sole directory owner; service
+# startup must not recursively change the shared configuration tree.
 #
 # Reload (re-read /etc/tessera): `systemctl reload tesserad`. Type=notify-reload
 # makes systemctl wait for the daemon's RELOADING=1 ... READY=1 pair. A
@@ -36,12 +36,7 @@ WatchdogSec=10s
 # Keep this above the sum.
 TimeoutStopSec=30s
 
-# Directories (created and owned by the service manager).
-RuntimeDirectory=tessera
-RuntimeDirectoryMode=0755
-StateDirectory=tessera
-StateDirectoryMode=0750
-ConfigurationDirectory=tessera
+# Directories are created by systemd-tmpfiles, including at boot.
 
 # Real-time scheduling and locked memory come from limits, not from root
 # (ADR 0004, ADR 0010). The daemon raises its soft RLIMIT_NOFILE itself.
@@ -57,6 +52,7 @@ NoNewPrivileges=yes
 
 # Filesystem.
 ProtectSystem=strict
+ReadWritePaths=/var/lib/tessera /run/tessera
 ProtectHome=yes
 ProtectProc=invisible
 PrivateTmp=yes

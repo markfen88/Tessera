@@ -12,8 +12,11 @@ applications attach to it through local sockets.
 | `tesseractl` | operator | Typed commands and queries over `control.sock` |
 | `tessera-web` | system service, `tessera-web` user | Authenticated pages/API; daemon control client; standalone network-helper client |
 | `tessera-network` | separate privileged helper | Supported OS networking, firewall isolation, transaction journal and recovery |
+| `tessera-controller@main` | system service, `tessera` user, `PartOf` the daemon | Controller compatibility runtime: serves the first logical device's base control ports and submits controller flows to the daemon as a typed command |
 | `tessera-pw` | desktop user service | PipeWire source/sink nodes using the audio and control sockets |
 | `pcm.tessera` | inside an ALSA application | Capture/playback using shared-memory audio rings |
+| `camilladsp`, `camillagui` | system services, `camilla` user (`tessera-dsp`) | A speaker's equaliser stage: reads `pcm.tessera`, plays to the sound card; the GUI edits its configurations ([dsp.md](dsp.md)) |
+| `tessera-bundle` | root, run by an operator | Authenticated add-on installer (`install`, `uninstall`, `verify`); not a service ([bundle.md](bundle.md)) |
 | NDIMon Tessera plugin | NDIMon's host/plugin framework | Host settings, routing, lifecycle hooks and an explicitly pinned Tessera runtime |
 
 ```text
@@ -85,14 +88,27 @@ nominal sample-rate conversion is a separate concern. See
 
 The network helper accepts a typed model of named untagged/tagged networks,
 IPv4 configuration and management/audio role assignments. It supports one wired
-port with native networkd or Netplan/networkd and refuses unsupported complex
-configurations. Only owned files/rules are changed.
+port managed by systemd-networkd, Netplan/networkd, NetworkManager or ifupdown (one
+adapter per backend behind a common transaction lifecycle) and refuses unsupported
+complex configurations. Only owned files/rules are changed. A root-only handoff
+exchange can release the networking to NDIMon-R or receive it from it.
 
 Apply journals the previous state before activating a new configuration.
 Management changes require an explicit Keep from the new management destination
 within 60 seconds after readiness. A device-side timer handles expiry; revert,
 failure and boot recovery restore prior state. Browser polling cannot confirm a
 transaction. See [VLAN configuration](network-vlans.md).
+
+## Network speaker chain
+
+A speaker normally adds a CamillaDSP stage: network, `tesserad`, the ALSA PCM
+`tessera`, CamillaDSP (equaliser, gain, one asynchronous resampler that is the
+only clock crossing), the sound card. The speaker page of the portal controls it
+through the engine's websocket and a few files, and the volume through the
+card's mixer. The unit of the engine is `PartOf` and `WantedBy` the daemon, so it
+stops and starts with it. Without CamillaDSP the daemon's own hardware bridge
+plays to the card. See [CamillaDSP speaker DSP](dsp.md) and the
+[Raspberry Pi speaker](raspberry-pi-speaker.md).
 
 ## Security and diagnostics
 
@@ -112,7 +128,11 @@ errors. See [troubleshooting](troubleshooting.md).
 
 ## Source and releases
 
-Runtime crates and packaging live here. NDIMon host plugin source, compatibility
+Runtime crates and packaging live here. Packages and bundles are built by
+`cargo xtask`; the tree contains no shell or Python scripts, and the Debian
+maintainer hooks are native programs. A release is authenticated with minisign
+signatures that the bundle installer checks against keys the operator has
+provisioned ([bundle.md](bundle.md#trusted-release-keys)). NDIMon host plugin source, compatibility
 metadata, platform catalogs and archive assembly live in
 [NDIMon-Plugins](https://github.com/markfen88/NDIMon-Plugins). Each plugin release
 pins a native runtime bundle and checksum. Updating runtime source requires a

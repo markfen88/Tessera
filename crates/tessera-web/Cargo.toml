@@ -11,21 +11,23 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-test = false
-doctest = false
 name = "tessera_web"
 path = "src/lib.rs"
+test = false
+bench = false
+doctest = false
 
 [[bin]]
-test = false
 name = "tessera-web"
 path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
 tessera-control-types = { workspace = true }
-tessera-state = { path = "../tessera-state", version = "0.2.1" }
-tessera-network = { path = "../tessera-network", version = "0.2.1" }
-tesseractl = { path = "../tesseractl", version = "0.2.1" }
+tessera-state = { path = "../tessera-state", version = "0.3.0" }
+tessera-network = { path = "../tessera-network", version = "0.3.0" }
+tesseractl = { path = "../tesseractl", version = "0.3.0" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json", "query", "multipart"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "process", "signal", "sync", "time", "macros", "fs"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

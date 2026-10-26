@@ -3,7 +3,7 @@
 //! This is how `dist/etc/tessera/config.toml` (installed as
 //! `/etc/tessera/config.toml` and as
 //! `/usr/share/doc/tessera/examples/config.toml`) is produced, and what
-//! `packaging/build-deb.sh` and the `dist` test check it against. It is a
+//! `cargo xtask build-deb` and the `dist` test check it against. It is a
 //! development tool, not a product binary. `tesserad --print-default-config`
 //! prints the same text from the installed daemon; this example is the way to get it from the workspace without
 //! building the daemon. To regenerate the shipped file, from the workspace

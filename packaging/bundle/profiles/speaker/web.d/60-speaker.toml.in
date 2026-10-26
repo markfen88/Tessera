@@ -1,0 +1,48 @@
+# Written by the tessera bundle (speaker profile with CamillaDSP): the portal's Speaker page,
+# service switches, the EQ engine and its GUI link. Edit freely; the installer never overwrites it.
+# `tessera-web check` validates it; after changing the service list run
+#   tessera-web appliance polkit | sudo tee /etc/polkit-1/rules.d/49-tessera-web-appliance.rules
+[appliance]
+enabled = true
+
+[[appliance.service]]
+unit = "tesserad"
+label = "Network audio"
+description = "Tessera audio daemon"
+essential = true
+
+[[appliance.service]]
+unit = "tessera-controller@main"
+label = "Controller compatibility"
+description = "Interoperable with Dante® Controller"
+essential = true
+
+[[appliance.service]]
+unit = "camilladsp"
+label = "EQ engine"
+description = "CamillaDSP"
+
+[[appliance.service]]
+unit = "tessera-web"
+label = "This portal"
+description = "Tessera web portal"
+essential = true
+
+[[appliance.service]]
+unit = "tessera-network"
+label = "Network configuration"
+description = "Standalone network configuration"
+essential = true
+
+[[appliance.service]]
+unit = "avahi-daemon"
+label = "Device discovery"
+description = "Local network service discovery"
+essential = true
+
+[appliance.camilladsp]
+enabled = true
+# The vendored engine lives in a root-owned directory; the portal runs it only to check a configuration.
+binary = "/usr/lib/tessera-dsp/camilladsp"
+# {host} is the address this page was reached at, so the link survives a change of IP or name.
+gui_url = "http://{host}:5005/gui/index.html"

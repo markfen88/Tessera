@@ -8,10 +8,8 @@ Before=network-online.target tesserad.service tessera-web.service
 Type=exec
 User=root
 Group=tessera-web
-RuntimeDirectory=tessera-network
-RuntimeDirectoryMode=0750
-StateDirectory=tessera-network
-StateDirectoryMode=0700
+# tmpfiles owns both directories. The service group grants socket access only;
+# the journal and private records are explicitly root:root (NE-6.2).
 ExecStartPre=/usr/bin/tessera-network boot-recover
 ExecStart=/usr/bin/tessera-network serve
 Restart=on-failure
@@ -29,7 +27,10 @@ LockPersonality=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# AF_PACKET is for /usr/bin/arping, the duplicate-address check of a static
+# address (Revert, recovery and boot run it inside this service). Root already
+# holds CAP_NET_RAW; nothing else in this unit opens a raw socket.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 
 [Install]
 WantedBy=multi-user.target

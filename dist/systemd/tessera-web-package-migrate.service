@@ -1,0 +1,6 @@
+[Unit]
+Description=Apply Tessera portal package migrations
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/tessera-package configure-web

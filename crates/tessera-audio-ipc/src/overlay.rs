@@ -505,8 +505,15 @@ mod tests {
             updated_mono_ns: raw,
             ..snap(0)
         });
-        let media = r.now_media_ns().unwrap();
+        let snapshot = r.read().unwrap();
+        let media = snapshot.media_ns_at(raw + 20_000_000);
         assert!((10_000_000_000..10_050_000_000).contains(&media));
+        // Bracket the real call with the same raw timebase. Descheduling may
+        // widen this interval, but must not turn into a false conversion error.
+        let before = raw_monotonic_ns();
+        let media = r.now_media_ns().unwrap();
+        let after = raw_monotonic_ns();
+        assert!((snapshot.media_ns_at(before)..=snapshot.media_ns_at(after)).contains(&media));
     }
 
     #[test]

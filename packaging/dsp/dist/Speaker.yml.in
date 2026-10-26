@@ -1,0 +1,34 @@
+title: Speaker
+description: Flat starting point for a tessera speaker (tesserad -> pcm.tessera -> CamillaDSP -> DAC)
+devices:
+  samplerate: @RATE@
+  chunksize: 1024
+  queuelimit: 4
+  capture:
+    type: Alsa
+    channels: 2
+    device: tessera
+    format: S32_LE
+  playback:
+    type: Alsa
+    channels: 2
+    device: @PLAYBACK_DEVICE@
+    format: @PLAYBACK_FORMAT@
+  enable_rate_adjust: true
+  resampler:
+    type: AsyncSinc
+    profile: Balanced
+mixers: {}
+filters:
+  # The portal's "Signal boost" control edits the gain of this filter (0 to +30 dB). Keep the name.
+  dashboard_signal_boost:
+    type: Gain
+    parameters:
+      gain: 0.0
+      inverted: false
+      mute: false
+pipeline:
+- type: Filter
+  channels: null
+  names:
+  - dashboard_signal_boost

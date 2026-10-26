@@ -19,4 +19,5 @@ std = []
 
 [lib]
 test = false
+bench = false
 doctest = false

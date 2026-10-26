@@ -100,6 +100,9 @@ pub enum Cmd {
     Metrics,
     /// Show the in-daemon hardware-card bridges (`[[bridge]]`).
     Bridges,
+    /// Inspect flow counters or replace the controller-managed flow set.
+    #[command(subcommand)]
+    Flows(FlowCmd),
     /// Stream state-change events until interrupted.
     Watch(WatchArgs),
     /// Rename the device.
@@ -207,6 +210,21 @@ pub enum ClockCmd {
         /// Priority, 0 to 255.
         priority: u8,
     },
+}
+
+/// `tesseractl flows ...`.
+#[derive(Debug, Subcommand)]
+pub enum FlowCmd {
+    /// Show the flow counters also included in metrics.
+    Show,
+    /// Replace controller flows from a file containing only [[flow]] entries.
+    /// Host configuration flows are retained; normal confirmation applies.
+    Set {
+        /// TOML file containing the complete desired controller flow set.
+        file: PathBuf,
+    },
+    /// Clear controller flows, retaining the host configuration flows.
+    Clear,
 }
 
 /// `tesseractl network ...`.
@@ -319,6 +337,7 @@ pub fn to_command(cmd: &Cmd, device: &DeviceKey) -> Option<Command> {
             interface: primary_arg(interface),
         },
         Cmd::Config(ConfigCmd::Reload) => Command::ReloadConfig,
+        Cmd::Flows(FlowCmd::Clear) => Command::SetProtocolFlows { flows: Vec::new() },
         _ => return None,
     })
 }
@@ -479,5 +498,27 @@ mod tests {
         let cli = parse(&["status", "--json", "--socket", "/x"]).unwrap();
         assert!(cli.json);
         assert_eq!(cli.socket, PathBuf::from("/x"));
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+
+    #[test]
+    fn flow_commands_do_not_require_a_default_device() {
+        for args in [
+            vec!["tesseractl", "flows", "show"],
+            vec!["tesseractl", "flows", "clear"],
+            vec!["tesseractl", "flows", "set", "flows.toml"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(!needs_device(&cli.command));
+        }
+        let cli = Cli::try_parse_from(["tesseractl", "flows", "clear"]).unwrap();
+        assert_eq!(
+            to_command(&cli.command, &DeviceKey(String::new())),
+            Some(Command::SetProtocolFlows { flows: Vec::new() })
+        );
     }
 }

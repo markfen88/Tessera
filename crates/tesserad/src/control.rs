@@ -463,6 +463,9 @@ async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
                 return;
             }
             RequestBody::Query(q) => run_query(&ctx, q, max).await,
+            RequestBody::ProtocolCommand { peer, command, .. } => {
+                run_protocol_command(&ctx, uid, access_now(&ctx), peer, command).await
+            }
             RequestBody::Command(c) => {
                 run_command(&ctx, uid, access_now(&ctx), c, Confirm::No).await
             }
@@ -522,6 +525,51 @@ async fn run_query(ctx: &ControlCtx, q: Query, max_frame: usize) -> Result<Reply
 #[must_use]
 pub fn is_dry_run(cmd: &Command) -> bool {
     matches!(cmd, Command::SetDeviceChannels { dry_run: true, .. })
+}
+
+/// Authenticate the local adapter before granting a protocol origin. Audit
+/// metadata never grants rights and cannot bypass the command allowlist.
+fn protocol_origin(
+    access: Access,
+    peer: String,
+    command: &Command,
+) -> Result<Origin, CommandError> {
+    if !access.can_mutate() || !matches!(command, Command::SetProtocolFlows { .. }) {
+        return Err(CommandError::PermissionDenied);
+    }
+    if peer.is_empty() || peer.len() > 128 || peer.chars().any(char::is_control) {
+        return Err(invalid(
+            "peer",
+            "expected a nonempty protocol identity of at most 128 bytes without control characters",
+        ));
+    }
+    Ok(Origin::Protocol { peer })
+}
+
+async fn run_protocol_command(
+    ctx: &ControlCtx,
+    uid: u32,
+    access: Access,
+    peer: String,
+    command: Command,
+) -> Result<Reply, CommandError> {
+    let origin = protocol_origin(access, peer, &command).inspect_err(|error| {
+        if matches!(error, CommandError::PermissionDenied) {
+            inc(&ctx.counters.requests_denied);
+            ctx.peerlog
+                .note(uid, "refused protocol adapter command", command.kind());
+        }
+    })?;
+    tracing::info!(
+        uid,
+        kind = command.kind(),
+        "control: protocol adapter command"
+    );
+    let applied = ctx.engine.apply(origin, command).await?;
+    if !applied.effects.is_empty() {
+        ctx.effects.on_effects(&applied.effects);
+    }
+    Ok(Reply::Done)
 }
 
 async fn run_command(
@@ -714,5 +762,35 @@ mod tests {
         assert!(is_dry_run(&c(true)));
         assert!(!is_dry_run(&c(false)));
         assert!(!is_dry_run(&Command::ReloadConfig));
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_metadata_cannot_grant_permission_or_exempt_other_commands() {
+        let flows = Command::SetProtocolFlows { flows: Vec::new() };
+        assert_eq!(
+            protocol_origin(Access::ReadOnly, "controller".into(), &flows),
+            Err(CommandError::PermissionDenied)
+        );
+        assert_eq!(
+            protocol_origin(Access::Admin, "controller".into(), &Command::ReloadConfig),
+            Err(CommandError::PermissionDenied)
+        );
+        assert_eq!(
+            protocol_origin(Access::Admin, "controller".into(), &flows),
+            Ok(Origin::Protocol {
+                peer: "controller".into()
+            })
+        );
+        for peer in [String::new(), "x".repeat(129), "controller\nforged".into()] {
+            assert!(matches!(
+                protocol_origin(Access::Admin, peer, &flows),
+                Err(CommandError::Invalid { .. })
+            ));
+        }
     }
 }

@@ -5,6 +5,29 @@ and CamillaDSP for per-channel EQ. tessera follows the network's PTP clock and
 receives the audio; CamillaDSP filters it and plays it on the DAC. These are configuration patterns for a dedicated wired speaker. Hardware audio
 and long-term clock behavior remain experimental; see [compatibility limits](interoperability.md).
 
+> **Shortcut.** Since 0.2.2 the `speaker` profile of the bundle sets up the *Direct* topology below
+> for you: `tessera-dsp` installs CamillaDSP and its GUI, writes the device configuration without a
+> bridge, seeds a flat CamillaDSP configuration for your card and turns on the portal's Speaker page
+> ([dsp.md](dsp.md)):
+>
+> ```sh
+> sudo ./tessera-bundle install --profile speaker --audio-card hw:CARD=<card> --yes
+> ```
+>
+> The installer authenticates the bundle first: provision the release key, or add `--allow-unsigned`
+> for a build that has none ([bundle.md](bundle.md#verifying-and-installing)). Install with `--no-dsp`
+> to get tessera alone with the in-daemon bridge. The rest of this page explains what the installer
+> does and the manual route (including the loopback variant).
+>
+> **A speaker that already runs CamillaDSP of its own** (a hand-made `camilladsp.service`, a
+> program and configurations in `/opt/camilladsp`) keeps them: the program, the configurations, the
+> state file and your portal service list are not touched, the EQ GUI is not added, and your unit
+> file is moved aside to `camilladsp.service.pre-tessera-dsp` so the packaged unit (which starts and
+> stops with the daemon) takes over. `uninstall --purge` deletes only what the bundle made. If the
+> speaker has Ethernet and Wi-Fi, name the management port with `[network] interface = "eth0"` in
+> `/etc/tessera/web.d/` before installing, so the EQ GUI (when it is added) listens on that address
+> only ([dsp.md](dsp.md)).
+
 ## Two topologies
 
 Pick **Direct** unless the speaker must also play local sources.
@@ -29,8 +52,8 @@ Pick **Direct** unless the speaker must also play local sources.
    not need (and which would need the PipeWire development headers):
 
    ```sh
-   SKIP_PW=1 packaging/build-deb.sh                                       # Direct
-   SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge packaging/build-deb.sh   # Loopback bridge
+   SKIP_PW=1 cargo xtask build-deb                                       # Direct
+   SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge cargo xtask build-deb   # Loopback bridge
    sudo apt install ./target/deb/tessera_*_arm64.deb ./target/deb/tessera-alsa_*_arm64.deb
    ```
 
@@ -104,7 +127,8 @@ only clock crossing.
 
    ```yaml
    devices:
-     samplerate: 96000              # the tessera device's rate
+     samplerate: 48000              # processing rate; see the note below
+     capture_samplerate: 48000      # must equal the tessera device's sample_rate
      chunksize: 1024
      enable_rate_adjust: true       # follow the DAC against the capture side
      resampler:
@@ -119,8 +143,27 @@ only clock crossing.
        channels: 2
    ```
 
+   The capture side opens `pcm.tessera` at `capture_samplerate`, or at
+   `samplerate` when that is unset, and the plugin accepts **only the device's
+   rate** (`sample_rate` of the `[[device]]`, 48000 in the speaker profile).
+   A mismatch makes CamillaDSP stop at start with
+   `Capture error: ALSA function 'snd_pcm_hw_params_set_rate' failed with error
+   'Invalid argument (22)'`, and the speaker stays silent while `tesserad` keeps
+   receiving. To process at a higher rate (for example `samplerate: 96000`),
+   keep `capture_samplerate` at the device's rate; the AsyncSinc resampler then
+   converts as part of the clock crossing, at some CPU cost and a little latency.
+
+   The portal's Speaker page shows a capture-rate mismatch, both rates and
+   the active configuration, and checks again after a device-rate change.
+   When a resampler is configured, or the processing rate already matches
+   the device, its one-click fix sets `capture_samplerate` to the device's
+   rate and reloads the EQ engine, keeping the file's comments and order.
+
    The plugin offers `S16_LE`, `S24_LE`, `S24_3LE`, `S32_LE` and `FLOAT_LE` at
-   the device's rate. Another device or channel range: define your own PCM
+   the device's rate. The card has its own list: a format it refuses stops the
+   engine with `snd_pcm_hw_params_set_format … Invalid argument`, and the Speaker
+   page then names the device and format and says to change `format` under
+   `devices` → `playback` ([dsp.md](dsp.md)). Another device or channel range: define your own PCM
    ([audio-backends.md](audio-backends.md#configuration)).
 3. Start CamillaDSP after `tesserad`. If the daemon restarts, the PCM reports
    `-ENODEV` and CamillaDSP must reopen it.

@@ -1,0 +1,12 @@
+.TH TESSERA-CONTROLLER-START 8 "" "Tessera" "System administration"
+.SH NAME
+tessera-controller-start \- Tessera system helper
+.SH SYNOPSIS
+.nf
+tessera-controller-start [DEVICE]
+.fi
+.SH DESCRIPTION
+Start the packaged compatibility runtime for the named logical device (default main), using the daemon configuration and persistent identity. Intended for the packaged systemd unit.
+Wait in the launcher until the daemon has persisted its identity; never generate a substitute identity or restart repeatedly because the first state file is absent.
+.SH SEE ALSO
+tesserad(8), tesseractl(1)

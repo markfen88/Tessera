@@ -1,0 +1,9 @@
+# tessera-dsp: the upstream artifacts the package vendors. Official release assets, pinned by
+# SHA-256 of the downloaded archive; packaging/dsp/fetch.sh refuses anything that differs.
+# Both programs are GPL-3.0-or-later and are shipped unmodified.
+#
+# component  version  arch   url  sha256
+camilladsp 4.1.3 amd64 https://github.com/HEnquist/camilladsp/releases/download/v4.1.3/camilladsp-linux-amd64.tar.gz 55f5ec2ed80fcc79a543672f9f89ace4557d290d80584ef31ee0442111bd0b11
+camilladsp 4.1.3 arm64 https://github.com/HEnquist/camilladsp/releases/download/v4.1.3/camilladsp-linux-aarch64.tar.gz d9a17092923ebfe5d20a770c6b6a7eb2268f9700f999bf604b9db09f518aca5a
+camillagui 4.1.0 amd64 https://github.com/HEnquist/camillagui-backend/releases/download/v4.1.0/bundle_linux_amd64.tar.gz 86fd3cde575038f312ede7bad0910dc5e46b974cafc048c26115ec3cb9f54792
+camillagui 4.1.0 arm64 https://github.com/HEnquist/camillagui-backend/releases/download/v4.1.0/bundle_linux_aarch64.tar.gz 9a5415b44dda58478f18de9fd572edf092f659fd5e45cbe8086ff5648dc089d7

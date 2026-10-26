@@ -1,0 +1,12 @@
+Description: CamillaDSP speaker DSP and web GUI for tessera
+ The DSP stage of a tessera speaker: CamillaDSP reads the network audio from
+ the ALSA PCM 'tessera' (package tessera-alsa), applies the equaliser and gain
+ stages of the active configuration and plays to the DAC, with its web GUI on
+ port 5005. The web portal (tessera-web) shows an 'EQ engine' switch, the
+ signal boost and a link to the GUI when it is configured for them.
+ .
+ Both programs are the unmodified upstream releases (GPL-3.0-or-later), pinned
+ by checksum; /usr/share/doc/tessera-dsp/vendored.txt names their versions.
+ The services are enabled but not started on install; the speaker profile of
+ the tessera bundle chooses the sound card and starts them. Install only
+ tessera and tessera-alsa for a speaker without DSP.

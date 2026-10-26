@@ -11,9 +11,12 @@
 # instances for the services under [[appliance.service]] in
 # /etc/tessera/web.toml). The helper re-reads web.toml, refuses anything
 # not in the allowlist, and runs one of
-#   /usr/bin/systemctl enable --now --no-reload <service>.service
-#   /usr/bin/systemctl disable --now --no-reload <service>.service
+#   /usr/bin/systemctl enable --now <service>.service
+#   /usr/bin/systemctl disable --now <service>.service
 #   /usr/bin/systemctl restart <service>.service
+# enable and disable reload systemd afterwards, so a service that is switched off is not
+# started again by the unit that wants it (the EQ engine by the daemon) and one that is
+# switched on is.
 # Its result is in the journal: journalctl -u 'tessera-web-unitfile@*'.
 #
 # The portal reads /etc/tessera/web.toml by default; if it runs with another

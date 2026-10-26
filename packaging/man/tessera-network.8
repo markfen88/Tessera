@@ -1,0 +1,24 @@
+.TH TESSERA-NETWORK 8 "" "Tessera" "System administration"
+.SH NAME
+tessera-network \- Tessera system helper
+.SH SYNOPSIS
+.nf
+tessera-network serve|boot-recover|recover-expired|apply TOKEN|recover TOKEN
+tessera-network accept-current [\-\-yes]
+tessera-network handoff prepare ndimon
+tessera-network handoff status
+tessera-network handoff cancel ID
+tessera-network handoff import ndimon ID
+tessera-network handoff commit ndimon ID IMPACT-TOKEN|\-\-yes
+tessera-network request
+.fi
+.SH DESCRIPTION
+Privileged standalone network helper with bounded apply and recovery operations. Intended for the packaged systemd units. Changes are requested through the authenticated portal and retain device-side recovery.
+.PP
+accept\-current is the way out of a recovery that cannot finish. When the previous settings cannot be verified (the Network page shows the recovery as pending and Keep is unavailable), the helper starts the audio services again and retries every ten seconds; if the cause is something only an administrator can settle, accept\-current prints the reason and the configuration files that differ from their saved copies and changes nothing. With \-\-yes it keeps the network as it is, puts the firewall back as it was before the change, closes the pending recovery and starts the audio services. Check the network afterwards (ip address, nmcli connection show).
+.PP
+The handoff commands (root only) release the standalone networking to NDIMon-R or receive networking that NDIMon-R released. Prepare quiesces the engine and writes an offer; import reviews an offer and changes nothing; commit applies it after the impact token has been reviewed (or with \-\-yes); cancel withdraws an offer the receiver has not reserved.
+.PP
+request reads one JSON line from standard input and handles it like the helper socket does, so a confirmation token never appears in a process argument.
+.SH SEE ALSO
+tesserad(8), tesseractl(1)

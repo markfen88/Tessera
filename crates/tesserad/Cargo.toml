@@ -11,15 +11,17 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-test = false
-doctest = false
 name = "tesserad"
 path = "src/lib.rs"
+test = false
+bench = false
+doctest = false
 
 [[bin]]
-test = false
 name = "tesserad"
 path = "src/main.rs"
+test = false
+bench = false
 
 [features]
 default = []
@@ -33,13 +35,13 @@ alsa-bridge = ["dep:tessera-backend-alsa"]
 bridge-test-hooks = ["alsa-bridge"]
 
 [dependencies]
-tessera-backend-alsa = { path = "../tessera-backend-alsa", version = "0.2.1", default-features = false, features = ["bridge"], optional = true }
+tessera-backend-alsa = { path = "../tessera-backend-alsa", version = "0.3.0", default-features = false, features = ["bridge"], optional = true }
 tessera-control-types = { workspace = true }
-tessera-state = { path = "../tessera-state", version = "0.2.1" }
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.1" }
-tessera-clock = { path = "../tessera-clock", version = "0.2.1", features = ["linux"] }
-tessera-media = { path = "../tessera-media", version = "0.2.1" }
-tessera-discovery = { path = "../tessera-discovery", version = "0.2.1" }
+tessera-state = { path = "../tessera-state", version = "0.3.0" }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.3.0" }
+tessera-clock = { path = "../tessera-clock", version = "0.3.0", features = ["linux"] }
+tessera-media = { path = "../tessera-media", version = "0.3.0" }
+tessera-discovery = { path = "../tessera-discovery", version = "0.3.0" }
 rtrb = "0.4"
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -49,3 +51,4 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
 nix = { version = "0.31", default-features = false, features = ["user", "resource", "fs", "socket", "time", "net", "sched", "mman"] }
+

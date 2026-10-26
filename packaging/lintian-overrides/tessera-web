@@ -1,0 +1,2 @@
+# yaml-rust2 is a pure Rust YAML implementation, not an embedded C libyaml.
+tessera-web: embedded-library libyaml [usr/bin/tessera-network]

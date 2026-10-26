@@ -70,6 +70,8 @@ pub struct AppState {
     pub network: Arc<dyn network_profiles::Backend>,
     /// Per-session browser drafts; no host changes until explicitly applied.
     pub network_drafts: Mutex<HashMap<String, tessera_state::network_profiles::Profiles>>,
+    /// Wrong network confirmation tokens per client, separate from login limits.
+    pub confirm_limiter: network_profiles::ConfirmLimiter,
 }
 
 /// A message shown once on the next page.
@@ -110,6 +112,7 @@ impl AppState {
             )),
             network: Arc::new(network_profiles::SocketBackend),
             network_drafts: Mutex::new(HashMap::new()),
+            confirm_limiter: network_profiles::ConfirmLimiter::default(),
         }
     }
 
@@ -183,6 +186,7 @@ pub fn router(state: Shared) -> Router {
         "/network/pending/{token}/{action}",
         post(network_profiles::finish),
     )
+    .merge(network_profiles::token_routes())
     .route("/devices", get(pages::devices))
     .route("/devices/{key}/settings", post(pages::device_settings))
     .route("/devices/{key}/channels", post(pages::device_channels))
@@ -235,7 +239,9 @@ async fn security_headers(req: Request, next: Next) -> Response {
 /// A state-changing request whose `Origin` names another site is refused
 /// (with `SameSite=Strict` cookies and CSRF tokens, a second line).
 async fn same_origin(req: Request, next: Next) -> Response {
-    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+    if !network_profiles::is_token_alias(req.uri().path())
+        && !matches!(*req.method(), Method::GET | Method::HEAD)
+    {
         if let Some(origin) = req.headers().get(header::ORIGIN) {
             let host = req
                 .headers()
@@ -247,6 +253,11 @@ async fn same_origin(req: Request, next: Next) -> Response {
                 .and_then(|o| o.split_once("://"))
                 .map(|(_, rest)| rest.trim_end_matches('/'));
             if host.is_none() || origin_host != host {
+                if req.uri().path().starts_with("/api/")
+                    || network_profiles::wants_json(req.headers())
+                {
+                    return api::error(StatusCode::FORBIDDEN, "cross-origin request refused");
+                }
                 return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
             }
         }

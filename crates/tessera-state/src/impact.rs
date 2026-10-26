@@ -296,6 +296,7 @@ pub fn declared_scope(cmd: &Command) -> RestartScope {
         | Command::SetEncoding { .. }
         | Command::SetLatency { .. }
         | Command::SetDeviceChannels { .. }
+        | Command::SetProtocolFlows { .. }
         | Command::SetPrimaryInterface { .. }
         | Command::ReloadConfig => RestartScope::Device,
         Command::SetDeviceName { .. }
@@ -436,7 +437,7 @@ fn geometry(
         }
         if iface {
             b.device(&n.key);
-            for f in config.flows.iter() {
+            for f in &new.flows {
                 b.flow(&f.id);
             }
         }
@@ -453,7 +454,7 @@ fn geometry(
         b.drops.push(format!(
             "audio clients attached to `{key}` are detached and must re-attach"
         ));
-        for f in config.flows.iter().filter(|f| f.device == *key) {
+        for f in new.flows.iter().filter(|f| f.device == *key) {
             b.flow(&f.id);
         }
         for br in config
@@ -558,6 +559,7 @@ pub fn impact_of(
 ) -> Impact {
     let mut b = Builder::default();
     geometry(&mut b, old, new, old_intent, new_intent, config);
+    flow_changes(&mut b, old, new);
     b.context.push(arguments(cmd));
     b.build(cmd.kind())
 }
@@ -577,6 +579,38 @@ fn arguments(cmd: &Command) -> String {
             format!("set_device_channels {} {rx} {tx}", device.0)
         }
         other => format!("{other:?}"),
+    }
+}
+
+fn flow_changes(b: &mut Builder, old: &Model, new: &Model) {
+    // [[flow]] entries by id.
+    let ids: BTreeSet<&str> = old
+        .flows
+        .iter()
+        .chain(&new.flows)
+        .map(|f| f.id.as_str())
+        .collect();
+    for id in ids {
+        let o = old.flows.iter().find(|f| f.id == id);
+        let n = new.flows.iter().find(|f| f.id == id);
+        if o == n {
+            continue;
+        }
+        let what = match (o, n) {
+            (None, _) => "is added",
+            (_, None) => "is removed",
+            _ => "changes",
+        };
+        for f in o.iter().chain(n.iter()) {
+            if new.device(&f.device).is_some() {
+                b.device(&DeviceKey(f.device.clone()));
+            }
+        }
+        b.flow(id);
+        b.context.push(format!("flow {id}: {o:?} -> {n:?}"));
+        b.reasons.push(format!("[[flow]] `{id}` {what}"));
+        b.drops
+            .push(format!("audio of flow `{id}` while it restarts"));
     }
 }
 
@@ -602,35 +636,7 @@ pub fn reload_impact(
     let mut b = Builder::default();
     geometry(&mut b, old, new, old_intent, new_intent, new_cfg);
     let all: Vec<DeviceKey> = new.devices.iter().map(|d| d.key.clone()).collect();
-    // [[flow]] entries by id.
-    let ids: BTreeSet<&str> = old_cfg
-        .flows
-        .iter()
-        .chain(&new_cfg.flows)
-        .map(|f| f.id.as_str())
-        .collect();
-    for id in ids {
-        let o = old_cfg.flows.iter().find(|f| f.id == id);
-        let n = new_cfg.flows.iter().find(|f| f.id == id);
-        if o == n {
-            continue;
-        }
-        let what = match (o, n) {
-            (None, _) => "is added",
-            (_, None) => "is removed",
-            _ => "changes",
-        };
-        for f in o.iter().chain(n.iter()) {
-            if new.device(&f.device).is_some() {
-                b.device(&DeviceKey(f.device.clone()));
-            }
-        }
-        b.flow(id);
-        b.context.push(format!("flow {id}: {o:?} -> {n:?}"));
-        b.reasons.push(format!("[[flow]] `{id}` {what}"));
-        b.drops
-            .push(format!("audio of flow `{id}` while it restarts"));
-    }
+    flow_changes(&mut b, old, new);
     let names: BTreeSet<&str> = old_cfg
         .bridges
         .iter()
@@ -674,10 +680,10 @@ pub fn reload_impact(
     if old_cfg.network.mtu_payload != new_cfg.network.mtu_payload {
         let with_flows: Vec<DeviceKey> = all
             .iter()
-            .filter(|d| new_cfg.flows.iter().any(|f| f.device == d.0))
+            .filter(|d| new.flows.iter().any(|f| f.device == d.0))
             .cloned()
             .collect();
-        for f in &new_cfg.flows {
+        for f in &new.flows {
             b.flow(&f.id);
         }
         net_change(
@@ -701,7 +707,7 @@ pub fn reload_impact(
         || old_cfg.network.secondary != new_cfg.network.secondary
     {
         b.interface = true;
-        for f in &new_cfg.flows {
+        for f in &new.flows {
             b.flow(&f.id);
         }
         net_change(

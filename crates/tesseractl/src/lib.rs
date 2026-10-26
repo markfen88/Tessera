@@ -22,7 +22,9 @@ use tessera_control_types::{
 };
 use tessera_state::{ConfigPaths, Environment, load_config};
 
-use crate::cli::{Cli, ClockCmd, Cmd, ConfigCmd, DirArgs, NetworkCmd, ShowArgs, WatchArgs};
+use crate::cli::{
+    Cli, ClockCmd, Cmd, ConfigCmd, DirArgs, FlowCmd, NetworkCmd, ShowArgs, WatchArgs,
+};
 use crate::client::{Client, ClientError};
 
 /// Exit code: success.
@@ -247,6 +249,19 @@ pub fn run_with(
                 write!(out, "{}", output::render_metrics(&m))?;
             }
         }
+        Cmd::Flows(FlowCmd::Show) => {
+            let reply = c.request(RequestBody::Query(Query::Metrics))?;
+            let Reply::Metrics(metrics) = reply else {
+                return Err(unexpected(&reply));
+            };
+            if cli.json {
+                json(out, &metrics.flows)?;
+            } else if metrics.flows.is_empty() {
+                writeln!(out, "No flows.")?;
+            } else {
+                write!(out, "{}", output::render_flows(&metrics.flows))?;
+            }
+        }
         Cmd::Bridges => {
             let reply = c.request(RequestBody::Query(Query::Bridges))?;
             let Reply::Bridges(b) = reply else {
@@ -309,8 +324,14 @@ pub fn run_with(
             } else {
                 DeviceKey(String::new())
             };
-            let Some(command) = cli::to_command(cmd, &device) else {
-                return Err(CliError::Usage("this command is not implemented".into()));
+            let command = if let Cmd::Flows(FlowCmd::Set { file }) = cmd {
+                let text = std::fs::read_to_string(file)?;
+                let flows =
+                    tessera_state::flows::parse_flow_specs(&text).map_err(CliError::Config)?;
+                Command::SetProtocolFlows { flows }
+            } else {
+                cli::to_command(cmd, &device)
+                    .ok_or_else(|| CliError::Usage("this command is not implemented".into()))?
             };
             let mut seen = None;
             let mut command = command;
@@ -524,6 +545,8 @@ fn resolve_device(c: &mut Client, wanted: Option<&str>) -> Result<DeviceKey, Cli
 fn confirmation(cmd: &Cmd, device: &DeviceKey) -> String {
     let d = &device.0;
     match cmd {
+        Cmd::Flows(FlowCmd::Set { .. }) => "Controller flow set replaced.".into(),
+        Cmd::Flows(FlowCmd::Clear) => "Controller flow set cleared.".into(),
         Cmd::SetName { name } => format!("{d}: name set to \"{name}\""),
         Cmd::SetRate { hz } => format!("{d}: sample rate set to {hz} Hz"),
         Cmd::SetEncoding { bits } => format!("{d}: encoding set to {bits} bit"),

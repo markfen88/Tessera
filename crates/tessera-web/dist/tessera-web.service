@@ -16,6 +16,9 @@
 [Unit]
 Description=tessera web portal
 After=network-online.target tesserad.service
+# Where the distribution restores mixer state at boot, the portal sets its
+# saved amplifier volume after it (the Volume pane; no effect elsewhere).
+After=alsa-restore.service
 Wants=network-online.target
 Requires=tessera-network.service
 After=tessera-network.service
@@ -42,6 +45,11 @@ PrivateDevices=yes
 # ([appliance.camilladsp] configs_dir, coeffs_dir, statefile).
 ReadWritePaths=-/run/tessera
 ReadWritePaths=-/run/tessera-network
+# The portal's own state: the amplifier volume it sets again at start
+# (/var/lib/tessera-web/volume.json). systemd creates the directory, owned by
+# the portal's user, and makes it writable under ProtectSystem=strict.
+StateDirectory=tessera-web
+StateDirectoryMode=0700
 UMask=0077
 ProtectClock=yes
 ProtectKernelTunables=yes

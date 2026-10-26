@@ -4,7 +4,7 @@
 can change. It is a separate service and a client of the daemon's
 control socket, like `tesseractl` (it uses the same client library). It never
 touches the daemon's state directly. Standalone host networking uses the
-separate typed Rust helper described in [network-vlans.md](network-vlans.md)
+separate typed Rust helper described in [network-vlans.md](network-vlans.md);
 NDIMon remains the network owner when it hosts Tessera. Code:
 `crates/tessera-web`.
 
@@ -55,12 +55,18 @@ page. Package installation generates the matching polkit rules automatically;
 regenerate them with `tessera-web appliance polkit` after editing the list.
 
 Server-rendered HTML with forms. Status pages use a small same-origin browser
-script to read fresh HTML in the background and update values in place, without
-reloading the document. Focused or edited forms, file selections, expanded
-details and scroll position are preserved. Hidden tabs pause polling; failed
-reads retain the last values and retry with backoff. Without JavaScript, pages
-and forms still work; status changes need a manual reload. Every page except
-the login page needs a session.
+script (`/live.js`) to read fresh HTML in the background and update values in
+place, without reloading the document. Focused or edited forms, file
+selections, expanded details and scroll position are preserved. Hidden tabs
+pause polling; failed reads retain the last values and retry with backoff.
+The same script posts the Speaker page's sliders and service buttons in
+place: the same forms and token, with the header `X-Tessera-Live: 1`, which
+makes the handler answer JSON (`{"ok": …, "text": …}` and a few fields of
+its own) instead of a redirect and a one-shot message; every other check
+(session, token, origin, allowlists, confirmations) is the same. Without
+JavaScript, pages and forms still work (the sliders keep an **Apply**
+button); status changes need a manual reload. Every page except the login
+page needs a session.
 
 Every page of a session has the same frame: a top bar with the brand, a host
 chip (the device's name and the primary interface's address, once a status
@@ -73,7 +79,7 @@ a phone (under 720 px).
 | Path | Page | Refreshes | Changes |
 |------|------|-----------|---------|
 | `/` | Overview: the **signal path** (network, flows, device, audio clients; a path is highlighted while packets move on it, judged from two metric samples), devices, network, clock, warnings | every 5 s | |
-| `/network` | standalone VLAN profiles and management/audio assignments; legacy interface selection where the helper is absent | | edit a draft, review/apply, explicitly keep or revert |
+| `/network` | standalone VLAN profiles (addressing, and management's DNS servers and search domains) and management/audio assignments; legacy interface selection where the helper is absent | | edit a draft, review/apply, explicitly keep or revert |
 | `/devices` | Device: per device, settings, channel labels, subscriptions | | name, rate, encoding, latency; channel counts (with a confirmation step, see below); labels; subscribe and unsubscribe (stored only, see below the table) |
 | `/clock` | clock settings and the clock table | every 10 s | role and priority |
 | `/metrics` | daemon counters (with the audio clients), media engine counters, per-flow counters | every 5 s | |
@@ -81,7 +87,7 @@ a phone (under 720 px).
 | `/config` | the configuration in effect (TOML) | | reload the configuration |
 | `/login`, `/logout` | log in (a centred card) and out | | |
 | `/theme` (POST only) | | | choose the appearance, see below |
-| `/speaker` | **appliance mode only** ([below](#appliance-mode)): host vitals, the daemon summary, one switch per configured service, sources, network, links | every 5 s | enable, disable or restart an allowlisted service (an essential one asks first) |
+| `/speaker` | **appliance mode only** ([below](#appliance-mode)): the control panel: volume and signal boost, warnings, host vitals and the daemon summary, the clock, one switch per configured service, sources, the signal path, devices and subscriptions, EQ files, network, links | every 5 s | volume and boost (live sliders), enable, disable or restart an allowlisted service (an essential one asks first), EQ files |
 | `/device`, `/overview` | appliance mode only: the overview (`/` redirects to `/speaker`) | every 5 s | |
 | `/assets/<hash>/style.css` | the stylesheet, at a path that changes with its content (cached for a year); `/style.css` and `/static/style.css` serve it uncached | | |
 
@@ -107,8 +113,9 @@ Subscriptions on `/devices` are stored by name. Their state follows the media of
 static `[[flow]]` that carries the rx channel: "in progress" until it does (and for
 the first seconds of a flow), then "receiving" while packets arrive or "no media" (about 2 to 3 s after the last packet),
 and the "N of M receiving" count uses it ([control-interface.md](control-interface.md#status)).
-`tesserad` does not implement the vendor control plane, so vendor controllers cannot
-route to it on their own ([interoperability.md](interoperability.md)).
+`tesserad` does not implement the vendor control plane itself; the packaged Controller
+compatibility runtime submits the flows a controller sets up
+([interoperability.md](interoperability.md)).
 
 **Changes that restart something.** The channel counts form on `/devices`
 first runs a dry run and shows a confirmation page: a warning that applying
@@ -215,11 +222,24 @@ optional; a missing file means the defaults; an unknown key is an error.
 | `cookie_secure` | `false` | mark the session cookie `Secure` (behind a TLS reverse proxy) |
 | `session_idle_secs` | `28800` | a session unused this long ends (at least 1) |
 | `daemon_timeout_secs` | `5` | how long one request to the daemon may take (at least 1) |
-| `[appliance]`, `[[appliance.service]]`, `[appliance.camilladsp]` | off | appliance mode: see [below](#appliance-mode) |
+| `[appliance]`, `[[appliance.service]]`, `[appliance.camilladsp]`, `[appliance.volume]` | off | appliance mode: see [below](#appliance-mode) |
+| `[network]` `confirm`, `interface` | `"require_management_address"`, automatic | read by the network helper, not the portal: `confirm = "token_only"` lets Keep arrive from any reachable address, `interface` names the wired port for the first adoption ([network-vlans.md](network-vlans.md#confirmation-policy)) |
 
 ```sh
 sudo tessera-web check      # listen 127.0.0.1:8090; control socket /run/tessera/control.sock; password file /etc/tessera/web-password
 ```
+
+**Drop-ins.** `web.toml` is a package-owned configuration file, so site and profile settings go in
+`/etc/tessera/web.d/*.toml` instead (the directory is named after the file, `web.toml` → `web.d`).
+The files are read after `web.toml`, in name order, and a later file wins. Tables merge key by key;
+any other value replaces the earlier one, and a list in a later file replaces the whole list, so
+a drop-in with `[[appliance.service]]` entries defines the complete service list. Hidden files and
+files that do not end in `.toml` are ignored; an unknown key or a syntax error in any file is
+an error that names the file. `tessera-web check` and `tessera-web appliance polkit` read the same
+files, and so does the network helper (`tessera-network`) for the `listen` port and the `[network]`
+policy, under the owner checks that already apply to `web.toml` (a root-owned regular file nobody
+else can write). The speaker profile of the bundle writes `web.d/60-speaker.toml`
+([dsp.md](dsp.md)).
 
 ---
 
@@ -273,22 +293,68 @@ the **Speaker** page (`/speaker`) and the overview moves to `/device` (alias
 of this exists: the paths are 404 and `/` is the overview. It is runtime
 configuration, not a build option.
 
-**The page** (refreshes every 5 s): a hero card with the device name (or
-`hostname_label`), the daemon's summary (device, channels, rate, encoding,
-latency) and chips for the clock (locked, unlocked, none), the temperature
+**The page** (refreshes every 5 s) is the device's control panel, in this
+order: the **master card** at the top, with the amplifier's **Volume** (with
+`[appliance.volume]`) and the EQ engine's **Signal boost** (with
+`[appliance.camilladsp] enabled = true`) side by side, each a large readout
+and a large slider (see "EQ engine" below; the card is absent when neither
+is configured); the **EQ engine input rate mismatch** notice (only while the
+engine's ALSA capture rate differs from the Tessera device's rate, with a
+one-click fix when the configuration allows it; see
+[the Raspberry Pi speaker guide](raspberry-pi-speaker.md)); the **EQ engine
+output format not supported** notice (only while the engine's stop reason is
+an ALSA `snd_pcm_hw_params_set_format` failure: it quotes the engine, names
+the playback device and `format` of the active configuration and says where
+to change it, with no button; an input-side failure says *input*); the daemon's
+**Warnings** (only when there are any); a hero
+card with the device name (or `hostname_label`), the daemon's summary
+(device, channels, rate, encoding, latency) and chips for the clock
+(locked, unlocked, none), the temperature
 (`/sys/class/thermal/thermal_zone0/temp`, only if the host has one) and the
-uptime (`/proc/uptime`); the **Services** card; a **Sources** card (the
-connected Bluetooth devices and the daemon's subscriptions); the
-**Network** card (interfaces and addresses from the daemon's status, the
-primary, the PTP leader) with links to the device page and, if `gui_url` is
-set, the EQ engine's own GUI. Bluetooth is asked from `bluetoothctl devices
-Connected` only while the `bluetooth` unit is active (stopped, the command
-blocks for seconds); a failed command shows **unavailable**, an empty answer
-**nothing connected**. The `Connected` filter needs BlueZ 5.65 or newer;
-older versions ignore it and list every known device. With
-`[appliance.camilladsp] enabled = true` the page also shows the EQ engine's
-state, signal boost and files, and with `[appliance.volume]` the
-amplifier's volume (see "EQ engine" below).
+uptime (`/proc/uptime`); the **Clock** (role, priority, one line per clock
+with state, offset and leader); the **Services** card; a **Sources** card
+(the connected Bluetooth devices and the daemon's subscriptions); the
+overview's **Signal path** diagram; the **Devices** table with every
+subscription and its state; the EQ files; the **Network** card (interfaces
+and addresses from the daemon's status, the primary, the PTP leader) with
+links to the overview page and, if `gui_url` is set, the EQ engine's own
+GUI.
+
+**The EQ engine's GUI.** With `[appliance.camilladsp] gui_url` set, the
+button **EQ engine (CamillaDSP)** is under the master card's sliders, in
+the hero's chips and in the Links; it opens the engine's own GUI in a new
+tab (`rel="noopener noreferrer"`), with the engine's state beside it
+(**engine off** while the engine cannot be asked: the GUI will not load
+then). The URL may contain `{host}` in place of the host, e.g.
+`http://{host}:5005/gui/index.html`: the page puts there the name or
+address the browser used to reach the portal (the request's `Host` header
+without its port; an IPv6 literal keeps its brackets), so the link follows
+the device's address. Only letters, digits, `.`, `-`, `_` and a bracketed
+IPv6 literal are accepted from the header, with at most a numeric port;
+anything else falls back to the device's host name, and when that is not
+usable either the button is left out. A `gui_url` without the placeholder
+is used as it is. The configuration accepts `{host}` once, only before
+the path, and still requires `http://` or `https://`. The GUI has no login
+and listens on one address (`bind_address` in `/etc/camilladsp/camillagui.yml`:
+loopback by default, the speaker's management address after the bundle
+installer): the speaker profile writes `gui_url` with that address, not
+`{host}`, and writes none when the GUI is off or listens on loopback only, so
+the button is left out ([dsp.md](dsp.md)).
+
+Bluetooth is asked from `bluetoothctl devices Connected` only while
+the `bluetooth` unit is active (stopped, the command blocks for seconds); a
+failed command shows **unavailable**, an empty answer **nothing
+connected**. The `Connected` filter needs BlueZ 5.65 or newer; older
+versions ignore it and list every known device. The overview itself stays
+at `/device`.
+
+**Live controls.** With JavaScript the sliders and the service buttons act
+in place and report next to the control ("applying…", "applied", "failed:
+…"); the background refresh never overwrites a slider that is being dragged
+or has the focus, and values changed elsewhere (another browser, `amixer`)
+appear at the next refresh once the slider is left. Sliders take the arrow
+keys and announce their value (`aria-valuetext`). Without JavaScript each
+slider has an **Apply** button and each action a redirect with a message.
 
 ### Services
 
@@ -326,12 +392,16 @@ described under the security model):
 
 | Press | The portal runs | Then, as root, the helper runs |
 |-------|-----------------|--------------------------------|
-| switch OFF → ON | `/usr/bin/systemctl start tessera-web-unitfile@enable-<name>.service` | `/usr/bin/systemctl enable --now --no-reload <name>.service` |
-| switch ON → OFF | `/usr/bin/systemctl start tessera-web-unitfile@disable-<name>.service` | `/usr/bin/systemctl disable --now --no-reload <name>.service` |
+| switch OFF → ON | `/usr/bin/systemctl start tessera-web-unitfile@enable-<name>.service` | `/usr/bin/systemctl enable --now <name>.service` |
+| switch ON → OFF | `/usr/bin/systemctl start tessera-web-unitfile@disable-<name>.service` | `/usr/bin/systemctl disable --now <name>.service` |
 | restart | `/usr/bin/systemctl start tessera-web-unitfile@restart-<name>.service` | `/usr/bin/systemctl restart <name>.service` |
 
-`--no-reload`: enabling does not ask PID 1 to reload every unit file; the
-symlink is read at the next boot anyway. For the portal's own unit,
+Enable and disable let `systemctl` reload systemd afterwards (no
+`--no-reload`): the units that want a service are read from the links the
+command changes, and without the reload a service that was switched off is
+brought back by the next start of the unit that wanted it (the EQ engine by
+`tesserad`, which `tessera-network` stops and starts on every network change),
+and one that was switched on is not started with it. For the portal's own unit,
 `disable` and `restart` get `--no-block`, so the answer reaches the browser
 before the portal stops; the message of that action is lost with the
 portal, and the page comes back without it. A `@` in a service name
@@ -345,7 +415,11 @@ message (success, or the sanitised `systemctl` error, at most 300
 characters, naming for a group the units already done; the helper's own
 error is in the journal, which the message names: a failed helper start is
 reported under the action asked for, e.g. `systemctl enable x.service: Job
-for tessera-web-unitfile@enable-x.service failed ...`). A unit file installed
+for tessera-web-unitfile@enable-x.service failed ...`). Posted by the
+page's script (header `X-Tessera-Live: 1`) the same request is answered
+with JSON instead, `{"ok": true|false, "text": "<the message>", "unit":
+"<key>", "action": "<action>"}`, shown under the row, and the row is
+re-read right after. A unit file installed
 after PID 1 last looked it up (`not-found` in its cache) may need
 `systemctl daemon-reload` before `--now` can start it. For the portal's own
 unit the message only says the action was requested: the portal does not
@@ -360,9 +434,13 @@ with `essential = true` (always: the daemon, this portal) answers the first
 request with a page that says what the unit is and what happens, and offers
 the action and **Cancel**. The action button is the same form again with
 `confirm=yes` and the session's CSRF token; only then does anything run.
-Enable never asks. (The daemon's own confirmation step for restarting
-changes uses an impact token from the daemon; these are host services, so a
-plain confirmed re-submit is used.)
+Enable never asks. With JavaScript the row asks instead, in place, with the
+same words (the server renders them into the form's `data-confirm`), and
+only the answer posts `confirm=yes`; a request posted in place without it
+is refused with 409 and `{"ok": false, "confirm": true, "text": …}`, so the
+server asks either way and nothing runs unconfirmed. (The daemon's own
+confirmation step for restarting changes uses an impact token from the
+daemon; these are host services, so a plain confirmed re-submit is used.)
 
 ### Security model
 
@@ -407,7 +485,7 @@ plain confirmed re-submit is used.)
   a drop-in with the same path, as the template's comment shows) re-reads
   the file, refuses an instance that is malformed or names a service
   outside the configured service allowlist, and then runs
-  exactly `systemctl enable|disable --now --no-reload <name>.service` or
+  exactly `systemctl enable|disable --now <name>.service` or
   `systemctl restart <name>.service` as root, exiting with its code. The
   helper unit is hardened as far as a unit that runs `systemctl` allows:
   `CapabilityBoundingSet=CAP_SYS_ADMIN` (the symlinks are written by PID 1
@@ -455,7 +533,7 @@ units = ["bluetooth", "bluealsa", "bluealsa-aplay"]
 
 [appliance.camilladsp]           # optional: the EQ engine, see "EQ engine" below
 enabled = true
-gui_url = "http://speaker.example:5005/gui/index.html"
+gui_url = "http://{host}:5005/gui/index.html"   # {host}: as the browser reached the portal
 
 [appliance.volume]               # optional: the amplifier's mixer control
 card = "amp"
@@ -464,7 +542,7 @@ card = "amp"
 `[appliance.camilladsp]` (`enabled`, `websocket` (a `ws://` address),
 `configs_dir`, `coeffs_dir`, `statefile`, `binary`, `gain_filter`,
 `gui_url`, `max_upload_bytes`) and `[appliance.volume]` (`card`,
-`control`, `min_db`, `max_db`) are described under "EQ engine"; the
+`control`, `min_db`, `max_db`, `state_file`) are described under "EQ engine"; the
 commented example in `crates/tessera-web/dist/web.toml` lists the
 defaults. `tessera-web check` reports whether appliance mode is on and how
 many entries it has.
@@ -539,26 +617,101 @@ is deleted or activated over (fail closed). Whether a listed file is the
 active one is decided by comparing the files themselves (device and
 inode, else canonical paths), not the strings.
 
-**Volume** (only with an `[appliance.volume]` table; `card` is required,
-`control` defaults to `Digital`, the range `min_db`..`max_db` to −60..0).
-The card reads the control with `/usr/bin/amixer -c <card> sget <control>`
-(the first `[... dB]` value) and shows it as a range input (0.5 dB steps,
-the filled part of the track computed by the server; nothing moves while
-dragging: **Apply** commits). `POST /speaker/volume` with `db` rounds to
-0.5, clamps into the range and runs
-`/usr/bin/amixer -c <card> -- sset <control> <db>dB`, then
-`/usr/sbin/alsactl store` so the value survives an unclean shutdown. The
-store needs `/var/lib/alsa` in the unit's `ReadWritePaths` and group write
-on `asound.state`; without that it fails quietly (logged at debug) and the
-mixer state is still saved by `alsa-restore.service` at a clean shutdown.
+**Volume** (the master card's left pane; only with an `[appliance.volume]`
+table; `card` is required, `control` defaults to `Digital`, the range
+`min_db`..`max_db` to −60..0). The pane reads the control with
+`/usr/bin/amixer -c <card> sget <control>` (the first `[... dB]` value) and
+shows it as a large readout and a range input (0.5 dB steps, the filled
+part of the track computed by the server). `POST /speaker/volume` with `db`
+rounds to 0.5, clamps into the range and runs
+`/usr/bin/amixer -c <card> -- sset <control> <db>dB`, then, for a commit,
+saves the value. The field `commit` chooses: absent, `1` or `yes` (the plain
+form, and the script on release) sets and saves; `0` or `no` (the script
+while the slider moves, at most every 150 ms) only sets the control, so the
+save happens once per drag; anything else is refused (400). With
+JavaScript the readout follows the thumb, the value is heard while
+dragging and the release commits; the script's requests are answered with
+JSON (`db` is the value as applied, `commit` what was done, `muted` whether the
+card's switch is off).
 
-**Signal boost** (the top of the Sources card). The page reads the active
+**The playback switch.** A value in dB does not touch the control's hardware
+switch (`[on]`/`[off]` in `amixer sget`), and a card can come up with it off (the
+distribution's restore service never ran for it): the slider then moves and
+nothing is heard. The pane reads the switch with the value; when a playback channel is
+`[off]` it says "The output is muted: the card's playback switch is off, so
+nothing is heard at any volume" under the slider and offers an **Unmute** button.
+`POST /speaker/volume/unmute` (session and token as every post) runs
+`/usr/bin/amixer -c <card> -- sset <control> unmute` and nothing else; the saved
+volume is not touched. A value set on a muted card is set, and the answer says it
+is muted ("Volume −24.0 dB, but the output is muted: switch it on with Unmute").
+The portal never unmutes by itself: a muted card may have been muted on purpose. The
+start restore logs a warning when the card it set is muted.
+
+The portal owns the setting; it does not rely on `alsactl store`, which
+needs root and which the distribution's restore service does not run for
+every card (a USB or HAT amplifier came back at its default level after a
+reboot). A commit writes `{"card":…,"control":…,"db":…}` atomically
+(a temporary file, synced, renamed) to `state_file`, by default
+`/var/lib/tessera-web/volume.json` in the unit's `StateDirectory=tessera-web`
+(0700, owned by the portal's user, removed by a package purge). A preview is
+not saved: only the value the operator settled on survives. At start the
+portal sets the saved value again with `amixer`, clamped into the current
+range, as soon as the card answers; the card may enumerate after the portal
+(USB audio), so it looks every 5 seconds for up to 10 minutes and logs once
+that it is waiting. Anyone who posts a volume in the meantime keeps their
+value and the restore stands down. A value saved for another card or control
+is ignored. The unit starts after `alsa-restore.service` where the
+distribution restores mixer state at boot, so the saved value is applied last.
+If the value cannot be saved (a manual install without the state directory),
+the commit says so: the volume is set but will not survive a restart. The
+signal boost needs no such file: it is the `gain` line of the engine's active
+configuration, which persists with it.
+
+**The card is named, not numbered.** Use the card's name (`aplay -l` lists
+`card 1: Dummy [Dummy]`: the name is the word in brackets) in
+`[appliance.volume] card`; the installer does. `amixer` finds a card by its
+name at every call, so a card that takes another index after a reboot is still
+found. The unit therefore lets the portal open the control device of every
+card index (see "Files and permissions"). If `amixer` cannot find or open the
+card, the pane says "The sound card `<name>` was not found" and lists the
+causes: it is not connected, `card` does not name it, or the unit may not
+open its control device.
+
+**A card that appears after the portal started** (a USB DAC plugged in later, a
+HAT that enumerates late, a card that takes another index while the system
+runs) is out of reach of the running unit: systemd binds `/dev/snd` and turns
+every `DeviceAllow=` path into a device number when the unit starts, and a node
+that does not exist then is dropped. The package therefore ships a udev rule
+(`/usr/lib/udev/rules.d/60-tessera-web-sound.rules`) that starts
+`tessera-web-sound.service` when a sound card's control device is added. The
+oneshot waits 5 seconds (one card's events, and a flapping one's, become one
+restart, clear of the portal's start limit), then runs
+`systemctl try-restart tessera-web.service`; its `ExecCondition` skips it when no
+drop-in of `/etc/systemd/system/tessera-web.service.d` lists a `/dev/snd/` device,
+that is, when the portal has no Volume pane. The portal's sessions are in memory,
+so the operator signs in again after such a restart; nothing else is lost (the
+saved volume is set again by the restore). Alternatives weighed, and why not:
+`DeviceAllow=char-alsa rw` would open the PCM, sequencer and timer nodes as well
+(the portal could play and record); `systemctl set-property --runtime
+tessera-web.service DevicePolicy=closed` makes systemd resolve the paths again
+without a restart (checked on systemd 257) but cannot create the `/dev/snd` bind
+mount of a unit that started when no card existed. Hardware check: unplug and
+plug a USB sound card while the portal runs and watch
+`journalctl -u tessera-web-sound -u tessera-web`.
+
+**Signal boost** (the master card's right pane). The page reads the active
 configuration file and shows the `gain` of the Gain filter named by
 `gain_filter` (default `dashboard_signal_boost`;
-`filters.<name>.parameters.gain`), 0..+30 dB in 0.5 steps. `POST
-/speaker/boost` with `db` edits exactly that line (the file is not
-re-serialised: comments, order and formatting stay; a comment after the
-value stays), writes the file atomically and asks the engine to `Reload`.
+`filters.<name>.parameters.gain`), 0..+30 dB in 0.5 steps; above +12 dB the
+pane is shown in the warning colour with a note that most sources clip.
+Without an active configuration or that filter the pane says so and has no
+slider. `POST /speaker/boost` with `db` edits exactly that line (the file
+is not re-serialised: comments, order and formatting stay; a comment after
+the value stays), writes the file atomically and asks the engine to
+`Reload`. Every post rewrites the file and reloads the engine, so the
+script posts only on release (and coalesces quick keyboard steps), never
+while the slider moves, and shows "applying…" until the engine has
+answered; the JSON answer carries `db` and `hot` (above the threshold).
 When the websocket is not reachable the portal restarts the engine's unit
 instead, but only if `camilladsp` is one of the `[[appliance.service]]`
 entries (a start of the root helper `tessera-web-unitfile@restart-camilladsp.service`, as the Services card does); otherwise the
@@ -606,26 +759,32 @@ it is not possible. A state file that exists but cannot be read stops the
 fallback.
 
 **Files and permissions.** The unit's `ProtectSystem=strict` leaves the
-portal no writable path but `/run/tessera`, and its `PrivateDevices=yes`
-hides the sound card from `amixer`; the EQ pages need the two directories
-and the state file, the Volume card the card's ALSA control device. The
-package ships a drop-in, `crates/tessera-web/dist/appliance-paths.conf`:
-the `ReadWritePaths=` lines (each with the `-` prefix, so a missing path
-does not stop the portal) and, for the Volume card, three device lines
-that keep `PrivateDevices=yes`: `BindPaths=/dev/snd` (the host's
-`/dev/snd` appears in the private `/dev`), `DeviceAllow=/dev/snd/controlC0
-rw` (the cgroup opens exactly that node: the control device of card 0,
-nothing else under `/dev/snd`, so no PCM or sequencer device is reachable)
-and `SupplementaryGroups=audio` (the group owning the node). The control
-device follows the card index: `amixer -c <card> info` prints
-`Card ...:<index>` and `ls -l /dev/snd` lists `controlC<index>`; adjust
-the `DeviceAllow` line to it. Verified on systemd 257 in a transient unit:
-the allowed node opens, the other control device is refused with EPERM.
-`DeviceAllow=char-alsa rw` would be simpler but exposes every ALSA device
+portal no writable path but `/run/tessera` and its own state directory
+`/var/lib/tessera-web`, and its `PrivateDevices=yes` hides the sound card
+from `amixer`; the EQ pages need the two directories and the state file, the
+Volume card the card's ALSA control device. The package ships a drop-in,
+`crates/tessera-web/dist/appliance-paths.conf`: the `ReadWritePaths=` lines
+(each with the `-` prefix, so a missing path does not stop the portal) and,
+for the Volume card, device lines that keep `PrivateDevices=yes`:
+`BindPaths=/dev/snd` (the host's `/dev/snd` appears in the private `/dev`),
+`DeviceAllow=/dev/snd/controlC<n> rw` for every `n` from 0 to 31 (the cgroup
+opens exactly those nodes: the control devices of any card, nothing else under
+`/dev/snd`, so no PCM, sequencer or timer device is reachable) and
+`SupplementaryGroups=audio` (the group owning the nodes). The control devices
+are listed for every index, not pinned to the card's current one, because
+`amixer` finds a card by its name by opening the control devices in turn and a
+unit that may open one only fails with "Invalid card number" as soon as the
+card has another index (the card order changes at a reboot when modules load
+in another order). `DeviceAllow` takes no wildcard in a path and ignores a node
+that does not exist, so 32 lines (the kernel's limit on cards) cost nothing.
+`DeviceAllow=char-alsa rw` would be shorter but exposes every ALSA device
 (PCM capture and playback included) to the portal; `PrivateDevices=no`
 would also drop the implied `CapabilityBoundingSet=~CAP_MKNOD
 CAP_SYS_RAWIO` and `SystemCallFilter=~@raw-io`, which would then have to
-be restated. Drop the three lines without an `[appliance.volume]` table:
+be restated. Verified on systemd 257 in a transient unit: a listed node
+opens, one that is not listed is refused with EPERM, a listed node that does
+not exist does not stop the unit. Drop the device lines without an
+`[appliance.volume]` table:
 
 ```sh
 sudo install -d /etc/systemd/system/tessera-web.service.d
@@ -648,10 +807,6 @@ sudo runuser -u tessera-web -- touch /opt/camilladsp/configs/.probe \
   && sudo rm /opt/camilladsp/configs/.probe                          # writable: no error
 ```
 
-For `alsactl store` (optional, see Volume): `/var/lib/alsa` is in the
-drop-in; `asound.state` must be group-writable by a group the portal's
-user is in as well.
-
 ---
 
 ## Limits
@@ -660,6 +815,6 @@ user is in as well.
 - No live push in the pages; they refresh. The API has Server-Sent Events.
 - Bridges and keepalive counters are only in the JSON.
 - One operator password, no user accounts; commands are attributed to the
-  portal's uid in the daemon (WEB-1).
-- A richer interface (live updates, a routing matrix) is meant to live in a
-  separate repository on top of the API (WEB-3).
+  portal's uid in the daemon.
+- A richer interface (a routing matrix) is meant to live in a separate
+  repository on top of the API.
