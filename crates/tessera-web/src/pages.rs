@@ -191,7 +191,7 @@ pub(crate) fn ms(us: u32) -> String {
     format!("{:.2} ms", f64::from(us) / 1000.0)
 }
 
-fn sub_class(s: &SubscriptionState) -> &'static str {
+pub(crate) fn sub_class(s: &SubscriptionState) -> &'static str {
     match s {
         SubscriptionState::Receiving => "ok",
         SubscriptionState::InProgress => "warn",
@@ -368,13 +368,74 @@ pub(crate) fn page(
     layout(&view, &Chrome::of(st, headers), Some(s), flash, body).into_response()
 }
 
+/// The request comes from the page's own script (`X-Tessera-Live`): a
+/// background read, or a form posted in place that wants a JSON answer
+/// instead of a redirect.
+pub(crate) fn is_live(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-tessera-live")
+}
+
 /// Background reads must not consume a message intended for a form redirect.
 pub(crate) fn live_flash(st: &Shared, token: &str, headers: &HeaderMap) -> Option<Flash> {
-    if headers.contains_key("x-tessera-live") {
+    if is_live(headers) {
         None
     } else {
         st.take_flash(token)
     }
+}
+
+/// The answer to a form posted in place: `{"ok": …, "text": …}` plus
+/// `extra`'s fields, so the page shows the result next to the control
+/// instead of following a redirect. The checks before it (session, token,
+/// origin, the allowlists) answer as they always did.
+pub(crate) fn live_answer(
+    status: StatusCode,
+    ok: bool,
+    text: &str,
+    extra: serde_json::Value,
+) -> Response {
+    let mut body = serde_json::json!({ "ok": ok, "text": text });
+    if let (Some(dst), Some(src)) = (body.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    (status, axum::Json(body)).into_response()
+}
+
+/// Two samples of the flow counters tell which paths carry audio now: the
+/// metrics (read once, or twice 400 ms apart when no recent sample exists)
+/// and the activity between the samples. Shared by the overview and the
+/// Speaker page.
+pub(crate) async fn flow_activity(st: &Shared) -> (Option<Metrics>, signal::Activity) {
+    let mut m = metrics_of(st).await;
+    let now = Instant::now();
+    let prev = st
+        .flow_sample
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|p| p.usable_at(now));
+    let prev = match (prev, &m) {
+        (Some(p), _) => Some(p),
+        // No recent sample: take a second one shortly after the first.
+        (None, Some(first)) => {
+            let p = Sample::of(first, now);
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            m = metrics_of(st).await;
+            Some(p)
+        }
+        (None, None) => None,
+    };
+    let act = m.as_ref().map_or_else(Default::default, |m| {
+        let cur = Sample::of(m, Instant::now());
+        let a = signal::activity(prev.as_ref(), m, &cur);
+        if let Ok(mut g) = st.flow_sample.lock() {
+            *g = Some(cur);
+        }
+        a
+    });
+    (m, act)
 }
 
 /// An error shown in place of content.
@@ -534,7 +595,9 @@ pub async fn logout(
 
 // ---- overview ----------------------------------------------------------------
 
-fn devices_table(s: &Status) -> Markup {
+/// The devices of the status, one row each (the overview and the Speaker
+/// page).
+pub(crate) fn devices_table(s: &Status) -> Markup {
     html! {
         div.table { table {
             thead { tr { th { "Device" } th { "Name" } th { "Rate" } th { "Bits" } th { "Latency" } th { "RX" } th { "TX" } th { "Subscriptions" } } }
@@ -593,33 +656,7 @@ pub async fn overview(State(st): State<Shared>, headers: HeaderMap) -> Response 
         Err(r) => return r,
     };
     let status = status_of(&st).await;
-    let mut m = metrics_of(&st).await;
-    let now = Instant::now();
-    let prev = st
-        .flow_sample
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .filter(|p| p.usable_at(now));
-    let prev = match (prev, &m) {
-        (Some(p), _) => Some(p),
-        // No recent sample: take a second one shortly after the first.
-        (None, Some(first)) => {
-            let p = Sample::of(first, now);
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            m = metrics_of(&st).await;
-            Some(p)
-        }
-        (None, None) => None,
-    };
-    let act = m.as_ref().map_or_else(Default::default, |m| {
-        let cur = Sample::of(m, Instant::now());
-        let a = signal::activity(prev.as_ref(), m, &cur);
-        if let Ok(mut g) = st.flow_sample.lock() {
-            *g = Some(cur);
-        }
-        a
-    });
+    let (m, act) = flow_activity(&st).await;
     let body = match &status {
         Err(e) => error_box(e),
         Ok(stt) => html! {

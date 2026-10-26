@@ -1,0 +1,49 @@
+[Unit]
+Description=CamillaDSP (tessera speaker DSP)
+Documentation=file:///usr/share/doc/tessera-dsp/README.md
+After=sound.target tesserad.service
+Wants=tesserad.service
+# A restart of the daemon restarts CamillaDSP too: its capture PCM then fails with -ENODEV and the
+# engine goes idle (it does not exit), so nothing but this would bring the audio back. PartOf
+# carries a stop and a restart of the daemon to the engine, but a plain start of the daemon after
+# a stop (what tessera-network does on every network change: stop, change, start) starts nothing
+# that PartOf stopped. That start is [Install] WantedBy= below: enabling the engine links it
+# into tesserad.service.wants, so the daemon starts the engine whenever it starts, and an engine
+# the administrator switched off (systemctl disable, the Speaker page's switch) stays off.
+PartOf=tesserad.service
+
+[Service]
+Type=simple
+User=camilla
+Group=audio
+# The ALSA PCM "tessera" is a client of tesserad's audio socket (group tessera).
+SupplementaryGroups=tessera
+# -w: with no configuration chosen yet, wait for one (from the GUI) instead of exiting.
+ExecStart=/usr/lib/tessera-dsp/camilladsp -w -s /opt/camilladsp/statefile.yml -p 1234 -a 127.0.0.1 -l info
+Restart=always
+RestartSec=2s
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=60
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/camilladsp
+ProtectHome=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0002
+
+[Install]
+WantedBy=multi-user.target tesserad.service

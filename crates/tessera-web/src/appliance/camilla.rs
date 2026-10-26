@@ -35,29 +35,37 @@ use futures_util::{SinkExt, StreamExt};
 use maud::{Markup, html};
 use serde::Deserialize;
 use serde_json::Value;
+use tessera_control_types::Status;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::Uri;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 
 use crate::Shared;
+use crate::appliance::capture_rate;
 use crate::appliance::files::{self, Kind, is_regular, write_atomic, write_in_place};
 use crate::appliance::services::{Action, Runner, SYSTEMCTL};
-use crate::config::{ApplianceConfig, CamillaDspConfig, canonical_unit};
-use crate::pages::need_post;
+use crate::config::{ApplianceConfig, CamillaDspConfig, GUI_HOST_PLACEHOLDER, canonical_unit};
+use crate::pages::{is_live, khz, live_answer, need_post, status_of};
 
 /// The whole exchange (connect, send, reply, close) must finish in this.
 pub const TIMEOUT: Duration = Duration::from_secs(4);
 /// The timeout of the reads a page render makes (`GetState`,
-/// `GetConfigFilePath`): a hung engine must not hold every page for long.
+/// `GetConfigFilePath`, `GetStopReason`): a hung engine must not hold every
+/// page for long.
 pub const PAGE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Largest message and frame accepted from the engine.
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
+/// How long a finished call waits for the engine's half of the closing handshake.
+const CLOSE_WAIT: Duration = Duration::from_millis(500);
 /// The engine's systemd unit, for the restart fallback when the websocket
 /// is not reachable: used only if it is an allowlisted entry.
 pub const UNIT: &str = "camilladsp";
 /// Signal boost range, dB.
 pub const BOOST_RANGE: (f64, f64) = (0.0, 30.0);
+/// Above this the boost pane is shown in the warning colour: that much
+/// gain clips most sources.
+pub const BOOST_WARN_DB: f64 = 12.0;
 /// Where the boost form sends the operator back.
 pub const BOOST_ANCHOR: &str = "/speaker#boost";
 
@@ -91,6 +99,8 @@ pub enum Command {
     /// The processing state (`Running`, `Paused`, `Inactive`, `Stalled`,
     /// `Starting`).
     GetState,
+    /// Why processing last stopped (not supported by every engine).
+    GetStopReason,
     /// The engine's own volume, dB (not the amplifier's).
     GetVolume,
     /// Set the engine's volume, dB.
@@ -112,6 +122,7 @@ impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Self::GetState => "GetState",
+            Self::GetStopReason => "GetStopReason",
             Self::GetVolume => "GetVolume",
             Self::SetVolume(_) => "SetVolume",
             Self::Reload => "Reload",
@@ -260,8 +271,17 @@ impl Client {
             }
         };
         // A polite close; the reply is already in hand, so its outcome
-        // does not matter.
-        let _ = ws.close(None).await;
+        // does not matter. Sending the Close frame is half of it: the stream is
+        // read on until the engine's own Close arrives and the stream ends.
+        // Dropping the socket with that reply unread resets the connection,
+        // and the engine logs "Connection reset without closing" for every call.
+        // Bounded, so an engine that never answers cannot hold the caller.
+        if ws.close(None).await.is_ok() {
+            let _ = tokio::time::timeout(CLOSE_WAIT, async {
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await;
+        }
         reply
     }
 
@@ -271,6 +291,15 @@ impl Client {
     /// [`WsError`].
     pub async fn get_state(&self) -> Result<String, WsError> {
         expect_string(self.call(&Command::GetState).await?)
+    }
+
+    /// `GetStopReason`: a string or a tagged stop reason, depending on the
+    /// engine version.
+    ///
+    /// # Errors
+    /// [`WsError`], including engines that do not know this command.
+    pub async fn get_stop_reason(&self) -> Result<Value, WsError> {
+        self.call(&Command::GetStopReason).await
     }
 
     /// `GetVolume`: the engine's volume, dB.
@@ -398,7 +427,7 @@ impl Playback {
 // ---- YAML, line by line --------------------------------------------------------------
 
 /// The lines of a text with their byte offsets, line endings stripped.
-fn lines(text: &str) -> Vec<(usize, &str)> {
+pub(super) fn lines(text: &str) -> Vec<(usize, &str)> {
     let mut v = Vec::new();
     let mut at = 0;
     for l in text.split_inclusive('\n') {
@@ -413,7 +442,7 @@ fn lines(text: &str) -> Vec<(usize, &str)> {
 /// The indentation (spaces; a tab counts as one, YAML forbids it there
 /// anyway) and content of a line that has any (blank and comment lines
 /// have none).
-fn content(line: &str) -> Option<(usize, &str)> {
+pub(super) fn content(line: &str) -> Option<(usize, &str)> {
     let t = line.trim_start_matches([' ', '\t']);
     if t.is_empty() || t.starts_with('#') {
         return None;
@@ -423,7 +452,7 @@ fn content(line: &str) -> Option<(usize, &str)> {
 
 /// If `t` (a line's content) is `key:` (plain or quoted), the byte length
 /// of `key:` in it.
-fn key_len(t: &str, key: &str) -> Option<usize> {
+pub(super) fn key_len(t: &str, key: &str) -> Option<usize> {
     for quoted in [key.to_owned(), format!("\"{key}\""), format!("'{key}'")] {
         if let Some(rest) = t.strip_prefix(quoted.as_str()) {
             if let Some(after) = rest.strip_prefix(':') {
@@ -462,7 +491,7 @@ fn find_child(ls: &[(usize, &str)], parent: Option<usize>, key: &str) -> Option<
 
 /// Does the mapping at line `parent` have any child line at all (a block
 /// mapping, not a flow `{...}` or a scalar)?
-fn has_block(ls: &[(usize, &str)], parent: usize) -> bool {
+pub(super) fn has_block(ls: &[(usize, &str)], parent: usize) -> bool {
     let Some((pi, _)) = content(ls[parent].1) else {
         return false;
     };
@@ -475,7 +504,7 @@ fn has_block(ls: &[(usize, &str)], parent: usize) -> bool {
 /// Of the text after `key:`: the byte range of the scalar value (without
 /// surrounding whitespace and a trailing `# comment`; a quoted value runs
 /// to its closing quote, a `#` inside it is not a comment).
-fn value_span(rest: &str) -> (usize, usize) {
+pub(super) fn value_span(rest: &str) -> (usize, usize) {
     let start = rest.len() - rest.trim_start().len();
     let b = rest.as_bytes();
     let mut end = rest.len();
@@ -520,7 +549,7 @@ fn scalar(line: &str, key: &str) -> Option<String> {
     Some(unquote(&rest[s..e]))
 }
 
-fn unquote(v: &str) -> String {
+pub(super) fn unquote(v: &str) -> String {
     if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
         let mut out = String::with_capacity(v.len());
         let mut esc = false;
@@ -575,7 +604,13 @@ fn quote(v: &str) -> String {
 
 /// `text` with the scalar on line `i` (a `key:` line) replaced by `new`,
 /// everything else byte for byte the same (the comment after it included).
-fn replace_scalar(text: &str, ls: &[(usize, &str)], i: usize, key: &str, new: &str) -> String {
+pub(super) fn replace_scalar(
+    text: &str,
+    ls: &[(usize, &str)],
+    i: usize,
+    key: &str,
+    new: &str,
+) -> String {
     let (off, line) = ls[i];
     let (indent, t) = content(line).unwrap_or((0, line));
     let k = key_len(t, key).unwrap_or(0);
@@ -993,6 +1028,168 @@ pub async fn set_boost(
     }
 }
 
+/// Re-check the active configuration, set its capture rate and apply it.
+/// Call with the file lock held; status must be freshly read from the daemon.
+///
+/// # Errors
+/// No fixable mismatch, an unsafe or changed file, or a write/reload failure.
+pub async fn set_capture_rate(
+    cfg: &ApplianceConfig,
+    runner: &dyn Runner,
+    status: &Status,
+) -> Result<(u32, String), String> {
+    let c = &cfg.camilladsp;
+    let client = Client::new(&c.websocket);
+    let active = Active::read(c, &client).await?;
+    let path = active
+        .path
+        .ok_or_else(|| "the EQ engine has no active configuration".to_owned())?;
+    let name = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(n)) if dir == c.configs_dir => n.to_owned(),
+        _ => {
+            return Err(format!(
+                "the active configuration `{}` is outside {}; the portal edits only files there",
+                path.display(),
+                c.configs_dir.display()
+            ));
+        }
+    };
+    let path = config_file(c, &name)?;
+    let yaml = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("cannot read the active EQ configuration: {e}"))?;
+    let (new, rate) = capture_rate::prepare(&yaml, &status.devices)?;
+    tokio::task::spawn_blocking(move || {
+        let current = files::read_regular(&path)
+            .map_err(|e| format!("cannot re-read the active EQ configuration: {e}"))?;
+        if current != yaml.as_bytes() {
+            return Err("The active EQ configuration changed while checking it; reload the Speaker page and try again.".into());
+        }
+        write_atomic(&path, new.as_bytes())
+            .map_err(|e| format!("cannot write the active EQ configuration: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let applied = match client.reload().await {
+        Ok(()) => Ok(Applied::Reloaded),
+        Err(WsError::Rejected(m)) => Err(format!("the EQ engine refused: {m}")),
+        Err(e) => restart(cfg, runner, e.to_string()).await,
+    };
+    match applied {
+        Ok(Applied::Reloaded | Applied::Restarted) => Ok((rate, name)),
+        Ok(Applied::Saved(why)) | Err(why) => Err(format!(
+            "Capture rate saved in {name}, but the EQ engine could not reload: {why}. Restart the EQ engine after correcting this."
+        )),
+    }
+}
+
+// ---- the engine's GUI ---------------------------------------------------------------------
+
+/// Longest host accepted from the `Host` header (a DNS name's limit).
+const HOST_MAX: usize = 253;
+
+/// The host the browser used to reach the portal, from the `Host` header
+/// with the port removed: `speaker.local`, `203.0.113.231`, `[fe80::1]`.
+/// Only letters, digits, `.`, `-`, `_`, `:`, `[` and `]` are accepted, a
+/// `:` only inside brackets (an IPv6 literal) or before the port; anything
+/// else, a missing header or an empty value is `None`. The header is
+/// untrusted input: the result goes into a link, so nothing else of it
+/// may pass.
+#[must_use]
+pub fn request_host(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::HOST)?.to_str().ok()?.trim();
+    host_of(raw)
+}
+
+/// [`request_host`] on the header's value.
+#[must_use]
+pub fn host_of(raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.len() > HOST_MAX
+        || !raw.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        })
+    {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = raw.strip_prefix('[') {
+        // An IPv6 literal: `[` hex digits and colons `]`, then nothing or
+        // `:port`.
+        let (inner, after) = rest.split_once(']')?;
+        let ipv6 = !inner.is_empty()
+            && inner.contains(':')
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'));
+        if !ipv6 {
+            return None;
+        }
+        let port = if after.is_empty() {
+            None
+        } else {
+            Some(after.strip_prefix(':')?)
+        };
+        (format!("[{inner}]"), port)
+    } else {
+        if raw.contains(['[', ']']) {
+            return None;
+        }
+        match raw.rsplit_once(':') {
+            Some((h, _)) if h.contains(':') => return None,
+            Some((h, p)) => (h.to_owned(), Some(p)),
+            None => (raw.to_owned(), None),
+        }
+    };
+    if let Some(p) = port {
+        if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.is_empty() || bare.starts_with(['.', '-']) {
+        return None;
+    }
+    Some(host)
+}
+
+/// The link to the engine's GUI: `template` (`gui_url`, validated by
+/// [`crate::config::valid_gui_url`]) with `{host}` replaced by `host`, the
+/// browser's host or the device's name. `None` when the template needs a
+/// host and there is none; a template without the placeholder is returned
+/// as it is.
+#[must_use]
+pub fn gui_link(template: &str, host: Option<&str>) -> Option<String> {
+    if !template.contains(GUI_HOST_PLACEHOLDER) {
+        return Some(template.to_owned());
+    }
+    let h = host.filter(|h| host_of(h).as_deref() == Some(h))?;
+    Some(template.replace(GUI_HOST_PLACEHOLDER, h))
+}
+
+/// The "EQ engine (CamillaDSP)" button: a link to the GUI in a new tab,
+/// with the engine's state next to it (the GUI does not load while the
+/// engine is off, and this says so). `small` is the hero's variant.
+#[must_use]
+pub fn gui_button(url: &str, playback: Option<&Playback>, small: bool) -> Markup {
+    let off = matches!(playback, Some(Playback::Off(_)));
+    html! {
+        span.eqgui {
+            a.btn.primary.sm[small] href=(url) target="_blank" rel="noopener noreferrer"
+                title=[playback.map(Playback::detail)] {
+                "EQ engine (CamillaDSP)"
+                @if !small { " ↗" }
+            }
+            @if let Some(p) = playback {
+                @if off {
+                    span.status.off title=(p.detail()) { "engine off" }
+                } @else if !small {
+                    span.status.on title=(p.detail()) { "engine running" }
+                }
+            }
+        }
+    }
+}
+
 // ---- the page ---------------------------------------------------------------------------------
 
 /// Everything the Speaker page shows of the engine, read in one go.
@@ -1002,6 +1199,10 @@ pub struct Snapshot {
     pub playback: Playback,
     /// The active configuration, or why it is unknown.
     pub active: Result<Active, String>,
+    /// A recognised ALSA capture-rate error, if the engine reports one.
+    pub stop_reason: Option<String>,
+    /// A recognised ALSA format error, if the engine reports one.
+    pub format_failure: Option<capture_rate::FormatFailure>,
     /// `configs_dir`, listed.
     pub configs: Vec<files::Entry>,
     /// `coeffs_dir`, listed.
@@ -1012,12 +1213,28 @@ impl Snapshot {
     /// Ask the engine (with [`PAGE_TIMEOUT`]) and read the files.
     pub async fn read(cfg: &CamillaDspConfig) -> Self {
         let client = Client::new(&cfg.websocket).with_timeout(PAGE_TIMEOUT);
-        let (state, active) = tokio::join!(client.get_state(), Active::read(cfg, &client));
+        let (state, active, stop_reason) = tokio::join!(
+            client.get_state(),
+            Active::read(cfg, &client),
+            client.get_stop_reason()
+        );
+        let (stop_reason, format_failure) = match stop_reason {
+            Ok(v) => (
+                capture_rate::stop_reason(&v),
+                capture_rate::format_failure(&v),
+            ),
+            Err(e) => {
+                tracing::debug!(%e, "EQ engine stop reason unavailable");
+                (None, None)
+            }
+        };
         let configs = files::list(&cfg.configs_dir, Kind::Config).await;
         let coeffs = files::list(&cfg.coeffs_dir, Kind::Coeff).await;
         Self {
             playback: Playback::of(&state),
             active,
+            stop_reason,
+            format_failure,
             configs,
             coeffs,
         }
@@ -1072,35 +1289,53 @@ pub fn signed_db(db: f64) -> String {
     }
 }
 
-/// The signal boost form (the top of the Sources card).
+/// Is `db` of boost in the warning range (above [`BOOST_WARN_DB`])?
 #[must_use]
-pub fn boost_form(active: &Result<Active, String>, csrf: &str) -> Markup {
+pub fn boost_is_hot(db: f64) -> bool {
+    db > BOOST_WARN_DB
+}
+
+/// The signal boost pane of the master card (`#boost`, where the form's
+/// redirect lands). The slider exists only when the active configuration
+/// has the gain filter; otherwise the pane says why not. The script finds
+/// the form by `data-live-slider` and applies it on release; the warning
+/// state (`hot`) is the server's until the script moves the slider.
+#[must_use]
+pub fn boost_pane(active: &Result<Active, String>, csrf: &str) -> Markup {
     let (min, max) = BOOST_RANGE;
     html! {
-        h2 id="boost" { "Signal boost " span.n { "for quiet sources · press Apply" } }
-        @match active {
-            Ok(Active { boost_db: Some(db), label, .. }) => {
-                form.vol method="post" action="/speaker/boost" {
-                    input type="hidden" name="csrf" value=(csrf);
-                    div {
-                        div.big { (signed_db(*db)) small { "dB" } }
-                        div.sub { "saved in " (label.as_deref().unwrap_or("the active EQ config")) }
+        div.pane id="boost" {
+            h2 { "Signal boost " span.n { "for quiet sources" } }
+            @match active {
+                Ok(Active { boost_db: Some(db), label, .. }) => {
+                    form.vol.live.hot[boost_is_hot(*db)] method="post" action="/speaker/boost" data-live-slider="boost" {
+                        input type="hidden" name="csrf" value=(csrf);
+                        div.readout {
+                            output.big for="boost-db" { (signed_db(*db)) small { "dB" } }
+                            div.sub { "saved in " (label.as_deref().unwrap_or("the active EQ config")) }
+                        }
+                        div.slider {
+                            input id="boost-db" type="range" name="db" min=(min) max=(max) step="0.5" value=(format!("{db:.1}"))
+                                class=(fill_class(*db, min, max)) aria-label="Signal boost, dB"
+                                aria-valuetext=(format!("{} dB", signed_db(*db)));
+                            div.ticks { span { "0" } span { "+15" } span { "+30" } }
+                            // Shown by the stylesheet while the form is `hot`.
+                            div.hint { "Above " (signed_db(BOOST_WARN_DB)) " dB most sources clip." }
+                        }
+                        div.apply {
+                            button.btn.primary.nojs type="submit" { "Apply" }
+                            span.note role="status" aria-live="polite" data-live-local {}
+                        }
                     }
-                    div {
-                        input type="range" name="db" min=(min) max=(max) step="0.5" value=(format!("{db:.1}"))
-                            class=(fill_class(*db, min, max)) aria-label="Signal boost, dB";
-                        div.ticks { span { "0" } span { "+15" } span { "+30" } }
-                    }
-                    button.btn.primary type="submit" { "Apply" }
                 }
+                Ok(Active { path: None, .. }) => {
+                    p.muted { "The EQ engine has no active configuration." }
+                }
+                Ok(_) => {
+                    p.muted { "The active EQ configuration has no " code { "Gain" } " filter named for the signal boost (" code { "[appliance.camilladsp] gain_filter" } ", block style, dB)." }
+                }
+                Err(e) => { p.muted { (e) } }
             }
-            Ok(Active { path: None, .. }) => {
-                p.muted { "The EQ engine has no active configuration." }
-            }
-            Ok(_) => {
-                p.muted { "The active EQ configuration has no " code { "Gain" } " filter named for the signal boost (" code { "[appliance.camilladsp] gain_filter" } ", block style, dB)." }
-            }
-            Err(e) => { p.muted { (e) } }
         }
     }
 }
@@ -1115,7 +1350,9 @@ pub struct BoostForm {
     db: String,
 }
 
-/// `POST /speaker/boost`.
+/// `POST /speaker/boost`. Posted in place (`X-Tessera-Live`) it answers
+/// JSON with the gain as applied (`db`); otherwise a redirect to the pane
+/// with a one-shot message.
 pub async fn post_boost(
     State(st): State<Shared>,
     headers: HeaderMap,
@@ -1142,15 +1379,74 @@ pub async fn post_boost(
         set_boost(&a.config, &*a.runner, db).await
     };
     tracing::info!(session = %s.id, db, ok = r.is_ok(), "appliance signal boost");
+    let text = match &r {
+        Ok(how) => format!("Signal boost {} dB {}", signed_db(db), how.message()),
+        Err(m) => m.clone(),
+    };
+    if is_live(&headers) {
+        return live_answer(
+            StatusCode::OK,
+            r.is_ok(),
+            &text,
+            serde_json::json!({ "db": db, "hot": boost_is_hot(db) }),
+        );
+    }
+    st.set_flash(&token, r.is_ok(), text);
+    Redirect::to(BOOST_ANCHOR).into_response()
+}
+
+/// The capture-rate form carries only the session's CSRF token: the device
+/// and its rate are resolved again on POST.
+#[derive(Debug, Deserialize)]
+pub struct CaptureRateForm {
+    #[serde(default)]
+    csrf: String,
+}
+
+/// `POST /speaker/capture-rate`.
+pub async fn post_capture_rate(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Form(f): Form<CaptureRateForm>,
+) -> Response {
+    let (token, s) = match need_post(&st, &headers, &f.csrf) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(a) = st
+        .appliance
+        .as_ref()
+        .filter(|a| a.config.camilladsp.enabled)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let r = {
+        let _g = a.eq_lock.lock().await;
+        match status_of(&st).await {
+            Ok(status) => set_capture_rate(&a.config, &*a.runner, &status).await,
+            Err(e) => Err(format!(
+                "Cannot check the Tessera device's current rate: {e}"
+            )),
+        }
+    };
+    tracing::info!(
+        session = %s.id,
+        rate = r.as_ref().ok().map(|(rate, _)| *rate),
+        ok = r.is_ok(),
+        "appliance capture rate"
+    );
     match r {
-        Ok(how) => st.set_flash(
+        Ok((rate, label)) => st.set_flash(
             &token,
             true,
-            format!("Signal boost {} dB {}", signed_db(db), how.message()),
+            format!(
+                "Capture rate set to {} in {label}; EQ engine reloaded.",
+                khz(rate)
+            ),
         ),
         Err(m) => st.set_flash(&token, false, m),
     }
-    Redirect::to(BOOST_ANCHOR).into_response()
+    Redirect::to("/speaker#capture-rate").into_response()
 }
 
 /// A form's `db`: a finite number, or nothing.
@@ -1209,6 +1505,7 @@ pipeline:
     #[test]
     fn commands_serialise_as_the_engine_expects() {
         assert_eq!(Command::GetState.json(), "\"GetState\"");
+        assert_eq!(Command::GetStopReason.json(), "\"GetStopReason\"");
         assert_eq!(Command::Reload.json(), "\"Reload\"");
         assert_eq!(Command::SetVolume(-12.0).json(), "{\"SetVolume\":-12.0}");
         assert_eq!(
@@ -1496,6 +1793,107 @@ pipeline:
         assert_eq!(signed_db(14.0), "+14.0");
         assert_eq!(signed_db(-12.5), "\u{2212}12.5");
         assert_eq!(signed_db(0.0), "0.0");
+        // The boost's own range and warning threshold.
+        let (lo, hi) = BOOST_RANGE;
+        assert_eq!(snap_db(-5.0, lo, hi), 0.0);
+        assert_eq!(snap_db(31.0, lo, hi), 30.0);
+        assert_eq!(snap_db(12.26, lo, hi), 12.5);
+        assert!(!boost_is_hot(12.0) && !boost_is_hot(0.0));
+        assert!(boost_is_hot(12.5) && boost_is_hot(30.0));
+    }
+
+    #[test]
+    fn the_browsers_host_is_taken_strictly_from_the_header() {
+        for (raw, want) in [
+            ("speaker", Some("speaker")),
+            ("speaker.local:8090", Some("speaker.local")),
+            ("203.0.113.231:8090", Some("203.0.113.231")),
+            ("203.0.113.231", Some("203.0.113.231")),
+            ("Speaker-1_a.example.", Some("Speaker-1_a.example.")),
+            ("[::1]:8090", Some("[::1]")),
+            ("[fe80::1]", Some("[fe80::1]")),
+            ("[::ffff:10.0.0.1]:80", Some("[::ffff:10.0.0.1]")),
+            (" speaker:8090 ", Some("speaker")),
+        ] {
+            assert_eq!(host_of(raw.trim()).as_deref(), want, "{raw:?}");
+        }
+        for bad in [
+            "",
+            "::1",
+            "a:b:c",
+            "speaker:",
+            "speaker:abc",
+            "speaker:123456",
+            "[::1]:",
+            "[::1]x",
+            "[::1",
+            "[]",
+            "[speaker]",
+            "[::1]:80:1",
+            "speaker]",
+            "-speaker",
+            ".speaker",
+            "evil.example\"><script>alert(1)</script>",
+            "evil.example/path",
+            "evil.example?x=1",
+            "evil.example#x",
+            "user@evil.example",
+            "evil.example\\x",
+            "evil example",
+            "ev\u{e9}l.example",
+            "evil.example%2f",
+            "evil.example'",
+            "evil.example{host}",
+        ] {
+            assert_eq!(host_of(bad), None, "{bad:?}");
+        }
+        assert_eq!(host_of(&"a".repeat(254)), None);
+        assert!(host_of(&"a".repeat(253)).is_some());
+        let mut h = HeaderMap::new();
+        assert_eq!(request_host(&h), None);
+        h.insert(
+            axum::http::header::HOST,
+            "speaker.local:8090".parse().unwrap(),
+        );
+        assert_eq!(request_host(&h).as_deref(), Some("speaker.local"));
+        h.insert(axum::http::header::HOST, "<b>x</b>".parse().unwrap());
+        assert_eq!(request_host(&h), None);
+    }
+
+    #[test]
+    fn the_gui_link_fills_the_placeholder_or_stays() {
+        let t = "http://{host}:5005/gui/index.html";
+        assert_eq!(
+            gui_link(t, Some("203.0.113.231")).as_deref(),
+            Some("http://203.0.113.231:5005/gui/index.html")
+        );
+        assert_eq!(
+            gui_link(t, Some("[fe80::1]")).as_deref(),
+            Some("http://[fe80::1]:5005/gui/index.html")
+        );
+        assert_eq!(gui_link(t, None), None);
+        // A fallback that is not a host (an empty or odd host name) is not
+        // used either.
+        assert_eq!(gui_link(t, Some("")), None);
+        assert_eq!(gui_link(t, Some("x\"y")), None);
+        assert_eq!(gui_link(t, Some("speaker:8090")), None);
+        let plain = "http://speaker.example:5005/gui/index.html";
+        assert_eq!(gui_link(plain, None).as_deref(), Some(plain));
+        assert_eq!(gui_link(plain, Some("other")).as_deref(), Some(plain));
+        // The button escapes what it links to and marks a stopped engine.
+        let off = Playback::Off("connection refused".into());
+        let b = gui_button("http://a/\"<x>", Some(&off), false).into_string();
+        assert!(b.contains("href=\"http://a/&quot;&lt;x&gt;\""), "{b}");
+        assert!(
+            b.contains("target=\"_blank\" rel=\"noopener noreferrer\""),
+            "{b}"
+        );
+        assert!(b.contains("engine off"), "{b}");
+        let on = gui_button("http://a/", Some(&Playback::Playing), true).into_string();
+        assert!(
+            !on.contains("engine off") && on.contains("EQ engine (CamillaDSP)"),
+            "{on}"
+        );
         assert_eq!(parse_form_db(" -3.5 "), Some(-3.5));
         for bad in ["NaN", "inf", "-inf", "1e309", "", "x"] {
             assert_eq!(parse_form_db(bad), None, "{bad}");

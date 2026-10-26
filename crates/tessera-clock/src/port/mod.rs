@@ -162,8 +162,11 @@ impl<const N: usize> Port<N> {
     #[must_use]
     pub fn new(cfg: PortConfig, now: LocalNs) -> Self {
         let initial = cfg.initial_media_ns.unwrap_or(now);
-        let mut clock = MediaClock::new(now, initial);
-        clock.set_rate(now, cfg.initial_rate_ppb);
+        // The mapping is anchored where `initial` was read, not where the
+        // port happens to be built.
+        let anchor = cfg.initial_local_ns.map_or(now, |t| t.min(now));
+        let mut clock = MediaClock::new(anchor, initial);
+        clock.set_rate(anchor, cfg.initial_rate_ppb);
         Port {
             cfg,
             state: PortState::Initializing,

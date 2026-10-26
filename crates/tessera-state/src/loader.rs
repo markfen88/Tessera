@@ -15,10 +15,10 @@
 //! * `[[bridge]]` entries have no key, so a drop-in that contains `[[bridge]]`
 //!   replaces the whole bridge list (with a warning).
 //!
-//! `[clock] locked` and `[network] locked` combine like a device's `locked` list (set union, each
-//! element's provenance names the file that added it), so a later file cannot
-//! silently drop a lock. Tables outside arrays, inline or not, merge; see
-//! [`merge_tables`].
+//! `[clock]`, `[network]` and `[control]` `locked` lists combine like a device's
+//! (set union, each element's provenance names the file that added it), so a
+//! later file cannot silently drop a lock. Tables outside arrays, inline or
+//! not, merge; see [`merge_tables`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -182,7 +182,7 @@ fn merge_into(base: &mut Table, over: Table, path: &str, file: &Path, prov: &mut
             if let (Some(Value::Table(b)), Value::Table(o)) = (base.get_mut(&k), v) {
                 merge_into(b, o, &p, file, prov);
             }
-        } else if (path == "clock" || path == "network")
+        } else if (path == "clock" || path == "network" || path == "control")
             && k == "locked"
             && both_arrays(base.get(&k), &v)
         {
@@ -445,29 +445,72 @@ pub fn load_from_sources_with(
     env: &Environment,
     overrides: &Overrides,
 ) -> Result<LoadedConfig, ConfigError> {
+    load_from_sources_for_state(sources, env, overrides, false)
+}
+
+/// Load with legacy controller fallback disabled once state owns that set.
+/// The legacy file is ignored before parsing, so stale invalid content cannot
+/// prevent a daemon with persisted protocol intent from starting or reloading.
+pub(crate) fn load_from_sources_for_state(
+    sources: &[Source],
+    env: &Environment,
+    overrides: &Overrides,
+    protocol_stored: bool,
+) -> Result<LoadedConfig, ConfigError> {
     let mut issues: Vec<Issue> = Vec::new();
     let mut merged = Table::new();
     let mut prov = Provenance::default();
     let mut merge_warnings: Vec<Issue> = Vec::new();
+    let mut legacy = Vec::new();
+    let mut legacy_sources = Vec::new();
     for s in sources {
-        match s.text.parse::<Table>() {
-            Ok(t) => {
-                // The Controller runtime can write this reserved drop-in.
-                // Enforce its scope here too, even if it bypasses its adapter.
-                if s.path.file_name().is_some_and(|n| n == "90-probe-flows.toml")
-                    && (t.keys().any(|key| key != "flow")
-                        || t.get("flow").is_some_and(|flows| {
-                            !matches!(flows, Value::Array(a) if a.iter().all(Value::is_table))
-                        }))
-                {
+        if s.path
+            .file_name()
+            .is_some_and(|n| n == "90-probe-flows.toml")
+        {
+            let mut warning = Issue::warning(
+                "flow",
+                if protocol_stored {
+                    "90-probe-flows.toml is deprecated; ignored because controller flows are owned by state.toml (removed in 0.4.0)"
+                } else {
+                    "90-probe-flows.toml is deprecated; submit set_protocol_flows instead (removed in 0.4.0)"
+                },
+            );
+            warning.source = Some(s.path.clone());
+            merge_warnings.push(warning);
+            if protocol_stored {
+                continue;
+            }
+            match s.text.parse::<Table>() {
+                Ok(table) if crate::flows::flow_only(&table) => {
+                    let (cfg, mut found) = extract(table, env);
+                    for issue in &mut found {
+                        issue.source = Some(s.path.clone());
+                    }
+                    issues.extend(found.into_iter().filter(Issue::is_error));
+                    for _ in &cfg.flows {
+                        legacy_sources.push(s.path.clone());
+                    }
+                    legacy.extend(cfg.flows);
+                }
+                Ok(_) => {
                     let mut issue = Issue::error(
                         "",
                         "reserved Controller drop-in accepts only [[flow]] entries",
                     );
                     issue.source = Some(s.path.clone());
                     issues.push(issue);
-                    continue;
                 }
+                Err(e) => {
+                    let mut issue = Issue::error("", format!("syntax error: {e}"));
+                    issue.source = Some(s.path.clone());
+                    issues.push(issue);
+                }
+            }
+            continue;
+        }
+        match s.text.parse::<Table>() {
+            Ok(t) => {
                 if let (Some(Value::Array(_)), Some(Value::Array(new))) =
                     (merged.get("device"), t.get("device"))
                 {
@@ -560,6 +603,7 @@ pub fn load_from_sources_with(
         _ => std::collections::BTreeSet::new(),
     };
     let (mut config, mut found) = extract(merged, env);
+    config.legacy_protocol_flows = legacy;
     // A value set on the command line wins over `state.toml` too: an
     // overridden key that commands can change (apply class `live`) is
     // treated as locked, so the stored value is skipped and commands are
@@ -578,9 +622,31 @@ pub fn load_from_sources_with(
         .filter(|i| i.is_error())
         .map(|i| i.path.clone())
         .collect();
+    let mut validation_config = config.clone();
+    if !config
+        .control
+        .locked
+        .contains(&crate::config::ControlLock::Flows)
+    {
+        validation_config
+            .flows
+            .extend(config.legacy_protocol_flows.iter().cloned());
+    }
     found.extend(
-        validate(&config, env)
+        validate(&validation_config, env)
             .into_iter()
+            .map(|mut issue| {
+                let legacy_index = issue
+                    .path
+                    .strip_prefix("flow[")
+                    .and_then(|path| path.split(']').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| index.checked_sub(config.flows.len()));
+                if let Some(source) = legacy_index.and_then(|index| legacy_sources.get(index)) {
+                    issue.source = Some(source.clone());
+                }
+                issue
+            })
             .filter(|i| !suppressed(&i.path, &bad)),
     );
     for i in &mut found {

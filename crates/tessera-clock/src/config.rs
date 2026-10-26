@@ -151,6 +151,15 @@ pub struct PortConfig {
     /// Media time at construction (a leader passes a TAI reading; `None` =
     /// the local monotonic time, i.e. a clock with offset 0).
     pub initial_media_ns: Option<u64>,
+    /// The local monotonic time `initial_media_ns` was read at (`None`: the
+    /// time the port is constructed). A port that continues an earlier
+    /// mapping is built on a new thread some time after the mapping was read,
+    /// longer when the host is busy; anchoring the clock at the instant of the
+    /// reading keeps media time exactly continuous whatever that takes, where
+    /// anchoring it at construction would step it back by the start-up time
+    /// and leave the followers' servos to work that step off. Not after
+    /// construction: a later time is taken as the construction time.
+    pub initial_local_ns: Option<u64>,
     /// Rate offset (ppb) of the media clock at construction. A leader that
     /// has no discipline runs at this rate against the monotonic clock
     /// (default 0); lab tests set a non-zero value so followers must slew.
@@ -203,6 +212,7 @@ impl PortConfig {
             max_samples_without_delay: 6,
             path_asymmetry_ns: 0,
             initial_media_ns: None,
+            initial_local_ns: None,
             initial_rate_ppb: 0,
             servo: ServoConfig::default(),
             holdover_ns: 60_000_000_000,

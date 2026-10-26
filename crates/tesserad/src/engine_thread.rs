@@ -482,7 +482,7 @@ fn run(
                 Msg::RuntimePlan { reply } => {
                     let _ = reply.send(RuntimePlan {
                         model: engine.model().clone(),
-                        config: engine.config().config.clone(),
+                        config: engine.runtime_config(),
                     });
                 }
                 Msg::ReportClock(status) => engine.report_clock_status(status),

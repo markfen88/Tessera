@@ -29,6 +29,7 @@ use tessera_audio_ipc::{
 
 use crate::error::Error;
 use crate::settings::{Dir, RingFormatPref, Settings, Trust, UserSpec};
+use crate::tick::TickEstimator;
 
 /// The wake socket and the audio socket of one attached session.
 #[derive(Debug)]
@@ -38,24 +39,20 @@ pub struct Link {
     wake: WakeWait,
     lost: bool,
     last_tick: Instant,
-    /// When a drain last found ticks (the reference of the interval estimate).
-    last_tick_drain: Option<Instant>,
-    /// Decayed sums of the time between tick-bearing drains and of the ticks they
-    /// found: their ratio is the mean tick interval, which stays right when the
-    /// daemon's ticks arrive in bursts. `tick_samples` counts the drains in.
-    tick_dt_ns: f64,
-    tick_count: f64,
-    tick_samples: u32,
+    now: fn() -> Instant,
+    /// The daemon's engine tick, from the drains that found ticks.
+    tick: TickEstimator,
 }
 
-/// Two drains that found ticks further apart than this say nothing about the
-/// tick interval (the socket fills up and the daemon drops ticks on purpose,
-/// so a long gap is a count of nothing).
-const TICK_WINDOW: Duration = Duration::from_millis(100);
-/// Estimates needed before the interval is trusted.
-const TICK_MIN_SAMPLES: u32 = 12;
-
 impl Link {
+    /// Inject the monotonic clock before the first drain in callback tests.
+    #[cfg(feature = "plugin")]
+    pub(crate) fn set_clock(&mut self, now: fn() -> Instant) {
+        self.now = now;
+        self.last_tick = now();
+        self.tick.reset();
+    }
+
     /// The descriptor to poll: one byte per daemon engine tick.
     pub fn wake_fd(&self) -> RawFd {
         self.wake.as_fd().as_raw_fd()
@@ -65,36 +62,26 @@ impl Link {
     /// keeps its clock overlay fresh but sends no ticks is broken; the plugin
     /// notices at `prepare`, which drains first.
     pub fn tick_age(&self) -> Duration {
-        self.last_tick.elapsed()
+        (self.now)().saturating_duration_since(self.last_tick)
     }
 
     /// The daemon's engine tick (the interval of its wake-ups) in frames of
     /// `rate` Hz; `0` until enough ticks were seen.
     ///
     /// `Attach` and the ring header do not carry the engine period (an
-    /// audio-ipc ABI gap, see PROGRESS.md), so it is estimated: only from two
-    /// drains that both found ticks and are less than 100 ms apart, as the
-    /// time between them divided by the ticks found, smoothed. Idle periods,
-    /// a socket that overflowed and stop/start cycles therefore cannot change
-    /// it.
+    /// audio-ipc ABI gap, see PROGRESS.md), so it is estimated (see
+    /// `tick.rs`): only from drains that found ticks and are less than 100 ms
+    /// apart, never below a steady tick whatever the drain timing. Idle
+    /// periods, a socket that overflowed and stop/start cycles cannot change it.
     pub fn tick_frames(&self, rate: u32) -> u64 {
-        if self.tick_samples < TICK_MIN_SAMPLES || self.tick_count <= 0.0 {
-            return 0;
-        }
-        let tick_ns = self.tick_dt_ns / self.tick_count;
-        let frames = (tick_ns * f64::from(rate) / 1e9).ceil();
-        if frames.is_finite() && frames >= 1.0 {
-            frames as u64
-        } else {
-            0
-        }
+        self.tick.frames(rate)
     }
 
     /// Waits up to `budget` for enough wake ticks to know the tick interval
     /// (open path, not real-time).
     pub fn measure_tick(&mut self, budget: Duration) {
         let end = Instant::now() + budget;
-        while self.tick_samples < TICK_MIN_SAMPLES && !self.lost {
+        while self.tick.tick_ns().is_none() && !self.lost {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -148,20 +135,16 @@ impl Link {
         if self.lost {
             return false;
         }
+        // The drain is timed from before its first read to after its last, so
+        // the span the estimate counts ticks in is never shorter than the one
+        // they arrived in, however the thread was scheduled in between.
+        let begin = (self.now)();
         match self.wake.drain() {
             Ok(n) => {
                 if n > 0 {
-                    let now = Instant::now();
+                    let now = (self.now)();
                     self.last_tick = now;
-                    if let Some(prev) = self.last_tick_drain {
-                        let dt = now.saturating_duration_since(prev);
-                        if dt <= TICK_WINDOW {
-                            self.tick_dt_ns = self.tick_dt_ns * 0.98 + dt.as_nanos() as f64;
-                            self.tick_count = self.tick_count * 0.98 + n as f64;
-                            self.tick_samples = self.tick_samples.saturating_add(1);
-                        }
-                    }
-                    self.last_tick_drain = Some(now);
+                    self.tick.record(begin, now, n);
                 }
                 true
             }
@@ -372,10 +355,8 @@ fn try_connect(
             wake,
             lost: false,
             last_tick: Instant::now(),
-            last_tick_drain: None,
-            tick_dt_ns: 0.0,
-            tick_count: 0.0,
-            tick_samples: 0,
+            now: Instant::now,
+            tick: TickEstimator::default(),
         },
         session_id,
         params,

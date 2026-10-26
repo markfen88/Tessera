@@ -15,10 +15,14 @@ and for the PipeWire client: `systemctl --user status tessera-pw` and
 
 Remember what exists today (see `user-guide.md` and `interoperability.md`):
 the daemon runs the PTP clock, the media engine with static `[[flow]]`
-entries, receiver keepalives, optional mDNS advertising, the local clients
+entries, receiver keepalives, mDNS advertising, the local clients
 and (with `alsa-bridge`) the sound-card bridge. It does not implement the
-vendor's control protocols, so nothing a controller asks for is carried out
-by `tesserad` itself.
+vendor's control protocols itself: the separate Controller compatibility
+runtime (`tessera-controller@main`) serves the first device's base control ports
+and hands what a controller sets up to the daemon as typed commands.
+
+On a speaker, the sections "Network speaker (CamillaDSP and the portal)" and
+"Add-on bundle" below cover most of what goes wrong.
 
 ## `tesseractl` fails
 
@@ -156,8 +160,8 @@ resampler).
 The `tessera-alsa` package is missing from a build made with `SKIP_ALSA=1`.
 If `aplay -L` has no `tessera` entry: the package is not installed or
 `/etc/alsa/conf.d/60-tessera.conf` is missing (`dpkg -L tessera-alsa`). The
-package's snippet defines only `pcm.tessera` with default options; there is
-no `tessera_plug` PCM in it (use `plug:tessera`). Options: `audio-backends.md`.
+package's snippet defines `pcm.tessera` with default options and a
+`tessera_plug` PCM (or use `plug:tessera`). Options: `audio-backends.md`.
 
 | Symptom | Likely cause and fix |
 |---|---|
@@ -178,7 +182,7 @@ table.
 
 | Symptom | Likely cause and fix |
 |---|---|
-| the daemon refuses the configuration: the bridge needs the `alsa-bridge` feature | this `tesserad` was built without it (the default). Build with `--features alsa-bridge` or `TESSERA_DAEMON_FEATURES=alsa-bridge packaging/build-deb.sh` |
+| the daemon refuses the configuration: the bridge needs the `alsa-bridge` feature | this `tesserad` was built without it (the default). Build with `--features alsa-bridge` or `TESSERA_DAEMON_FEATURES=alsa-bridge cargo xtask build-deb` |
 | `reopening`, "Permission denied" | the service user cannot open `/dev/snd/*`: add `SupplementaryGroups=audio` in a drop-in (`systemctl edit tesserad`) |
 | `reopening`, "Device or resource busy" | another program holds the card (or the same card is named twice with different spellings) |
 | `reopening`, card not found | the card is missing (`aplay -l`); the bridge starts by itself when it appears. Each attempt also prints `ALSA lib ... Cannot get card index` to the journal (alsa-lib's own message) |
@@ -218,7 +222,8 @@ The order is the order of dependence.
 6. **Subscription stuck "in progress"**: no rx `[[flow]]` carries that rx channel
    (or the flow started less than 5 s ago). A subscription is stored by name, but
    `tesserad` does not implement the flow control that would set it up; audio is
-   carried by `[[flow]]` entries (`configuration.md`, "Static flows"), and the
+   carried by `[[flow]]` entries (`configuration.md`, "Static flows") or by the flows
+   a controller submitted (`tesseractl flows show`), and the
    state follows the packets of the flow that carries the channel: "receiving",
    or "no media" when none arrived for a few seconds (check the sender, the port
    and `peer`, item 7).
@@ -249,16 +254,101 @@ The order is the order of dependence.
 
 ## A controller lists the device but shows it greyed out or unreachable
 
-The controller found the device in mDNS (so `[discovery] advertise_devices =
-true`) but gets no answer on the control ports the records advertise: ARC (UDP
+The controller found the device in mDNS (device advertisement is on by default)
+but gets no answer on the control ports the records advertise: ARC (UDP
 4440), CMC (8800) and flow control (4455), each plus 10 per further device.
-The control protocols are not served by `tesserad` yet. This is an implemented
-feature boundary, so changing VLANs or restarting a controller cannot add it.
-Use matching static flows with Tessera peers or independently configured peers.
-Optional advertisement can list ports that have no listener; the daemon warns
-about these ports. Disable device advertisement unless it is deliberately needed.
-A locked PTP clock does not imply vendor-controller compatibility. See
-[compatibility limits](interoperability.md).
+`tesserad` does not serve these ports itself. The packaged Controller
+compatibility runtime does, for the first logical device only:
+
+* Is it running? `systemctl status tessera-controller@main`. It starts and stops
+  with `tesserad` (it is `PartOf` it); a start that fails is retried every 3 s, and
+  an instance for a retired device key exits with status 78 and is not retried.
+  `journalctl -u tessera-controller@main -b` says why.
+* It reads the daemon's wired interface, address, device name and identity when it
+  starts. After the address changed (DHCP lease, cable moved to another network),
+  restart it: `sudo systemctl restart tessera-controller@main`.
+* A second logical device has no listener: its records advertise offset ports on
+  which nothing answers, and the daemon warns about each. Disable advertisement
+  (`[discovery] advertise_devices = false`) if that matters.
+* A site-local `/etc/systemd/system/tessera-controller@.service` overrides the
+  packaged unit and prevents the automatic migration of an old username-based
+  instance to `@main`; review or remove it.
+
+A locked PTP clock does not imply vendor-controller compatibility. The static
+flows of Tessera peers or independently configured peers work without any
+controller. See [compatibility limits](interoperability.md).
+
+## Network speaker (CamillaDSP and the portal)
+
+A speaker installed with the `speaker` profile plays through CamillaDSP
+(`dsp.md`). Start with `systemctl status tesserad camilladsp camillagui
+tessera-web` and `journalctl -u camilladsp -b`; the portal's Speaker page shows
+the engine's state and names the usual causes in a notice.
+
+| Symptom | Likely cause and fix |
+|---|---|
+| silent, the daemon receives (`tesseractl metrics` packets grow) and `camilladsp` is not running or keeps restarting | no engine can start: the card is missing (`aplay -l`; the engine keeps retrying until it appears), the card is held by another program (a leftover `[[bridge]]` of the tessera-only speaker: remove it or reinstall with `--no-dsp`), or one of the next two rows |
+| Speaker page: **EQ engine input rate mismatch** | the engine's ALSA capture rate (`capture_samplerate`, else `samplerate`) differs from the tessera device's rate, and the PCM `tessera` accepts only the device's rate. Press the fix button, or set `capture_samplerate` to the device's rate in the GUI. The notice appears only when the configuration can be read; one that cannot is logged once by the portal |
+| Speaker page: **EQ engine output format not supported** | the card refuses the playback `format` (`snd_pcm_hw_params_set_format … Invalid argument`). In the GUI set `devices.playback.format` to one the card plays: `S32_LE`, `S24_3_LE`, `S24_4_LE` or `S16_LE`. Many USB DACs offer only `S16_LE` and `S24_3_LE`. The installer seeds the first the card accepts |
+| silent after every network apply, Revert or expiry (0.2.2 speakers) | the engine was only `PartOf` the daemon and stayed stopped when the daemon started again. 0.3.0 links it into `tesserad.service.wants`: `systemctl show -p WantedBy camilladsp` must list `tesserad.service`; if not, `sudo systemctl enable camilladsp`. An engine you switched off (`systemctl disable`, the Speaker page's switch) stays off |
+| Volume pane: "The sound card `<name>` was not found" | the card is not connected, `[appliance.volume] card` is not its name (the word in brackets in `aplay -l`), or the portal's unit may not open its control device. A drop-in written by an installer before 0.3.0 names one `controlC<n>`: replace that line with the lines of `/usr/share/doc/tessera-web/examples/appliance-paths.conf` (`web-portal.md`, "Files and permissions") |
+| Volume pane: "The output is muted" | the card's playback switch is off (`[off]` in `amixer sget`), so the slider moves and nothing is heard. Press **Unmute** (it runs `amixer sset <control> unmute`); the portal never unmutes by itself |
+| volume back at its default after a reboot | 0.3.0 saves the value in `/var/lib/tessera-web/volume.json` and sets it again at start. Missing file after a change: the unit has no state directory (a manual install without the packaged unit), and the commit said it will not survive a restart. `journalctl -u tessera-web -b` names a card it is still waiting for (looks every 5 s for up to 10 minutes) |
+| everyone is signed out when a USB DAC is plugged in | by design: a udev rule starts `tessera-web-sound.service`, which restarts the portal 5 s later so the new card is reachable. It happens only where the portal has a Volume pane; sign in again |
+| no **EQ engine (CamillaDSP)** button | `[appliance.camilladsp] gui_url` is not set, or the engine is off ("engine off"); the speaker profile sets it |
+| CamillaGUI (port 5005) is open to the network | it has no login. 0.3.0 listens on loopback or on the management address only; the first candidates listened on every interface (`0.0.0.0`), which the installer narrows on upgrade (in the file; the running GUI keeps listening on every interface until `systemctl restart camillagui`). Check `bind_address` in `/etc/camilladsp/camillagui.yml`; `ss -ltn sport = :5005` shows what listens (`dsp.md`) |
+| the installer says the GUI listens on this machine only: "the management port is unknown" | the speaker has several default routes (Ethernet and Wi-Fi), or the port has no IPv4 address. Name the port with `[network] interface = "eth0"` in `/etc/tessera/web.toml` or a `web.d` file and install again (a plain `install` of the installed version applies the GUI's address and the portal's link, restarts `camillagui` if it runs, and installs nothing; no `--reinstall`), or set `bind_address` in `/etc/camilladsp/camillagui.yml` to the speaker's address and `systemctl restart camillagui` |
+| the EQ GUI does not start after an address change | `bind_address` holds the management address that was set at install; edit it (and `gui_url` in `/etc/tessera/web.d/60-speaker.toml`) or give the speaker a fixed address. `journalctl -u camillagui` says "Cannot assign requested address" |
+| the old engine unit of mine is gone from `/etc/systemd/system` | the installer moved it to `camilladsp.service.pre-tessera-dsp` (and its drop-in directory to `camilladsp.service.d.pre-tessera-dsp`) so the packaged unit takes over; `bundle.md` says how to go back |
+| the portal lost the services I had configured | the profile's `web.d/60-speaker.toml` of an earlier build carried a service list, and a list in a drop-in replaces the whole list. Put your list in a `web.d` file that sorts after it (for example `70-services.toml`) and regenerate the polkit rules with `tessera-web appliance polkit`; this release writes no list over yours |
+| Signal boost pane says there is no slider | the active configuration lacks the gain filter named by `gain_filter` (default `dashboard_signal_boost`); the seeded `Speaker.yml` has it |
+
+## Add-on bundle (`tessera-bundle`)
+
+| Message or symptom | Cause and fix |
+|---|---|
+| `untrusted_key: no trusted release key is installed. Trusted keys are read from /etc/tessera/trusted-release-keys …` | the installer has no built-in key and the file is absent. Provision the release's public key from a channel you trust (`bundle.md`, "Trusted release keys"), or, for a development build only, install with `--allow-unsigned`. Nothing was changed |
+| `untrusted_key: the release is not signed by any trusted release key` | a key file exists but none of its keys vouches for this archive: wrong archive, wrong key or an unsigned build. Do not add a key because it came with the download |
+| `bad_signature`, `wrong_product`, `wrong_version`, `missing_file`, `checksum_mismatch` | the archive is damaged or altered, or its parts come from different releases. Download it again, check it against the release's `SHA256SUMS`, and extract it into an empty directory |
+| `malformed: trusted keys require a root-owned regular file with mode 0644`, or `trusted-key parent must be root-owned and not group/world-writable` | fix the owner and mode of `/etc/tessera/trusted-release-keys` and of its directories; symlinks are refused |
+| `WARNING: --allow-unsigned is for development only` | expected with that option; the checksum, manifest and platform checks still ran |
+| `unknown option …`, `install.sh: No such file` | the 0.2.x scripts are gone. Run `tessera-bundle install` with the same options; `verify` takes none |
+| `refusing downgrade` | the installed version is newer than the bundle |
+| the install refuses because of a `[[bridge]]` in `/etc/tessera/config.d/60-speaker.toml` | a bridge that is not the speaker profile's own cannot share the card with CamillaDSP. Remove it, or install with `--no-dsp` |
+| `restart pending` | not an error: the new binary runs after `sudo systemctl restart tesserad` (or `install --restart`), which interrupts audio. After a restart or a reboot the next `install` prints `restart done` and clears it |
+| `install: dependencies: missing dependency libasound2` (a bundle built before 0.3.0-7) | the bundle names the virtual package `libasound2`; current installers accept the package that provides it (`libasound2t64` on trixie). Use the new bundle, or install with the newer `tessera-bundle` from it |
+| `apt cannot install the missing dependencies (…)` | apt could not resolve the listed dependencies (package lists out of date, no network, a name that does not exist). Nothing was changed and no record was written; run `sudo apt-get update`, or install them yourself and use `--offline` |
+| a failed install after packages were installed | the record is left incomplete with the failed step named. Fix the cause and run the same command again, or `tessera-bundle uninstall` |
+| the experimental Ubuntu archive is refused | it needs `--allow-ubuntu-24.04` and Ubuntu 24.04 arm64; other releases and amd64 are refused, and a Debian archive does not install on Ubuntu |
+
+## Network page and `tessera-network`
+
+| Symptom | Likely cause and fix |
+|---|---|
+| Keep answers `wrong_address` (409) | the policy `require_management_address` needs the request to arrive at the new management address. Open the address the confirmation page shows, or an administrator sets `[network] confirm = "token_only"` in `web.toml` (`network-vlans.md`) |
+| `still_applying` (409) | the change is still being applied or recovered; try again in a moment. A Revert waits up to five seconds for the apply worker first |
+| the Network page says the recovery is pending and Keep is unavailable; a Revert answers `apply_failed` / `recover` (409) | the previous settings could not be verified yet (the page, `journalctl -t tessera-network` and `tessera-network accept-current` give the connection, the property and both values). The speaker keeps playing and the helper retries every ten seconds; if it cannot settle, run `sudo tessera-network accept-current` to see why and `--yes` to keep the network as it is (`network-vlans.md`, "When a recovery cannot finish") |
+| `token_mismatch` (403), then `rate_limited` (429) | five failed token attempts per minute and client are allowed across Pending, Keep and Revert together. Wait a minute |
+| `not_pending`, `expired` (410) | the change ended (kept, reverted or expired); the previous or new configuration is in place, check the Network page |
+| "Network configuration refused: …" at adoption or Apply | the host's network configuration cannot be represented without losing something. The reason names it: `ambiguous_backend` (NetworkManager and networkd both manage the port), `unknown_backend`, `wired_port_required`, `attached_interfaces`, `foreign_vlan`, `ipv6_configuration`, `mixed_dhcp_static`, `multiple_addresses`, `policy_routing`, `unsupported_dhcp_client` (ifupdown needs ISC dhclient), `ifupdown_main_stanza` / `ifupdown_include_missing` (move the parent stanza to `/etc/network/interfaces.d/tessera-<interface>` and mark it handed off), and others. `unrepresentable_configuration (file: key)` names where it found the setting. Nothing is changed. With several wired ports, set `[network] interface = "eth0"` in `web.toml` |
+| search domains refused | more than six, an invalid name (a trailing dot, a `~` routing domain), or domains on a network that is not management. A `tessera-network` or NDIMon-R release that predates search domains rejects a document that carries them: upgrade both ends before configuring any |
+| management address lost after Apply | do nothing for 60 seconds after activation: without a Keep the device-side timer restores the previous configuration, and boot recovery does it after a reboot. Waiting is safe; pressing Keep from an address that works confirms |
+| the host kept its VLANs after removing the packages | by design: the committed Netplan/networkd files, the VLAN links and `/etc/modules-load.d/tessera-8021q.conf` stay so that removal never changes the host's addressing. Delete them by hand if unwanted |
+| `handoff` refuses | `tessera-network handoff status` shows the offer; an offer is cancelled with `handoff cancel <id>` until the receiver reserves its commit. Review the impact token before `commit`; changed impact needs a new review |
+
+## Controller flows
+
+* **A warning names `90-probe-flows.toml`.** The file is deprecated and still read in
+  0.3.0 while no controller flow set is stored; support ends in 0.4.0. Store the flows
+  with `tesseractl flows set FILE` (or let the Controller runtime submit them), then
+  delete the file.
+* **`flows is locked by the configuration`.** The host owns the flows
+  (`[control] locked = ["flows"]`), as on an NDIMon appliance. Change the host's
+  configuration, not the daemon.
+* **A restart of `tesserad` must not lose stored flows.** The Controller runtime
+  restarts with the daemon and reports an empty set at start; the adapter ignores that
+  report until the run has applied one of its own (`control-interface.md`, "Who owns
+  the controller flow set"). `tesseractl flows show` lists what is in force.
 
 ## Packages
 
@@ -274,11 +364,22 @@ A locked PTP clock does not imply vendor-controller compatibility. See
 * **`purge` left the user or the groups**: intended (sysusers semantics),
   see `user-guide.md`, section 9.
 * **`dpkg: dependency problems`**: install with `sudo apt install ./file.deb`
-  so that `apt` resolves them; `tessera-pw` needs the same version of
-  `tessera`.
+  so that `apt` resolves them; `tessera-pw`, `tessera-alsa`, `tessera-web` and
+  `tessera-dsp` need the same version of `tessera` (`tessera-dsp` also of
+  `tessera-alsa`): upgrade them in one `apt install`.
+* **`Duplicate line for path "/etc/polkit-1/rules.d"` at every boot**: 0.2.x
+  packages declared polkit's directory in their tmpfiles file. 0.3.0 does not;
+  the message is gone after the upgrade, which also puts the directory back to
+  polkitd's mode 0750 when 0.2.x had left it at 0755.
+* **`iproute2 set to manually installed`** in an installer's output: fixed in the
+  0.3.0 bundle, which no longer names a dependency that is already installed.
+* **The socket-buffer ceilings stayed raised after a purge**: 0.2.x packages did not
+  put `net.core.rmem_max` and `wmem_max` back. 0.3.0 records the values it replaces
+  in `/var/lib/tessera-package` and restores them on removal.
 * **Reproduce a clean state**: `sudo apt purge tessera tessera-pw`, remove the
-  user and groups by hand, install again.
-* **`build-deb.sh` fails linking the ALSA plugin** (`cannot find -lasound`):
+  user and groups by hand, install again. For a bundle install, use
+  `tessera-bundle uninstall --purge`.
+* **`cargo xtask build-deb` fails linking the ALSA plugin** (`cannot find -lasound`):
   install `libasound2-dev`, or build with `SKIP_ALSA=1`. In a cross build the
   plugin needs the target's libasound; use `SKIP_ALSA=1` unless it is
   installed.

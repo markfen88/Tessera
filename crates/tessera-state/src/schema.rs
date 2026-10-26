@@ -298,6 +298,16 @@ pub const KEYS: &[KeySpec] = &[
     // [control]
     k!(
         "control",
+        "locked",
+        Value("[]"),
+        "",
+        "flows",
+        Reload,
+        NONE,
+        "Host-owned runtime domains. flows refuses controller flow commands and uses only host-configured flows."
+    ),
+    k!(
+        "control",
         "max_frame_bytes",
         Value("1048576"),
         "bytes",
@@ -929,10 +939,10 @@ pub const KEYS: &[KeySpec] = &[
             example: "\"studio-pc\""
         },
         "",
-        "1..=31 bytes, no control characters (PROVISIONAL: the size of the name on the wire, OQ-CFG-2)",
+        "1..=31 bytes, no control characters (PROVISIONAL: the size of the name on the wire)",
         Live,
         NONE,
-        "Name on the network. Default: the host name (<host>-<id> with several devices). The 31-byte limit is the wire size of the name as far as known; PROVISIONAL until a capture confirms it (OQ-CFG-2)."
+        "Name on the network. Default: the host name (<host>-<id> with several devices). The 31-byte limit is the wire size of the name as far as known; PROVISIONAL until a capture confirms it."
     ),
     k!(
         "device",
@@ -1537,9 +1547,9 @@ pub const REFERENCE_HEADER: &str = "\
 # wins over the files, unless the setting is pinned with `locked`. Only
 # some settings can be pinned: in [[device]] name, sample_rate, encoding,
 # latency, rx_channels, tx_channels and the channel labels; in [clock]
-# role and priority; in [network] the primary interface. Every other key
-# has no run-time form and no lock. `tesseractl config show` prints the
-# merged files.
+# role and priority; in [network] the primary interface; in [control]
+# flows. Every other key has no run-time form and no lock.
+# `tesseractl config show` prints the merged files.
 # reload = takes effect on SIGHUP (systemctl reload tesserad) or
 # `tesseractl config reload`. restart = needs a daemon restart.
 # restart scope: what a change interrupts (none; the device: its flows,

@@ -140,6 +140,122 @@ pub enum ClockRole {
     Auto,
 }
 
+/// A controller-managed media flow (ADR 0015). The state actor applies the
+/// same validation as `[[flow]]` configuration, including IPv4 addresses,
+/// channel bounds, packet settings and uniqueness across all flow sources.
+/// Strings for formats and addresses leave room for future supported values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct FlowSpec {
+    /// Unique local flow key.
+    pub id: String,
+    /// Media direction relative to the device.
+    pub direction: Direction,
+    /// Logical device key.
+    pub device: DeviceKey,
+    /// Device channels in wire order; empty means all in this direction.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub channels: Vec<u16>,
+    /// Destination (TX) or permitted sender (RX), as an IPv4 address.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub peer: Option<String>,
+    /// Destination (TX) or local listening (RX) UDP port; must be nonzero.
+    pub port: u16,
+    /// Interface override; absent means the primary interface.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub interface: Option<String>,
+    /// Local IPv4 bind address override.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub local_address: Option<String>,
+    /// Packet format, currently `reference`.
+    #[cfg_attr(feature = "serde", serde(default = "flow_format"))]
+    pub format: String,
+    /// TX frames per packet; absent uses the configured default.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub frames_per_packet: Option<u32>,
+    /// TX send delay in microseconds.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub send_offset_us: u32,
+    /// RX explicitly accepts any sender instead of requiring `peer`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub any_source: bool,
+    /// TX DSCP, 0 through 63 (default EF, 46).
+    #[cfg_attr(feature = "serde", serde(default = "flow_dscp"))]
+    pub dscp: u8,
+    /// TX lateness limit in microseconds.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub max_lag_us: Option<u32>,
+    /// RX keepalive interval override in milliseconds.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub rx_keepalive_ms: Option<u32>,
+    /// RX keepalive timeout override in milliseconds.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub rx_keepalive_timeout_ms: Option<u32>,
+    /// RX keepalive payload override (`empty` or `1337`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub rx_keepalive_payload: Option<String>,
+}
+
+fn flow_format() -> String {
+    String::from("reference")
+}
+
+fn flow_dscp() -> u8 {
+    46
+}
+
+impl FlowSpec {
+    /// Construct a flow with the same defaults as a `[[flow]]` entry.
+    /// Set `peer` for TX or filtered RX, or `any_source` for unfiltered RX.
+    #[must_use]
+    pub fn new(id: impl Into<String>, device: DeviceKey, direction: Direction, port: u16) -> Self {
+        Self {
+            id: id.into(),
+            direction,
+            device,
+            port,
+            channels: Vec::new(),
+            peer: None,
+            interface: None,
+            local_address: None,
+            format: flow_format(),
+            frames_per_packet: None,
+            send_offset_us: 0,
+            any_source: false,
+            dscp: flow_dscp(),
+            max_lag_us: None,
+            rx_keepalive_ms: None,
+            rx_keepalive_timeout_ms: None,
+            rx_keepalive_payload: None,
+        }
+    }
+}
+
 /// A request to change state. Every surface goes through these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
@@ -149,6 +265,14 @@ pub enum ClockRole {
 )]
 #[non_exhaustive]
 pub enum Command {
+    /// Atomically replace all controller-originated flows, retaining host
+    /// configuration flows. Empty clears the controller set and prevents
+    /// legacy-file fallback. A host's `[control] locked = ["flows"]` refuses
+    /// this command. Protocol origins are exempt from restart confirmation.
+    SetProtocolFlows {
+        /// Complete desired controller flow set, validated together.
+        flows: Vec<FlowSpec>,
+    },
     SetDeviceName {
         device: DeviceKey,
         name: String,
@@ -225,6 +349,7 @@ impl Command {
     /// Every value [`kind`](Self::kind) can return. Tests use it to make sure
     /// every command is covered by permission and logging tables.
     pub const KINDS: &'static [&'static str] = &[
+        "set_protocol_flows",
         "set_device_name",
         "set_channel_label",
         "subscribe",
@@ -247,6 +372,7 @@ impl Command {
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::SetProtocolFlows { .. } => "set_protocol_flows",
             Self::SetDeviceName { .. } => "set_device_name",
             Self::SetChannelLabel { .. } => "set_channel_label",
             Self::Subscribe { .. } => "subscribe",
@@ -1431,6 +1557,47 @@ impl Metrics {
 )]
 #[non_exhaustive]
 pub enum Event {
+    /// Origin-bearing companion to the legacy `ConfigReloaded` event.
+    /// Reload changes always carry `Origin::Config` (ADR 0008).
+    ConfigReloadedWithOrigin {
+        /// Origin of configuration reconciliation.
+        origin: Origin,
+    },
+    /// A runtime command was refused because configuration pins its value.
+    LockedValueRefused {
+        /// Full configuration field path (for example `clock.role`).
+        field: String,
+        /// Origin of the refused command.
+        origin: Origin,
+        /// Compact attempted value; omitted for large values such as flows.
+        attempted: Option<String>,
+    },
+    /// Runtime intent changed and was queued for the debounced state write.
+    /// Published after the in-memory commit, before disk I/O, like the other
+    /// change events. No-op, refused and observation-only changes omit it.
+    RuntimeValueChanged {
+        /// Full field path (for example `device.main.latency_us` or `flows`).
+        field: String,
+        /// Origin of the committed runtime command.
+        origin: Origin,
+    },
+    /// The effective controller flow set changed.
+    ProtocolFlowsChanged {
+        /// Effective controller flow IDs after the change.
+        flows: Vec<String>,
+        /// Origin of the change.
+        origin: Origin,
+    },
+    /// Origin-bearing companion to the legacy `SubscriptionChanged` event.
+    /// Both are emitted to preserve the existing wire shape.
+    SubscriptionChangedWithOrigin {
+        /// Logical device key.
+        device: DeviceKey,
+        /// Current subscription status.
+        status: SubscriptionStatus,
+        /// Command origin, or `Internal` for a runtime observation.
+        origin: Origin,
+    },
     DeviceRenamed {
         device: DeviceKey,
         name: String,
@@ -1495,6 +1662,17 @@ pub enum Event {
 )]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// A trusted local compatibility adapter forwarding a protocol command.
+    /// Requires the same admin rights as other mutations. Only
+    /// `SetProtocolFlows` is accepted; it runs as `Origin::Protocol` so the
+    /// network controller need not answer local restart confirmation.
+    ProtocolCommand {
+        /// Protocol peer or adapter identity when the runtime cannot supply
+        /// the remote controller's address. This is audit metadata, not auth.
+        peer: String,
+        /// Complete controller flow replacement.
+        command: Command,
+    },
     Command(Command),
     Query(Query),
     /// Switch this connection to an event stream.
@@ -1944,6 +2122,7 @@ mod kind_tests {
     #[test]
     fn kind_is_the_serde_variant_name() {
         let samples = [
+            Command::SetProtocolFlows { flows: Vec::new() },
             Command::SetDeviceName {
                 device: DeviceKey("d".into()),
                 name: "n".into(),
@@ -2344,6 +2523,62 @@ mod round2_tests {
         assert_eq!(
             serde_json::to_string(&b).unwrap(),
             r#"{"confirmed_command":{"command":"reload_config","expect":null}}"#
+        );
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod host_mode_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_flow_command_and_events_use_external_snake_case_tags() {
+        let flow = FlowSpec::new("rx", DeviceKey("main".into()), Direction::Rx, 5004);
+        let command = Command::SetProtocolFlows {
+            flows: alloc::vec![flow],
+        };
+        let request = RequestBody::ProtocolCommand {
+            peer: "controller-compatibility".into(),
+            command,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.starts_with(r#"{"protocol_command":{"peer":"controller-compatibility","command":{"set_protocol_flows":{"flows":["#));
+        assert_eq!(serde_json::from_str::<RequestBody>(&json).unwrap(), request);
+        for event in [
+            Event::LockedValueRefused {
+                field: "flows".into(),
+                origin: Origin::Internal,
+                attempted: None,
+            },
+            Event::RuntimeValueChanged {
+                field: "flows".into(),
+                origin: Origin::Internal,
+            },
+            Event::ProtocolFlowsChanged {
+                flows: Vec::new(),
+                origin: Origin::Internal,
+            },
+            Event::ConfigReloadedWithOrigin {
+                origin: Origin::Config,
+            },
+            Event::SubscriptionChangedWithOrigin {
+                device: DeviceKey("main".into()),
+                status: SubscriptionStatus::new(
+                    Channel::new(1).unwrap(),
+                    "Out",
+                    "sender",
+                    SubscriptionState::NoMedia,
+                ),
+                origin: Origin::Internal,
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+        }
+        let empty = Command::SetProtocolFlows { flows: Vec::new() };
+        assert_eq!(
+            serde_json::to_string(&empty).unwrap(),
+            r#"{"set_protocol_flows":{"flows":[]}}"#
         );
     }
 }

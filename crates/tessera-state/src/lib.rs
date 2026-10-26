@@ -61,7 +61,9 @@
 //!   `role`, `priority` (a `locked` list in `[clock]`). Unknown entries are
 //!   errors. A locked key is cleared from `state.toml`, so after unlocking the
 //!   old state value is gone and the configured one applies until something
-//!   changes it. Subscriptions cannot be locked.
+//!   changes it. `[control] locked = ["flows"]` pins flow ownership to the
+//!   host; `[network] locked = ["primary"]` pins its interface binding.
+//!   Subscriptions cannot be locked.
 //! * **`allow_unsafe_latency`** is a per-device boolean; the platform latency
 //!   floor is a value in [`env::Environment`], never a constant in this crate.
 //! * **Clock role and priority** are persisted in `[clock]` of `state.toml`
@@ -131,9 +133,11 @@
 
 pub mod bus;
 pub mod config;
+pub mod dropin;
 pub mod engine;
 pub mod env;
 pub mod error;
+pub mod flows;
 pub mod impact;
 pub mod loader;
 pub mod model;

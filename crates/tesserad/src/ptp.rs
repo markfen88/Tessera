@@ -19,10 +19,11 @@
 //! * only a change of the interface restarts a runner (`rt_priority` and `cpu`
 //!   are applied when a runner starts, never live). The restart hands the
 //!   overlay writer over (a [`SlotPublisher`] gives it back when the runner
-//!   ends), starts the new port at the old mapping's time and rate, publishes
-//!   `holdover` while the new port catches up so TX keeps flowing, and bumps
-//!   the epoch (the new port's first anchor is a thread start-up later than
-//!   the old mapping, so it is not exactly continuous);
+//!   ends), starts the new port at the old mapping's time and rate (anchored
+//!   at the instant the daemon read the mapping, so the thread start-up does
+//!   not step media time), publishes `holdover` while the new port catches up
+//!   so TX keeps flowing, and still bumps the epoch so that clients re-anchor
+//!   once;
 //! * if a runner cannot start (an interface without an address, no privilege
 //!   for the PTP ports, `lo`), the domain **degrades loudly, never silently**:
 //!   a free-running overlay keeps being published (state `free_running`, the
@@ -223,8 +224,9 @@ struct Continuation {
 /// from the monotonic timeline to a TAI reading: media time jumps, so the
 /// epoch must change. Any other first start (a follower) stays on the
 /// monotonic timeline. A restart (an interface change) starts the new port
-/// at the old mapping's time and rate but is not exactly continuous, so the
-/// epoch changes.
+/// at the old mapping's time and rate, anchored where the mapping was read
+/// (`PortConfig::initial_local_ns`); the epoch changes all the same, so that
+/// clients re-anchor once.
 fn continuation(last: Option<ClockSnapshot>, fresh: bool, leads: bool) -> Continuation {
     let epoch = last.map_or(0, |s| s.epoch);
     if fresh {
@@ -234,9 +236,12 @@ fn continuation(last: Option<ClockSnapshot>, fresh: bool, leads: bool) -> Contin
         }
     } else {
         // The new port is created on its own thread a little after the old
-        // mapping was sampled, so its first anchor is behind the old mapping by
-        // the start-up time (hundreds of microseconds): a discontinuity, so the
-        // epoch changes. Only an interface change restarts a runner.
+        // mapping was sampled; it is anchored at the sampling instant, so
+        // media time does not step by the start-up time (hundreds of
+        // microseconds, milliseconds on a busy host), which the followers'
+        // servos would take tens of seconds to work off. The epoch changes
+        // all the same: clients re-anchor once. Only an interface change
+        // restarts a runner.
         Continuation {
             epoch_base: epoch.wrapping_add(1),
             old: last,
@@ -499,6 +504,9 @@ impl Domain {
             Some(s) if !h.fresh => {
                 let m = OverlaySnapshot::from_ipc(s);
                 pc.initial_media_ns = Some(m.media_ns_at(now));
+                // The runner builds the port on its own thread later; it
+                // anchors the mapping at `now`, where it was read.
+                pc.initial_local_ns = Some(now);
                 pc.initial_rate_ppb = s.rate_ppb;
             }
             _ => {
@@ -1096,13 +1104,47 @@ mod tests {
         let follower = continuation(last, true, false);
         assert_eq!(follower.epoch_base, 3);
         assert_eq!(follower.old, None);
-        // A restart starts at the old mapping but is not exactly continuous:
-        // the epoch changes, whoever leads.
+        // A restart starts at the old mapping and changes the epoch, whoever
+        // leads.
         for leads in [false, true] {
             let c = continuation(Some(snap_in(IpcState::Locked, 9)), false, leads);
             assert_eq!(c.epoch_base, 10);
             assert_eq!(c.old.map(|s| s.epoch), Some(9));
         }
+    }
+
+    #[test]
+    fn a_restarted_port_is_anchored_where_the_old_mapping_was_read() {
+        // The runner builds the port on its own thread, later (longer on a
+        // busy host): its clock continues the old mapping at the instant the
+        // daemon read it, so followers see no step.
+        let (d, _fd) = Domain::new("x".into(), true).unwrap();
+        let mut h = d.slot.lock().unwrap().take().unwrap();
+        let mut old = snap_in(IpcState::Locked, 2);
+        old.rate_ppb = 20_000;
+        h.last = Some(old);
+        h.fresh = false;
+        let info = netif::IfInfo {
+            name: "eth0".into(),
+            index: 2,
+            addr: std::net::Ipv4Addr::new(10, 77, 0, 1),
+            mac: [2, 0, 0, 0, 0, 1],
+            wireless: false,
+        };
+        let mut plan = ClockPlan::free_running();
+        plan.role = ClockRole::Leader;
+        let now = 5_000_000;
+        let pc = Domain::port_config(&plan, &info, &h, now);
+        assert_eq!(pc.initial_local_ns, Some(now));
+        let old = OverlaySnapshot::from_ipc(old);
+        assert_eq!(pc.initial_media_ns, Some(old.media_ns_at(now)));
+        assert_eq!(pc.initial_rate_ppb, 20_000);
+        // A first start has nothing to continue.
+        h.fresh = true;
+        assert_eq!(
+            Domain::port_config(&plan, &info, &h, now).initial_local_ns,
+            None
+        );
     }
 
     #[test]

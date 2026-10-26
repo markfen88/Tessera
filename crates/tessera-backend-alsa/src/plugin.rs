@@ -70,6 +70,7 @@ struct Inner {
     armed: Option<u64>,
     /// When `pointer` last drained the wake socket.
     last_drain_ns: u64,
+    drain_clock: fn() -> u64,
 }
 
 /// The channel areas of the transfer in progress.
@@ -449,7 +450,7 @@ fn hung_up(fd: c_int) -> bool {
 /// hang-up now (one more syscall) instead of at the next drain; for
 /// `poll_revents`, which a hang-up may be the reason for.
 fn check_daemon(p: &Plugin, g: &mut Inner, prompt: bool) {
-    g.last_drain_ns = raw_monotonic_ns();
+    g.last_drain_ns = (g.drain_clock)();
     g.link.drain_wake();
     if prompt && hung_up(g.link.wake_fd()) {
         g.link.mark_lost();
@@ -554,7 +555,7 @@ unsafe extern "C" fn cb_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t 
         };
         // An application that never calls `poll_revents` must still notice a
         // daemon that is gone: look now and then.
-        if raw_monotonic_ns().saturating_sub(g.last_drain_ns) >= DRAIN_EVERY_NS {
+        if (g.drain_clock)().saturating_sub(g.last_drain_ns) >= DRAIN_EVERY_NS {
             check_daemon(p, &mut g, false);
         }
         let lost = g.link.is_lost();
@@ -1402,6 +1403,7 @@ fn new_plugin(
             default_tick: plan.tick_frames,
             armed: None,
             last_drain_ns: 0,
+            drain_clock: raw_monotonic_ns,
         }),
     });
     Ok(Box::into_raw(plugin))
@@ -1473,6 +1475,26 @@ pub mod testing {
             };
         }
         Ok(io)
+    }
+
+    /// Use the test's monotonic timeline for wake interval measurements.
+    ///
+    /// # Safety
+    /// `io` must come from [`mock_plugin`] and not have been freed. Set this
+    /// before the first callback; `now` must be monotonic on this thread.
+    pub unsafe fn set_clocks(
+        io: *mut snd_pcm_ioplug_t,
+        now: fn() -> std::time::Instant,
+        raw: fn() -> u64,
+    ) {
+        // SAFETY: caller contract.
+        if let Some(p) = unsafe { plugin(io) } {
+            if let Some(mut g) = p.lock() {
+                g.link.set_clock(now);
+                g.drain_clock = raw;
+                g.last_drain_ns = 0;
+            }
+        }
     }
 
     /// What `cb_sw_params` stores, without a `snd_pcm_sw_params_t`.

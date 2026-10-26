@@ -1,0 +1,24 @@
+---
+# CamillaDSP web GUI backend (tessera-dsp). Local changes are kept across package upgrades.
+camilla_host: "127.0.0.1"
+camilla_port: 1234
+# The GUI has no login: it can change what the speaker plays, so it listens on this machine
+# only (an SSH tunnel reaches it: ssh -L 5005:127.0.0.1:5005 user@speaker). The tessera bundle
+# installer sets the speaker's management address here, so the portal's "EQ engine" link works
+# from the network the speaker is managed on and from no other. Set it by hand to the address
+# of the port you manage the speaker on; 0.0.0.0 would open the GUI on every interface (the
+# tessera network helper still rejects port 5005 on every link but the management one).
+bind_address: "127.0.0.1"
+port: 5005
+ssl_certificate: null
+ssl_private_key: null
+gui_config_file: "/etc/camilladsp/gui-config.yml"
+config_dir: "/opt/camilladsp/configs"
+coeff_dir: "/opt/camilladsp/coeffs"
+default_config: "/opt/camilladsp/default_config.yml"
+statefile_path: "/opt/camilladsp/statefile.yml"
+log_file: "/opt/camilladsp/camilladsp.log"
+on_set_active_config: null
+on_get_active_config: null
+supported_capture_types: null
+supported_playback_types: null

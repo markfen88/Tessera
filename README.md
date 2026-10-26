@@ -1,4 +1,4 @@
-# Tessera 0.2.1
+# Tessera 0.3.0
 
 Tessera is an experimental, open audio-over-IP stack for Linux, written in Rust
 and licensed under MPL-2.0. It provides a PTPv1 media clock, UDP audio flows,
@@ -28,9 +28,14 @@ affiliated with or endorsed by Audinate.
 - ALSA PCM capture/playback, a PipeWire client and an optional in-daemon sound-card
   bridge with drift compensation.
 - `tessera-network`: a separate privileged helper for standalone management/audio
-  VLANs, recoverable apply and traffic isolation. The audio daemon stays unprivileged.
-- Debian packages and profile-based add-on bundles. NDIMon integration is delivered
-  through a separate plugin archive containing an exact precompiled runtime bundle.
+  VLANs, recoverable apply and traffic isolation, on systemd-networkd, Netplan,
+  NetworkManager or ifupdown. The audio daemon stays unprivileged.
+- `tessera-dsp` (amd64 and arm64): CamillaDSP and its GUI as the equaliser stage of a
+  network speaker. The `speaker` profile of the add-on bundle sets the whole chain up
+  ([CamillaDSP speaker DSP](docs/dsp.md)).
+- Debian packages and profile-based add-on bundles, installed by a Rust program that
+  authenticates the release first. NDIMon integration is delivered through a separate
+  plugin archive containing an exact precompiled runtime bundle.
 
 ## Platforms and prerequisites
 
@@ -39,7 +44,7 @@ affiliated with or endorsed by Audinate.
 | Runtime | Linux/glibc; wired Ethernet; systemd 253 or newer for shipped units |
 | Primary packages/bundles | Debian 13 Trixie; native amd64/arm64 builds |
 | Experimental Ubuntu bundle | Ubuntu 24.04 Noble arm64 only, with explicit opt-in |
-| Standalone VLAN editor | One wired port; native systemd-networkd or Netplan/networkd |
+| Standalone VLAN editor | One wired port; systemd-networkd, Netplan/networkd, NetworkManager or ifupdown |
 | Build | Rust toolchain from `rust-toolchain.toml`, a native C toolchain and `dpkg-dev` |
 | ALSA plugin/bridge build | `libasound2-dev`, `pkg-config` |
 | Optional PipeWire build | `libpipewire-0.3-dev`, `libspa-0.2-dev`, `libclang-dev` |
@@ -60,20 +65,36 @@ sudo apt install ./tessera_<version>_<arch>.deb \
 ```
 
 The daemon is enabled without being started. Configure it before starting audio.
-The portal also needs a password before it is started. The web package includes
-the standalone network helper/recovery units and their dependencies.
+A fresh portal starts with the password `tessera`; change it with
+`sudo tessera-web set-password`. The web package includes the standalone network
+helper/recovery units and their dependencies. The `tessera-dsp` package belongs to
+the speaker; install it with the others when you want the CamillaDSP stage.
 
 For a profile-based speaker or NDIMon runtime, use an add-on archive. It contains
-the core daemon and ALSA plugin, not the optional web/PipeWire packages. Extract
-trusted root installer code into a private root-owned directory:
+the core daemon, the ALSA plugin, the web portal and, on amd64 and arm64, the
+CamillaDSP stage that the speaker profile installs by default (`--no-dsp` leaves it
+out; [dsp.md](docs/dsp.md)), not the optional PipeWire package. The archive carries
+its own installer, `tessera-bundle`, which authenticates the release before it
+changes anything (the `install.sh` and `uninstall.sh` scripts of 0.2.x no longer
+exist). Extract trusted root installer code into a private root-owned directory:
 
 ```sh
 sha256sum -c SHA256SUMS
 sudo install -d -o root -g root -m 0700 /root/tessera-addon
 sudo install -o root -g root -m 0600 tessera-bundle_<version>_<arch>.tar.gz /root/tessera-addon/bundle.tar.gz
 sudo tar --no-same-owner --strip-components=1 -xzf /root/tessera-addon/bundle.tar.gz -C /root/tessera-addon
-sudo /root/tessera-addon/install.sh --profile speaker --audio-card hw:CARD=MyDAC --yes
+sudo /root/tessera-addon/tessera-bundle install --profile speaker --audio-card hw:CARD=MyDAC --yes
 ```
+
+**Trust.** The installer has no built-in key. It installs a bundle only when a key
+listed in the root-owned `/etc/tessera/trusted-release-keys` (mode 0644, one bare
+minisign public key per line) vouches for the release; otherwise it stops with
+`untrusted_key` and changes nothing. Until you have provisioned the key of a signed
+release, a build is installed with `tessera-bundle install --allow-unsigned`, an
+option for development builds that keeps every checksum, manifest and platform
+check. `tessera-bundle verify` has no such bypass. Check the release's
+`SHA256SUMS` (and its `SHA256SUMS.minisig` with `minisign`) before you run
+anything you downloaded; [bundle guide](docs/bundle.md#verifying-and-installing).
 
 The experimental Ubuntu archive requires `--allow-ubuntu-24.04` on its installer.
 Use `--profile ndimon` only for runtime provisioning; installing Tessera alone
@@ -82,6 +103,17 @@ plugin is the normal path for an NDIMon appliance.
 
 Full install/removal behavior: [bundle guide](docs/bundle.md) and
 [user guide](docs/user-guide.md).
+
+### Network speaker with CamillaDSP
+
+`--profile speaker` makes the machine a network speaker: `tesserad` receives the
+audio, CamillaDSP applies the equaliser and gain filters and plays to the sound
+card you name, and the portal's Speaker page controls volume, signal boost, the
+services and the EQ files. Prefer an explicit card selector (`aplay -L`). A speaker
+installed with an earlier bundle is converted or upgraded in place; `--no-dsp`
+keeps the tessera-only speaker with the in-daemon bridge. What the installer
+writes, how it upgrades and what a purge removes: [CamillaDSP speaker DSP](docs/dsp.md)
+and [Raspberry Pi speaker](docs/raspberry-pi-speaker.md).
 
 ## First configuration
 
@@ -127,13 +159,16 @@ audio crosses the network. See [configuration](docs/configuration.md) and
 The standalone portal's Network page defines named untagged/tagged networks,
 DHCP/static IPv4, and independent management/audio assignments on one wired port.
 VLAN IDs are 1–4094. A blank tag follows the switch port's untagged/native network.
-Only management supplies the default gateway and DNS.
+Only management supplies the default gateway, DNS servers and up to six DNS search
+domains. The helper configures systemd-networkd, Netplan with networkd,
+NetworkManager (also behind Netplan) or ifupdown, whichever the host uses.
 
 Edits stay in a draft until Apply. Once activation is ready, open the new
 management address and explicitly Keep changes within 60 seconds. Status polls
 and page loads do not confirm. Revert, expiry, failed apply or boot recovery
 restores the previous configuration. Timers operate independently of the browser.
-Management confirmation uses the actual destination socket address, not proxy headers.
+Management confirmation uses the actual destination socket address, not proxy headers,
+unless an administrator sets `[network] confirm = "token_only"` in `web.toml`.
 
 For direct confirmation, the portal must listen on the management address or
 `0.0.0.0:<port>`; its configured port is restricted to management. Configure TLS
@@ -142,8 +177,10 @@ refused rather than silently discarded.
 
 When NDIMon owns the appliance, its network settings are authoritative. Tessera's
 standalone editor becomes read-only; choose the audio VLAN inside the NDIMon
-plugin. An existing standalone setup needs an explicit ownership handoff.
-See [network configuration and recovery](docs/network-vlans.md).
+plugin. An existing standalone setup needs an explicit ownership handoff
+(`tessera-network handoff`). The NetworkManager and ifupdown backends are new in
+0.3.0 and not yet accepted on live hosts. See
+[network configuration and recovery](docs/network-vlans.md).
 
 ## Web portal
 
@@ -159,8 +196,9 @@ CSRF/origin validation. Daemon configuration changes can require impact-token
 confirmation; network confirmation is a separate scoped transaction.
 
 The optional appliance mode adds a Speaker page, allowlisted service controls,
-CamillaDSP EQ/config files, signal boost and hardware volume when configured.
-See [portal configuration/API](docs/web-portal.md).
+CamillaDSP EQ/config files, signal boost and hardware volume when configured; the
+speaker profile of the bundle turns it on. Site settings go in
+`/etc/tessera/web.d/*.toml`. See [portal configuration/API](docs/web-portal.md).
 
 ## Audio backends and timing
 
@@ -194,25 +232,29 @@ git clone https://github.com/markfen88/Tessera.git
 cd Tessera
 cargo build --release -p tesserad -p tesseractl -p tessera-web -p tessera-network \
   --features tesserad/alsa-bridge
-SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge TESSERA_DEB_REVISION=1 packaging/build-deb.sh
+SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge TESSERA_DEB_REVISION=1 cargo xtask build-deb
 ```
 
 Build on the target OS/architecture. `TESSERA_DEB_REVISION` makes the package
-revision explicit in source archives. Version `0.2.1` is packaged as `0.2.1-*`. To create an
-add-on bundle, use `packaging/build-bundle.sh`, or its explicit Ubuntu opt-in.
-See [build/package options](docs/bundle.md#building).
+revision explicit in source archives. Version `0.3.0` is packaged as `0.3.0-*`. To create an
+add-on bundle, use `cargo xtask build-bundle`, or its explicit Ubuntu opt-in.
+The tree contains no shell or Python scripts: packaging, bundle and test entry
+points are `cargo xtask` tasks. See [build/package options](docs/bundle.md#building).
 
 ## Upgrade, rollback and removal
 
-Back up `/etc/tessera` first. Upgrade matching core/web/ALSA/PipeWire packages
+Back up `/etc/tessera` first. Upgrade matching core/web/ALSA/DSP/PipeWire packages
 as a set. Package/bundle installation preserves configuration and does not
 silently restart a running audio daemon. Restart deliberately to activate the
 new binary; restarting interrupts audio. In NDIMon, update through Plugins.
+Read the upgrade notes of the [release notes](CHANGELOG.md) before moving from
+0.2.x: the bundle is installed with `tessera-bundle` and authenticated first.
 
 Bundle removal uses its installed ownership record. Plain removal preserves
-configuration/accounts; purge can delete configuration and recorded accounts.
-Dependencies are not automatically autoremoved. Review the [bundle guide](docs/bundle.md)
-before using purge or dependent-package removal.
+configuration/accounts; purge can delete configuration and recorded accounts, and
+for a CamillaDSP speaker the CamillaDSP data. Dependencies are not automatically
+autoremoved. Review the [bundle guide](docs/bundle.md) before using purge or
+dependent-package removal.
 
 ## Known limitations
 
@@ -221,8 +263,11 @@ Additional logical devices’ offset control ports are not yet supported.
 AES67, JACK, Bluetooth latency calibration, ARC/eARC capture and automatic lip-sync
 are not implemented.
 Static flow and packet settings remain provisional for external hardware.
-Standalone VLAN changes support networkd and Netplan/networkd only; Wi-Fi,
-IPv6 configuration, bonds/bridges and arbitrary policy routing are not managed.
+Standalone VLAN changes support one wired port on systemd-networkd, Netplan/networkd,
+NetworkManager and ifupdown (the last two are new and not yet accepted on live
+hosts); Wi-Fi, IPv6 configuration, bonds/bridges and arbitrary policy routing are
+not managed.
+CamillaGUI has no login: keep it off networks you do not trust.
 Source publication does not deploy to any appliance.
 
 ## License

@@ -76,7 +76,9 @@ An ALSA ioplug PCM that is a thin client of the daemon: it attaches the
 channels it is configured for and copies between the application's buffer and
 the ring. Its clock is the media clock, so nothing is resampled. Code:
 `crates/tessera-backend-alsa` (feature `plugin`). Needs
-alsa-lib 1.2.1 or newer for exact pointer arithmetic.
+alsa-lib 1.2.1 or newer for exact pointer arithmetic. On a network speaker the
+client is CamillaDSP, which captures `pcm.tessera` and plays to the sound card
+([dsp.md](dsp.md)); the PCM accepts only the device's own rate.
 
 ```sh
 aplay -D tessera some.wav                             # into the device's TX channels
@@ -87,18 +89,23 @@ aplay -D plug:tessera some-44k1.wav                   # let alsa-lib convert for
 ### Configuration
 
 The package installs `/usr/share/alsa/alsa.conf.d/60-tessera.conf` (linked from
-`/etc/alsa/conf.d/`). With the current packaging script that file is the
-minimal definition:
+`/etc/alsa/conf.d/`). The file is the full, commented sample
+(`crates/tessera-backend-alsa/dist/alsa.conf.d/50-tessera.conf` in the source
+tree): every option at its default, plus a `tessera_plug` PCM. In its
+essentials:
 
 ```text
 pcm.tessera {
     type tessera
 }
+
+pcm.tessera_plug {
+    type plug
+    slave.pcm "tessera"
+}
 ```
 
-The full, commented sample (every option, plus a `tessera_plug` PCM) is
-`crates/tessera-backend-alsa/dist/alsa.conf.d/50-tessera.conf` in the source
-tree; the packaging script does not pick it up yet. Define your own PCMs in
+Define your own PCMs in
 `~/.asoundrc` or `/etc/asound.conf`:
 
 ```text
@@ -136,8 +143,8 @@ and RX numbering of a device are independent). Unknown keys are errors.
 | Topic | Behaviour |
 |-------|-----------|
 | Formats | `S16_LE`, `S24_LE`, `S24_3LE`, `S32_LE`, `FLOAT_LE`; interleaved and non-interleaved read/write access; the device's rate. Anything else, mmap included, through `plug:tessera` |
-| Playback timeline | frame 0 is written `period + latency` frames (`latency`: the plugin key) ahead of the media clock at `start`; an application that keeps less queued underruns visibly (no write is silently dropped as late); `snd_pcm_delay` includes the lead |
-| Capture timeline | frame 0 is read `effective latency + engine tick + latency` behind the clock (the device's effective latency in time, plus `latency` frames, the plugin key); the engine tick is estimated from the wake socket (5 ms assumed until measured), which also sets the minimum period and buffer |
+| Playback timeline | frame 0 is written `period + latency` frames (`latency`: the plugin key) ahead of the media clock at `start`; an application that keeps less queued underruns visibly (no write is silently dropped as late); `snd_pcm_delay` includes the lead, so an application that steers its buffer level by `snd_pcm_delay` must target more than the lead plus one of its own writes (a client that writes one 512-frame period per cycle and targets two periods keeps only about half a period really queued and underruns between writes) |
+| Capture timeline | frame 0 is read `effective latency + engine tick + latency` behind the clock (the device's effective latency in time, plus `latency` frames, the plugin key); the engine tick is estimated from the wake socket (5 ms assumed until measured; never below a steady tick, up to about 23 % above it at first), which also sets the minimum period and buffer |
 | Poll descriptor | one descriptor (event `POLLIN` in both directions): an epoll set of a **timerfd** and the session's wake socket. The timer is armed from the media clock for the moment `avail >= avail_min` (never sooner than one engine tick plus 0.1 ms), so the descriptor becomes readable when the application can move `avail_min` frames, a drain has ended, or the plugin has seen an xrun, a stop or a lost daemon. The wake socket is in the set only for its hang-up, so a dead daemon wakes the application at once |
 | `poll_revents` | `POLLIN`/`POLLOUT` when `avail >= avail_min` and at the end of a drain; `POLLERR` for an xrun, a lost daemon and the states SETUP, OPEN and SUSPENDED (like a kernel driver: `snd_pcm_wait` on a stopped PCM returns `-EIO`) |
 | Wake-ups | alsa-lib raises `avail_min` to the period, so an application wakes about `rate / max(avail_min, period)` times a second. |
@@ -169,7 +176,7 @@ unplug). Every key: [configuration.md](configuration.md#hardware-card-bridges-br
 
 1. A `tesserad` built with the cargo feature `alsa-bridge` (off by default):
    `cargo build --release -p tesserad --features alsa-bridge`, or packages from
-   `TESSERA_DAEMON_FEATURES=alsa-bridge packaging/build-deb.sh` (the `tessera`
+   `TESSERA_DAEMON_FEATURES=alsa-bridge cargo xtask build-deb` (the `tessera`
    package then depends on the native ALSA library). A daemon without the feature refuses
    any `[[bridge]]`. The default package build is still without it
 .

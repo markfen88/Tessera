@@ -16,11 +16,12 @@ publish = false
 [lints]
 workspace = true
 
+[lib]
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 tessera-media = { path = "../tessera-media" }
 rubato = { version = "5.0.1", default-features = false }
 
-
-[lib]
-test = false
-doctest = false

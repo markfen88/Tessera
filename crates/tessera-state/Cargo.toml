@@ -13,17 +13,18 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[[example]]
+name = "reference_config"
+path = "examples/reference_config.rs"
+test = false
+
+[lib]
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 tessera-control-types = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 
-
-[lib]
-test = false
-doctest = false
-
-[[example]]
-name = "reference_config"
-path = "examples/reference_config.rs"
-test = false

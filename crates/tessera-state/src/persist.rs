@@ -2,11 +2,11 @@
 //! recovery from a missing or corrupt file, and the write debouncer.
 //!
 //! `state.toml` holds **operator intent that changed at runtime** (names,
-//! labels, subscriptions, rate/encoding/latency, clock role and priority) and
-//! the generated per-device identity. It does not hold anything derived. Unknown keys
-//! inside a known schema version are ignored on load (and lost on the next
-//! write); a file from a *newer* schema version is never overwritten, it is
-//! moved aside (see [`load_state`]).
+//! labels, subscriptions, rate/encoding/latency, clock role and priority,
+//! controller flows) and the generated per-device identity. It holds nothing
+//! derived. Unknown keys inside a known schema version are ignored on load
+//! (and lost on the next write); a file from a *newer* schema version is never
+//! overwritten, it is moved aside (see [`load_state`]).
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tessera_control_types::ClockRole;
+use tessera_control_types::{ClockRole, FlowSpec};
 use toml::{Table, Value};
 
 use crate::error::StateError;
@@ -122,6 +122,10 @@ pub struct StateFile {
     /// Schema version (a missing key is read as version 1).
     #[serde(default = "default_version")]
     pub schema_version: u32,
+    /// Complete controller flow intent. `None` permits legacy-file fallback;
+    /// `Some([])` records an explicit clear and never resurrects that file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_flows: Option<Vec<FlowSpec>>,
     /// `[clock]`.
     #[serde(default, skip_serializing_if = "ClockIntent::is_empty")]
     pub clock: ClockIntent,
@@ -136,6 +140,7 @@ pub struct StateFile {
 impl Default for StateFile {
     fn default() -> Self {
         Self {
+            protocol_flows: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             clock: ClockIntent::default(),
             network: NetworkIntent::default(),
@@ -346,10 +351,15 @@ pub(crate) fn load_state_with(
 
 /// Rebuild as much state as possible from a table that does not fit the
 /// schema as a whole. Per device: the whole section if it parses, else just
-/// its `wire_device_id` (if that is a string). The clock and network sections
-/// are kept if they parse. Returns the state and the number of devices kept.
+/// its `wire_device_id` (if that is a string). Clock, network and controller
+/// flow sections are kept if they parse. A malformed controller section clears
+/// that set explicitly so recovery cannot resurrect the legacy file. Returns
+/// the state and the number of devices kept.
 fn salvage(table: &Table) -> (StateFile, usize) {
     let mut out = StateFile::default();
+    if let Some(flows) = table.get("protocol_flows") {
+        out.protocol_flows = Some(Vec::<FlowSpec>::deserialize(flows.clone()).unwrap_or_default());
+    }
     if let Some(c) = table.get("clock") {
         if let Ok(c) = ClockIntent::deserialize(c.clone()) {
             out.clock = c;

@@ -1,0 +1,20 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: tessera
+Source: https://github.com/markfen88/Tessera
+
+Files: *
+Copyright: 2026 Tessera contributors
+License: MPL-2.0
+
+License: MPL-2.0
+ This Source Code Form is subject to the terms of the Mozilla Public
+ License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ You can obtain one at https://mozilla.org/MPL/2.0/.
+ .
+ On Debian systems the full text is in /usr/share/common-licenses/MPL-2.0.
+
+Comment: The binaries statically link Rust crates under permissive licences
+ (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0, CC0 and MPL-2.0). The allowed
+ set is enforced for workspace binaries by `cargo deny check` (deny.toml);
+ their exact crate list is in Cargo.lock. The separately built compatibility
+ runtime has its own dependency list in lab/cmc-probe/Cargo.lock.

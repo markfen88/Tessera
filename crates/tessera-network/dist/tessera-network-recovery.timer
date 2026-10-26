@@ -3,7 +3,7 @@ Description=Retry unfinished tessera network recovery independently of the porta
 
 [Timer]
 OnBootSec=30s
-OnUnitInactiveSec=30s
+OnUnitInactiveSec=10s
 AccuracySec=100ms
 RandomizedDelaySec=0
 

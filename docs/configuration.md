@@ -10,7 +10,7 @@ The keys are one table in `schema.rs`. The [schema reference](#schema-reference)
 |---|---|---|
 | `/etc/tessera/config.toml` | the package (a conffile) | the **reference**: every key commented out at its default, each with what it does and why, its unit, range, apply class and restart scope. Nothing in it is active; keep it as shipped. `tesserad --print-default-config` prints the reference of the installed version; a copy is installed as `/usr/share/doc/tessera/examples/config.toml`, which is absent on images that strip `/usr/share/doc` |
 | `/etc/tessera/config.d/*.toml` | you, other packages | **your configuration**: drop-ins applied in lexical order; tables merge, scalars and arrays replace, `[[device]]` entries merge by `id` (see "Drop-ins"). Copy the lines you want from the reference into a file here and change them |
-| `/var/lib/tessera/state.toml` | `tesserad` | current values changed at run time with `tesseractl`, the web portal or a network controller (once the control protocols exist); do not edit while running |
+| `/var/lib/tessera/state.toml` | `tesserad` | current values changed at run time with `tesseractl`, the web portal or a network controller (the packaged Controller compatibility runtime), including the controller flow set; do not edit while running |
 
 An empty configuration is valid: the defaults give one device named after the host, 2 receive and 2 transmit channels, 48 kHz. Unknown keys are errors, so a daemon older than a key refuses a file that uses it. How the package treats the conffile on an upgrade: [the user guide](user-guide.md#8-upgrade-and-rollback).
 
@@ -30,7 +30,7 @@ From strongest to weakest:
 Runtime commands (protocol / CLI / web) are validated against bounds and locks, then persisted to `state.toml` (step 3).
 
 **`locked`.** A key listed in a device's `locked` (`name`, `sample_rate`, `encoding`, `latency`, `rx_channels`, `tx_channels`, `rx_channel_labels`,
-`tx_channel_labels`), in `[clock] locked` (`role`, `priority`) or in `[network] locked` (`primary`) is pinned by the configuration (unless the command line overrides it, step 1): `state.toml` (step 3)
+`tx_channel_labels`), in `[control] locked` (`flows`), in `[clock] locked` (`role`, `priority`) or in `[network] locked` (`primary`) is pinned by the configuration (unless the command line overrides it, step 1): `state.toml` (step 3)
 is skipped for it, the value from the files (`config.d` over `config.toml` over the default) is the one in effect, and a command that would change it
 (`tesseractl`, the web portal, a network controller) is refused with a `Locked` error naming the key. Removing a key from `locked` makes it
 changeable again; a state value that was stored before is then ignored until something changes the key. A `locked` entry protects a key from run-time commands only,
@@ -125,7 +125,7 @@ Files are applied after `config.toml`, in lexical file-name order; a later file 
 - **Tables** (`[daemon]`, `[network]`, `[clock]`, the label tables inside a device, `[device.multicast]`, ...) merge key by key.
 - **Scalars and arrays** replace. This includes `[network] interfaces`, `[engine] cpu_affinity` and `latency_bounds_us`: a drop-in that
   sets one of them restates the whole value.
-- **`locked` lists combine** instead of replacing: `[clock] locked`, `[network] locked` and each device's `locked` are extended by the entries of later files (a
+- **`locked` lists combine** instead of replacing: `[control] locked`, `[clock] locked`, `[network] locked` and each device's `locked` are extended by the entries of later files (a
   set union; duplicates are ignored). A drop-in can add locks but never silently remove one that an earlier file set; to remove a lock, edit
   the file that set it.
 - **`[[device]]` entries merge by `id`.**
@@ -401,7 +401,11 @@ address and port. Hardware transmitters that need a negotiated flow request cann
 from this file: Tessera does not send those requests. Use a matching Tessera
 peer or independently configured hardware peer. Packet settings remain
 provisional for external hardware ([compatibility limits](interoperability.md)).
-Flows belong to configuration files; `state.toml` never stores them.
+Host flows belong to configuration files. Controller flows are a separate set in
+`state.toml`, replaced atomically by `set_protocol_flows`; both use the flow rules
+below. Across the effective set there can be only **one flow per peer, port and
+direction**, even across devices or explicit interfaces. RX port and channel
+exclusivity also apply. Opposite directions may share a peer and port.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -445,6 +449,73 @@ How a flow behaves:
   with the new ring geometry.
 * `SIGHUP` (or `tesseractl config reload`) applies added, changed and removed flows without touching the others and without detaching clients.
   A reload that does not validate is refused and changes nothing.
+
+## Controller flows and host ownership
+
+The packaged compatibility adapter accepts the runtime's historical `tee` command
+only for `90-probe-flows.toml`, parses its `[[flow]]` document, and sends one
+`set_protocol_flows` command over `control.sock`. It writes no configuration file.
+The command replaces all controller flows together, preserving host `[[flow]]`
+entries such as `61-ndimon-flows.toml`. The state actor validates the combined
+set against effective device geometry and applies the computed impact; only
+changed flows restart. Protocol commands need no local confirmation.
+
+The runtime reports an empty set when it starts, and it restarts with the daemon.
+The adapter therefore applies an empty report only from a run that has already
+applied a report: flows stored with `tesseractl flows set` or `set_protocol_flows`
+survive a restart of `tesserad` with the controller enabled
+([control interface](control-interface.md#commands) has the ownership rule).
+
+The historical invocation supplies no remote controller address. Its recorded
+origin is therefore `protocol { peer: "controller-compatibility" }`, identifying
+the forwarding runtime rather than an audio endpoint. The adapter still needs
+root or the configured admin group. Its following `systemctl reload` action
+returns success with a deprecation message: the command already applied the set.
+
+A host such as NDIMon-R can render the flows and pin the values it owns:
+
+```toml
+[control]
+locked = ["flows"]
+
+[clock]
+locked = ["role", "priority"]
+
+[network]
+interfaces = ["enp3s0"]
+locked = ["primary"]
+```
+
+`flows` blocks every runtime controller-set replacement, including CLI clears,
+with `locked { field: "flows" }`. Only host-configured flows run. Adding this
+lock clears stored controller intent to an explicit empty set; unlocking never
+restores old flows. A later drop-in can add a lock but cannot remove an earlier
+one. Clock and primary-interface locks retain their existing precedence.
+
+`locked_value_refused` reports the full field path, the attempted origin and a
+small attempted value where useful. `runtime_value_changed` reports every changed
+runtime intent field and origin, including clears. These events follow the
+in-memory commit and precede the debounced disk write.
+Refusals change no intent; dry runs and no-ops emit no runtime-change event.
+Legacy subscription and reload events retain their shapes and have additive
+`subscription_changed_with_origin` and `config_reloaded_with_origin` companions.
+After lost events, re-read effective configuration/status, following the existing
+`lagged`/SSE `resync` rule.
+
+For one transition release the loader still accepts a reserved
+`90-probe-flows.toml` containing only flow entries, with a warning naming it. It
+is treated as controller fallback and cannot replace host flow entries. As soon
+as `state.toml` contains `protocol_flows`, even `protocol_flows = []`, that set wins
+and the old file is ignored with a warning (including stale invalid contents).
+**Support for the file is removed in 0.4.0.** (0.3.0 still reads it.) Ordinary host flow drop-ins retain
+the existing whole-list replacement semantics; include their complete host set.
+If stored controller intent becomes invalid after a host edit, it is kept but
+inactive with a warning; no conflicting flow runs.
+
+Use `tesseractl flows set controller-flows.toml` or `tesseractl flows clear` for
+local changes (normal restart confirmation, `--yes` for scripts). `flows show`
+shows the flow counters also present in `metrics`; `config show --effective`
+includes the effective host and controller entries.
 
 ## Hardware-card bridges (`[[bridge]]`)
 
@@ -563,7 +634,7 @@ What is applied live (reload, `tesseractl`, the portal) and what needs a restart
 |---|---|
 | `[clock] role`, `[clock] priority` (leader-capable roles only; a follower never uses it), `[clock] timestamping` | Applied live: sent as a command to the running PTP runner, which re-runs the election. **No restart, no step of media time, the epoch does not change** (it changes only if the servo later has to step). A role change on an isolated node moves media time by 0 ns; between two daemons the difference stays within the sync error (measured: a few microseconds). `timestamping = hardware` on an interface that cannot stamp PTPv1 is rejected: the previous mode stays, the daemon logs an error and counts it in `commands_rejected`. |
 | `tesseractl network primary <name>` (runtime selection) | Same as a change of the primary interface below. Kept in `state.toml` across restarts; `tesseractl network primary default` clears it. |
-| `[network] interfaces` (the primary interface) | The PTP runner of the affected interface is restarted. The overlay and its writer are kept, the new port starts at the old mapping's time and rate and is published as `holdover` while it catches up (transmit keeps flowing), and the **epoch changes** (the new port is created a thread start-up after the old mapping was sampled, so media time is not exactly continuous). |
+| `[network] interfaces` (the primary interface) | The PTP runner of the affected interface is restarted. The overlay and its writer are kept, the new port starts at the old mapping's time and rate, anchored at the instant the daemon read the mapping (the thread start-up, long on a busy host, does not step media time, so followers keep their lock), and is published as `holdover` while it catches up (transmit keeps flowing). The **epoch changes** all the same, so local audio clients re-anchor once. |
 | `[clock] free_running_tx` | Applied live. |
 | `[[flow]]` | Applied live (see above). |
 | `[[bridge]]` | Applied live, per bridge: a changed card, direction, channels, sizes, resampler, priority (or a device rate, latency or channel count change) restarts only that bridge; a changed `time_constant_s` or `max_correction_ppm` is applied to the running loop without a restart; unchanged bridges are not touched. |
@@ -571,7 +642,7 @@ What is applied live (reload, `tesseractl`, the portal) and what needs a restart
 | `[discovery] mdns` | Applied live (the backend is restarted). |
 | `[engine]` (`workers`, `tick_us`, `rt_priority`, `ptp_rt_priority`, `cpu_affinity`, `mlock`, the batch and buffer sizes) | Takes effect at the next service start: a reload logs each changed key by name and the status shows it until then. `ptp_rt_priority` and the PTP CPU are read at start too (a PTP runner restarted for an interface change keeps the values the daemon started with). |
 
-* **Priority mapping (PROVISIONAL, confidence: guess).** PTPv1 has no priority field (`OQ-CLK-1`). `tessera-clock` compares dataset members in the order
+* **Priority mapping (PROVISIONAL, confidence: guess).** PTPv1 has no priority field. `tessera-clock` compares dataset members in the order
   preferred, stratum, identifier, variance, ...; a leader-capable port advertises `[clock] priority` (lower wins, default 128) as: *preferred* for
   priority below 64; *stratum* 4 up to priority 128 and one worse per further 32 (255 gives 7; never 1-3, which could outrank hardware); and
   *variance* around the reference default (-4000, 16 per step) for the fine ordering. The default priority advertises exactly what an unconfigured
@@ -716,6 +787,7 @@ The local control socket (`control.sock`) used by tesseractl and the web portal:
 
 | Key | Type | Default | Unit | Range | Apply | Restart scope | What and why |
 |---|---|---|---|---|---|---|---|
+| `locked` | array | `[]` |  | flows | reload | none | Host-owned runtime domains. flows refuses controller flow commands and uses only host-configured flows. |
 | `max_frame_bytes` | integer | `1048576` | bytes | 65536..=4294967295 | reload | none | Largest request or response on the control socket. Clients learn it from the status. Raise it if a status with very many devices or channels is refused as too large. |
 | `max_connections` | integer | `256` |  | >= 1 | reload | none | Most simultaneous control connections (all users). |
 | `max_connections_per_uid` | integer | `16` |  | >= 1 | reload | none | Most control connections one user may hold, so one user cannot use up the slots. |
@@ -847,7 +919,7 @@ A logical device as it appears on the network. Several are allowed; the defaults
 | Key | Type | Default | Unit | Range | Apply | Restart scope | What and why |
 |---|---|---|---|---|---|---|---|
 | `id` | string | required (e.g. `"main"`) |  | letters, digits, _ and - | reload | none | Local key of the device (not its network identity). Required. Changing it makes a new device. |
-| `name` | string | host (e.g. `"studio-pc"`) |  | 1..=31 bytes, no control characters (PROVISIONAL: the size of the name on the wire, OQ-CFG-2) | live | none | Name on the network. Default: the host name (<host>-<id> with several devices). The 31-byte limit is the wire size of the name as far as known; PROVISIONAL until a capture confirms it (OQ-CFG-2). |
+| `name` | string | host (e.g. `"studio-pc"`) |  | 1..=31 bytes, no control characters (PROVISIONAL: the size of the name on the wire) | live | none | Name on the network. Default: the host name (<host>-<id> with several devices). The 31-byte limit is the wire size of the name as far as known; PROVISIONAL until a capture confirms it. |
 | `rx_channels` | integer | `2` | channels | 0..=65535 (not both 0) | live | device | Receive channels. Changing it restarts the device. |
 | `tx_channels` | integer | `2` | channels | 0..=65535 (not both 0) | live | device | Transmit channels. Changing it restarts the device. |
 | `sample_rate` | integer | `48000` | Hz | 44100, 48000, 88200, 96000, 176400, 192000 | live | device | Sample rate. Changing it restarts the device. |

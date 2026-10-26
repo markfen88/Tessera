@@ -596,6 +596,46 @@ fn sub_line(s: &SubscriptionStatus) -> String {
 pub fn render_event(e: &Event) -> String {
     let e = &cleaned(e);
     match e {
+        Event::LockedValueRefused {
+            field,
+            origin: o,
+            attempted,
+            ..
+        } => format!(
+            "{field}: locked change refused{} ({})",
+            attempted
+                .as_ref()
+                .map_or_else(String::new, |v| format!("; attempted {v}")),
+            origin(o)
+        ),
+        Event::RuntimeValueChanged {
+            field, origin: o, ..
+        } => format!(
+            "{field}: runtime value changed; queued for state.toml ({})",
+            origin(o)
+        ),
+        Event::ProtocolFlowsChanged {
+            flows, origin: o, ..
+        } => format!(
+            "controller flows: {} ({})",
+            if flows.is_empty() {
+                "none".into()
+            } else {
+                flows.join(", ")
+            },
+            origin(o)
+        ),
+        Event::SubscriptionChangedWithOrigin {
+            device,
+            status,
+            origin: o,
+            ..
+        } => format!(
+            "{}: subscription {} ({})",
+            device.0,
+            sub_line(status),
+            origin(o)
+        ),
         Event::DeviceRenamed {
             device,
             name,
@@ -668,6 +708,9 @@ pub fn render_event(e: &Event) -> String {
             selected.as_deref().unwrap_or("none"),
             origin(o)
         ),
+        Event::ConfigReloadedWithOrigin { origin: o } => {
+            format!("configuration reloaded ({})", origin(o))
+        }
         Event::ConfigReloaded => "configuration reloaded".into(),
         Event::DeviceChannelsChanged {
             device,
@@ -875,5 +918,33 @@ mod tests {
         });
         assert!(!line.contains('\u{1b}') && !line.contains('\n') && !line.contains('\u{202e}'));
         assert!(line.contains("\\u{1b}"), "{line}");
+    }
+    #[test]
+    fn host_audit_events_are_readable_and_sanitized() {
+        let refused = Event::LockedValueRefused {
+            field: "flows".into(),
+            origin: Origin::Protocol {
+                peer: "controller".into(),
+            },
+            attempted: None,
+        };
+        let line = render_event(&refused);
+        assert!(
+            line.contains("flows")
+                && line.contains("locked change refused")
+                && line.contains("controller")
+        );
+        let changed = Event::RuntimeValueChanged {
+            field: "clock.priority".into(),
+            origin: Origin::Cli { uid: 1000 },
+        };
+        assert!(render_event(&changed).contains("clock.priority: runtime value changed"));
+        let escaped = Event::LockedValueRefused {
+            field: "flows".into(),
+            origin: Origin::Internal,
+            attempted: Some("bad\n\u{1b}[2J".into()),
+        };
+        let line = render_event(&escaped);
+        assert!(!line.contains('\n') && !line.contains('\u{1b}'));
     }
 }

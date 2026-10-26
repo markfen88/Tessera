@@ -1,0 +1,9 @@
+Description: PipeWire client for the tessera daemon
+ tessera-pw exposes the channels of a tessera device as PipeWire nodes (one
+ source for received audio, one sink for transmitted audio), driven by the
+ network media clock.
+ .
+ It ships a systemd user unit. It is not enabled automatically: as the user
+ that runs PipeWire, enable it with
+ 'systemctl --user enable --now tessera-pw.service' and make that user a
+ member of the tessera group.

@@ -18,9 +18,9 @@
 # wins over the files, unless the setting is pinned with `locked`. Only
 # some settings can be pinned: in [[device]] name, sample_rate, encoding,
 # latency, rx_channels, tx_channels and the channel labels; in [clock]
-# role and priority; in [network] the primary interface. Every other key
-# has no run-time form and no lock. `tesseractl config show` prints the
-# merged files.
+# role and priority; in [network] the primary interface; in [control]
+# flows. Every other key has no run-time form and no lock.
+# `tesseractl config show` prints the merged files.
 # reload = takes effect on SIGHUP (systemctl reload tesserad) or
 # `tesseractl config reload`. restart = needs a daemon restart.
 # restart scope: what a change interrupts (none; the device: its flows,
@@ -74,6 +74,11 @@
 #[control]
 # The local control socket (`control.sock`) used by tesseractl and the web
 # portal: frame size, connection limits, timeouts, rate limits.
+#
+# Host-owned runtime domains. flows refuses controller flow commands and uses
+# only host-configured flows.
+# (range: flows; apply: reload; restart scope: none)
+#locked = []
 #
 # Largest request or response on the control socket. Clients learn it from the
 # status. Raise it if a status with very many devices or channels is refused
@@ -424,10 +429,10 @@
 #
 # Name on the network. Default: the host name (<host>-<id> with several
 # devices). The 31-byte limit is the wire size of the name as far as known;
-# PROVISIONAL until a capture confirms it (OQ-CFG-2).
+# PROVISIONAL until a capture confirms it.
 # (range: 1..=31 bytes, no control characters (PROVISIONAL: the size of the
-# name on the wire, OQ-CFG-2); apply: live; restart scope: none; default
-# depends on the host, typical:)
+# name on the wire); apply: live; restart scope: none; default depends on the
+# host, typical:)
 #name = "studio-pc"
 #
 # Receive channels. Changing it restarts the device.

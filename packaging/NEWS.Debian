@@ -1,3 +1,81 @@
+tessera (0.3.0-1) unstable; urgency=medium
+
+  Upgrading from 0.2.2 or 0.2.1. A running tesserad is not restarted by the
+  upgrade: restart it when an audio interruption is acceptable to run the new
+  binary. Upgrade tessera, tessera-alsa, tessera-web and tessera-dsp together
+  (and tessera-pw if installed); the packages depend on each other's exact
+  version.
+
+  The add-on bundle changed. install.sh and uninstall.sh are gone: the
+  archive carries one program, tessera-bundle, with the same options
+  (tessera-bundle install --profile speaker --audio-card hw:CARD=...,
+  tessera-bundle uninstall --purge) and a new verify command. It
+  authenticates the release first. This release ships no trusted key: put the
+  minisign public key of the release in the root-owned file
+  /etc/tessera/trusted-release-keys (mode 0644, one bare key per line;
+  docs/bundle.md), or, until you have one, install with --allow-unsigned,
+  which is meant for development builds. Without either, the install stops
+  with "untrusted_key" and changes nothing. The record of an earlier
+  installation (/var/lib/tessera-bundle/record.json) is read as it is.
+
+  Speakers with CamillaDSP (0.2.2): nothing changes in your files. The
+  installer never rewrites the device configuration, the portal's
+  /etc/tessera/web.d/60-speaker.toml, the CamillaDSP configurations or the
+  state file. Restart camilladsp and camillagui when convenient. The
+  Speaker page now warns when the EQ engine's capture rate differs from the
+  device's rate, and can fix it. The portal now saves the amplifier volume
+  itself. The unit drop-in written by an earlier installer
+  (/etc/systemd/system/tessera-web.service.d/60-speaker.conf) is not
+  rewritten: to let the Volume pane follow the sound card when its index
+  changes, replace its DeviceAllow=/dev/snd/controlC<n> line with the device
+  lines of /usr/share/doc/tessera-web/examples/appliance-paths.conf, remove
+  ReadWritePaths=-/var/lib/alsa and restart tessera-web.
+
+  Tessera-only speakers (0.2.1, or 0.2.2 installed with --no-dsp): running
+  tessera-bundle install --profile speaker again converts the speaker to the
+  CamillaDSP speaker in place (see the 0.2.2 entry); add --no-dsp to keep it
+  as it is. A [[bridge]] that is not the profile's own makes the install
+  refuse before anything changes. CamillaGUI (port 5005) has no login: it
+  listens on 127.0.0.1 unless the bundle installer set the speaker's
+  management address (a GUI that listened on every interface is narrowed on
+  upgrade; a speaker that had no GUI does not get one). A speaker with a
+  CamillaDSP of its own keeps its program, configurations and portal services;
+  its unit file is moved aside (camilladsp.service.pre-tessera-dsp) so the
+  packaged unit takes over.
+
+  Controller flows are now stored in state.toml and applied over the control
+  socket; tesseractl flows show|set|clear manages them. An existing
+  /etc/tessera/config.d/90-probe-flows.toml is still read, with a warning,
+  until a flow set has been stored; support for the file is removed in 0.4.0.
+
+  Network documents gain the optional field dns_search (DNS search domains of
+  the management network). A tessera-network or NDIMon-R older than this
+  release rejects a document that carries search domains: upgrade both before
+  you configure any. The Network page also drives NetworkManager and ifupdown
+  now; those two backends are new and not yet accepted on live hosts.
+
+  Speakers with CamillaDSP: the engine is now linked into tesserad's wants
+  (WantedBy=tesserad.service), so a network change, which stops and starts
+  the daemon, no longer leaves the engine stopped and the speaker silent.
+  The upgrade enables the engine again, which creates the link; an engine
+  switched off stays off. The portal restarts itself when a sound card
+  appears while it runs (a udev rule and tessera-web-sound.service), so the
+  Volume pane finds a USB card plugged in later; sign in again afterwards.
+
+ -- tessera maintainers <tessera@invalid>  Mon, 26 Oct 2026 00:00:00 +0000
+
+tessera (0.2.2-1) unstable; urgency=medium
+
+  The speaker profile of the add-on bundle now includes the CamillaDSP stage
+  (package tessera-dsp) by default: CamillaDSP plays the network audio to the
+  card and the portal's Speaker page controls it. Use tessera-bundle install
+  --no-dsp for the previous tessera-only speaker with the in-daemon bridge.
+  Changes made from a network controller that restart a device are now
+  applied (they were refused before). Local portal settings can be kept in
+  /etc/tessera/web.d/.
+
+ -- tessera maintainers <tessera@invalid>  Sun, 25 Oct 2026 00:00:00 +0000
+
 tessera (0.2.1-1) unstable; urgency=medium
 
   Shipping defaults now include and enable the Controller compatibility

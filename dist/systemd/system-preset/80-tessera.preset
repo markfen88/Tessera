@@ -1,0 +1,3 @@
+# Core is enabled, but never started or restarted during package configure.
+enable tesserad.service
+enable tessera-controller@.service main

@@ -10,7 +10,9 @@ use std::fmt;
 
 use tessera_control_types::{ClockRole, DeviceKey};
 
-use crate::config::{ClockLock, Config, DeviceConfig, DeviceLock, NetworkLock};
+use crate::config::{
+    ClockLock, Config, ControlLock, DeviceConfig, DeviceLock, FlowConfig, NetworkLock,
+};
 use crate::env::{Environment, validate_name};
 use crate::error::Issue;
 use crate::persist::{DeviceIntent, StateFile, SubscriptionIntent};
@@ -134,6 +136,8 @@ pub struct NetworkModel {
 /// All effective values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
+    /// Effective media flows from host configuration and controller intent.
+    pub flows: Vec<FlowConfig>,
     /// Devices in configuration order.
     pub devices: Vec<DeviceModel>,
     /// Clock settings.
@@ -506,6 +510,32 @@ pub fn reconcile(
 ) -> (Model, Vec<Issue>, bool) {
     let before = intent.clone();
     let mut warnings = Vec::new();
+    let mut combined = config.clone();
+    if config.control.locked.contains(&ControlLock::Flows) {
+        // Keep an explicit empty marker so removing the lock never resurrects
+        // either stale controller intent or the deprecated file.
+        intent.protocol_flows = Some(Vec::new());
+    } else if let Some(specs) = &intent.protocol_flows {
+        if !config.legacy_protocol_flows.is_empty() {
+            warnings.push(Issue::warning(
+                "flow",
+                "90-probe-flows.toml is deprecated and ignored because controller flows are stored in state.toml",
+            ));
+        }
+        match crate::flows::from_specs(specs, env) {
+            Ok(flows) => combined.flows.extend(flows),
+            Err(issues) => warnings.extend(issues.into_iter().map(|i| {
+                Issue::warning(
+                    "state.protocol_flows",
+                    format!("{i}; controller set kept but inactive"),
+                )
+            })),
+        }
+    } else {
+        combined
+            .flows
+            .extend(config.legacy_protocol_flows.iter().cloned());
+    }
 
     let config_names: Vec<String> = config
         .devices
@@ -523,7 +553,7 @@ pub fn reconcile(
             .collect();
         let ds = intent.device.entry(dc.id.clone()).or_default();
         devices.push(reconcile_device(
-            config,
+            &combined,
             dc,
             ds,
             &others,
@@ -585,10 +615,35 @@ pub fn reconcile(
         None => None,
     };
 
+    // Runtime geometry may differ from configuration defaults. Validate the
+    // entire controller set against those effective counts before exposing it.
+    for dc in &mut combined.devices {
+        if let Some(d) = devices.iter().find(|d| d.key.0 == dc.id) {
+            dc.rx_channels = d.rx_channels;
+            dc.tx_channels = d.tx_channels;
+            dc.sample_rate = d.sample_rate;
+            dc.encoding = d.encoding;
+            dc.latency_us = d.latency_us;
+        }
+    }
+    let problems: Vec<Issue> = crate::validate::validate(&combined, env)
+        .into_iter()
+        .filter(|i| i.is_error() && i.path.starts_with("flow["))
+        .collect();
+    if !problems.is_empty() {
+        warnings.extend(problems.into_iter().map(|i| {
+            Issue::warning(
+                "state.protocol_flows",
+                format!("{i}; controller set kept but inactive"),
+            )
+        }));
+        combined.flows.clone_from(&config.flows);
+    }
     intent.schema_version = crate::persist::CURRENT_SCHEMA_VERSION;
     let changed = *intent != before;
     (
         Model {
+            flows: combined.flows,
             devices,
             clock: ClockModel {
                 role,

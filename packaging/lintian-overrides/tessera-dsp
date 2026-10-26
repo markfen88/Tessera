@@ -1,0 +1,12 @@
+# The programs under /usr/lib/tessera-dsp are the unmodified upstream releases, pinned by SHA-256
+# in packaging/dsp/dsp.lock: CamillaDSP, and the CamillaGUI backend with the Python runtime and
+# libraries it was released with (a PyInstaller bundle). Stripping, relinking or repacking them
+# would change what the pin vouches for, so lintian's complaints about how upstream built them
+# are overridden for those paths only.
+tessera-dsp: unstripped-binary-or-object [usr/lib/tessera-dsp/*]
+tessera-dsp: custom-library-search-path * [usr/lib/tessera-dsp/*]
+tessera-dsp: shared-library-is-executable * [usr/lib/tessera-dsp/*]
+tessera-dsp: embedded-library * [usr/lib/tessera-dsp/*]
+tessera-dsp: library-not-linked-against-libc [usr/lib/tessera-dsp/*]
+tessera-dsp: hardening-no-pie [usr/lib/tessera-dsp/*]
+tessera-dsp: shared-library-lacks-prerequisites [usr/lib/tessera-dsp/*]

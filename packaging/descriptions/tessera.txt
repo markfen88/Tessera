@@ -1,0 +1,11 @@
+Description: audio-over-IP daemon and control tool
+ tesserad is a Linux daemon that makes this machine an audio-over-IP device
+ on the local network: named channels, subscriptions, a PTP-synchronised
+ media clock and a local control socket. tesseractl is its command line.
+ .
+ This package ships the systemd service (enabled at boot, but
+ not started on install), the tessera and tessera-admin groups, the sample
+ configuration and the documentation. Audio applications connect through
+ tessera-pw (PipeWire) or tessera-alsa (ALSA).
+ .
+ The wire protocol support is provisional until verified in the lab.

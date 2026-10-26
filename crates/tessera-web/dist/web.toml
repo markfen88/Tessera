@@ -101,11 +101,16 @@
 # The whole table is optional; without it there is no Volume card. `card`
 # is required (the ALSA card name or index; `aplay -l` lists them);
 # `control` is the simple mixer control (`amixer -c <card> scontrols`);
-# `min_db`..`max_db` is the range the slider offers, in 0.5 dB steps. After
-# a change the portal tries `alsactl store` (best effort; the mixer state is
-# saved at a clean shutdown by alsa-restore.service anyway).
+# `min_db`..`max_db` is the range the slider offers, in 0.5 dB steps. Name
+# the card, do not number it: the index can change at a reboot, the name
+# does not. A committed change (the slider released, or Apply) is saved in
+# `state_file`, and the portal sets it again at start, as soon as the card is
+# there (up to 10 minutes after the start), unless the volume was changed
+# meanwhile. The default is in the unit's state directory; the portal's user
+# must be able to write the directory.
 #[appliance.volume]
 #card = "amp"
 #control = "Digital"
 #min_db = -60
 #max_db = 0
+#state_file = "/var/lib/tessera-web/volume.json"

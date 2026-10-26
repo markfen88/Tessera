@@ -17,9 +17,12 @@ instead (marked where they appear): the commands inside `clock`, `network` and
 | [`tesserad`](#tesserad) | `tessera` | the daemon (normally started by `tesserad.service`) |
 | [`tessera-web`](#tessera-web) | `tessera-web` | the web portal; sets its password |
 | [`tessera-pw`](#tessera-pw) | `tessera-pw` | the PipeWire client (started by the user unit) |
+| [`tessera-network`](#tessera-network) | `tessera-web` | the privileged network helper (started by its units; root-only handoff commands) |
+| [`tessera-bundle`](#tessera-bundle) | the add-on archive | install, remove and verify an add-on bundle |
 
 Man pages with the same text are installed by native package builds
-(`man tesseractl`, `man tesserad`, `man tessera-web`, `man tessera-pw`).
+(`man tesseractl`, `man tesserad`, `man tessera-web`, `man tessera-pw`,
+`man tessera-network`).
 
 ---
 
@@ -392,6 +395,19 @@ so it does not prove that the media comes from the transmitter named in the subs
 tesseractl subscribe 2 "Out 2" stagebox-a
 tesseractl unsubscribe 2
 ```
+
+### Flows
+
+`tesseractl flows show` shows the per-flow counters also included in `metrics`.
+`tesseractl flows set FILE` replaces the controller-owned set from a TOML file
+containing only `[[flow]]` entries. `tesseractl flows clear` stores an explicit
+empty controller set. Both retain host configuration flows and obey the normal
+restart confirmation (`--yes` for scripts). `[control] locked = ["flows"]`
+refuses either change. See [flow ownership](configuration.md#controller-flows-and-host-ownership).
+
+`watch` displays lock-refusal, runtime-intent and controller-flow events with
+their origins. Runtime intent is queued for the ordinary debounced state write;
+it is visible in `config show --effective` immediately.
 
 ### Clock and network
 
@@ -841,3 +857,53 @@ USAGE: tessera-pw [OPTIONS]
 The unit starts it as `tessera-pw --audio-socket /run/tessera/audio.sock
 --control-socket /run/tessera/control.sock`; change options with `systemctl
 --user edit tessera-pw.service`. Behaviour: [audio-backends.md](audio-backends.md#pipewire-tessera-pw).
+
+---
+
+## tessera-network
+
+The privileged helper behind the portal's Network page. The packaged units run
+`tessera-network serve` (the root-only helper socket), `boot-recover` (first, ahead
+of `network-online.target`) and `recover-expired` (the recovery timer); `apply JOB`
+and `recover JOB` run one change inside the system manager. Administrators do not run
+these by hand. The program must run as root. The commands an administrator does use
+are `accept-current`, the ownership handoff with NDIMon-R and `request` (this list is from the source,
+`crates/tessera-network/src/main.rs`; the program has no `--help`):
+
+| Command | Effect |
+|---------|--------|
+| `accept-current [--yes]` | the way out of a recovery that cannot finish (the Network page shows it as pending): without `--yes` print the reason and the configuration files that differ from their saved copies and change nothing; with `--yes` keep the network as it is, put the firewall back as before the change, close the pending recovery and start the audio services |
+| `handoff prepare ndimon` | release the standalone networking to NDIMon-R: quiesce the engine and write the offer `/var/lib/tessera-network/handoff/<id>.json` |
+| `handoff status` | the offer in progress, a receipt or a mismatched marker |
+| `handoff cancel ID` | withdraw an offer the receiver has not reserved |
+| `handoff import ndimon ID` | review an offer from NDIMon-R (files, tables, services and the impact token); changes nothing |
+| `handoff commit ndimon ID IMPACT` | receive it, after the impact token reviewed with `import` (`--yes` instead of the token confirms blindly, for scripts); an Apply/Keep/Revert cycle follows |
+| `request` | read one JSON line from standard input and handle it as the helper socket does (Keep and Revert without the token in a process argument) |
+
+Each prints the helper's JSON reply and exits 1 when the reply carries an error.
+Details and the JSON forms: [network-vlans.md](network-vlans.md#versioned-documents-and-ownership-handoff).
+
+---
+
+## tessera-bundle
+
+The installer inside an add-on archive (there is no package for it; run it from the
+extracted, root-owned directory). It replaces the `install.sh` and `uninstall.sh`
+scripts of 0.2.x.
+
+```text
+tessera-bundle install   [--profile speaker|ndimon|none] [--admin-user USER]...
+                         [--audio-card CARD] [--no-dsp] [--allow-unsigned]
+                         [--allow-ubuntu-24.04] [--restart] [--reinstall]
+                         [--offline] [--dry-run] [--yes]
+tessera-bundle uninstall [--purge] [--keep-users] [--remove-dependents]
+                         [--dry-run] [--yes]
+tessera-bundle verify
+```
+
+`verify` authenticates the bundle and checks every payload file; it changes nothing
+and takes no options. A release that no key in `/etc/tessera/trusted-release-keys`
+vouches for is refused with `untrusted_key`; `install --allow-unsigned` bypasses only
+that authentication, for development builds. Exit status 0 on success, 1 on any
+failure (including unknown options). What each option does, the record, upgrades and
+purge: [bundle.md](bundle.md).

@@ -1,0 +1,40 @@
+[Unit]
+Description=CamillaDSP web GUI
+Documentation=file:///usr/share/doc/tessera-dsp/README.md
+After=camilladsp.service network-online.target
+Wants=camilladsp.service network-online.target
+# Listening on the speaker's management address fails until that address is configured; try
+# again however often it takes (this unit is not part of the audio path).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=camilla
+Group=camilla
+WorkingDirectory=/usr/lib/tessera-dsp/gui/camillagui_backend
+ExecStart=/usr/lib/tessera-dsp/gui/camillagui_backend/camillagui_backend -c /etc/camilladsp/camillagui.yml
+Restart=on-failure
+RestartSec=2s
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/camilladsp
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0002
+
+[Install]
+WantedBy=multi-user.target

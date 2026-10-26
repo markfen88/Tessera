@@ -9,12 +9,16 @@ Ltd, which is not affiliated with this project).
 > **Read this first: what works today.** This guide describes the packages
 > built from the current source tree. `tesserad` runs the PTPv1 clock
 > (follower or leader), the media engine with **static flows** (`[[flow]]`,
-> provisional), receiver keepalives, optional mDNS advertisement, the local
+> provisional), receiver keepalives, mDNS advertisement, the local
 > control and audio sockets, and (in builds with the `alsa-bridge` feature)
-> the in-daemon sound-card bridge. It does **not** implement the vendor's
-> control protocols (routing, device control, monitoring) yet: a subscription
-> made with `tesseractl subscribe` is stored but no flow is set up from it,
-> and audio crosses the network only through `[[flow]]` entries. Everything
+> the in-daemon sound-card bridge. `tesserad` itself does **not** implement the
+> vendor's control protocols (routing, device control, monitoring): a subscription
+> made with `tesseractl subscribe` is stored but no flow is set up from it by the
+> daemon, and audio crosses the network only through `[[flow]]` entries. The
+> packages also install and enable a separate **Controller compatibility
+> runtime** (`tessera-controller@main`) that serves the first logical device's
+> base control ports and hands the flows a controller sets up to the daemon as a
+> typed command (section 3, "Controller flows"). Everything
 > that concerns the wire (packet format, ports, QoS values, timing defaults,
 > protocol identity values) is **provisional** until it has been confirmed
 > with external hardware. Compatibility limits: [interoperability.md](interoperability.md).
@@ -23,13 +27,17 @@ Ltd, which is not affiliated with this project).
 
 | Package | Contents | Notes |
 |---|---|---|
-| `tessera` | `tesserad` (daemon), `tesseractl` (control tool), systemd unit, `tessera` user and `tessera-admin` group, sample configuration, completions and man pages (native builds only), this documentation | needs systemd 253 or newer |
+| `tessera` | `tesserad` (daemon), `tesseractl` (control tool), systemd unit, the Controller compatibility runtime and its unit, `tessera` user and `tessera-admin` group, reference configuration, completions and man pages (native builds only), this documentation | needs systemd 253 or newer |
 | `tessera-pw` | `tessera-pw`, the PipeWire client, and its systemd **user** unit | depends on `pipewire` and `tessera` |
 | `tessera-alsa` | ALSA plugin `pcm.tessera` and its configuration snippet | built by default; left out with `SKIP_ALSA=1` (section 10) |
 | `tessera-web` | `tessera-web`, the portal (pages and JSON API), standalone network helper/recovery units and the `tessera-web` user | depends on `tessera`; see section 4b |
+| `tessera-dsp` | CamillaDSP and its GUI, the equaliser stage of a network speaker (amd64 and arm64) | depends on the exact versions of `tessera` and `tessera-alsa`, recommends `tessera-web`; see [dsp.md](dsp.md) |
 
-The build script targets `amd64`, `arm64` (Raspberry Pi 4/5 with a 64-bit OS)
-and `armhf`; see section 10.
+A speaker is normally installed with the add-on bundle, which brings the
+right packages and the configuration together ([bundle.md](bundle.md),
+[raspberry-pi-speaker.md](raspberry-pi-speaker.md)). The build script targets
+`amd64`, `arm64` (Raspberry Pi 4/5 with a 64-bit OS) and `armhf`; see section 10.
+`tessera-dsp` is not built for `armhf`.
 
 ## 2. Install
 
@@ -49,7 +57,14 @@ What installing does, and does not do:
 * **enables** `tesserad.service` so that it starts at boot, but **does not
   start it**: the daemon will own audio devices on your network, so you start
   it when you have looked at the configuration;
+* enables the Controller compatibility runtime `tessera-controller@main.service`
+  with the daemon: it starts and stops with `tesserad` (it is `PartOf` it) and is
+  not started by the installation either;
 * does not enable `tessera-pw` (it is a per-user service, see section 6).
+
+A speaker (a Raspberry Pi with a DAC, a mini-PC with an amplifier) is better
+installed with the add-on bundle than with `apt install` by hand: see
+[bundle.md](bundle.md) and [raspberry-pi-speaker.md](raspberry-pi-speaker.md).
 
 Start it, and check it:
 
@@ -93,7 +108,9 @@ Files:
 |---|---|---|
 | `/etc/tessera/config.toml` | the package (a conffile) | the reference: every key, commented out at its default, with what it does and why. Nothing in it is active; leave it as shipped |
 | `/etc/tessera/config.d/*.toml` | you, or other packages | your configuration: drop-ins applied after `config.toml` in file-name order |
-| `/var/lib/tessera/state.toml` | the daemon | values changed at run time (by `tesseractl` or network controllers). Do not edit while the daemon runs |
+| `/var/lib/tessera/state.toml` | the daemon | values changed at run time (by `tesseractl` or network controllers), including the controller flow set. Do not edit while the daemon runs |
+| `/etc/tessera/web.toml`, `/etc/tessera/web.d/*.toml` | the package, you | the portal's configuration: `web.toml` is a package file with every key commented out, your settings go in `web.d/` (read after it, in name order, a later file wins) |
+| `/etc/tessera/trusted-release-keys` | you | public keys that vouch for add-on bundles ([bundle.md](bundle.md#trusted-release-keys)); absent by default |
 
 `tesserad --print-default-config` prints the reference of the installed version, and
 `/usr/share/doc/tessera/examples/config.toml` is a copy of it (absent on images that strip `/usr/share/doc`, such as some containers).
@@ -239,7 +256,7 @@ Exact human-readable output may change; use `--json` for integrations.
 
 ```
 $ tesseractl status
-tessera 0.2.1
+tessera 0.3.0
 
 DEVICE  NAME       RATE      BITS  LATENCY  RX  TX  LOCKED
 main    studio-pc  48000 Hz  24    6000 us  4   2   sample_rate
@@ -299,6 +316,23 @@ would set it up. Audio is carried by `[[flow]]` entries in the configuration; se
 `configuration.md`, "Static flows". When an rx `[[flow]]` carries the channel, the state
 becomes "receiving" while its packets arrive and "no media" about 2 to 3 s after they stop. `tesserad` does not implement the vendor control plane, so vendor
 controllers cannot route to it on their own: see `interoperability.md`.)
+
+**Controller flows.** The flows that the Controller compatibility runtime (or you)
+sets up are a set of their own, kept in `state.toml` next to the `[[flow]]` entries
+of your configuration files. They replace each other as a whole, and they survive a
+restart of the daemon:
+
+```sh
+tesseractl flows show                          # the flows in effect, with their counters
+tesseractl flows set controller-flows.toml     # a file with only [[flow]] entries
+tesseractl --yes flows clear                   # store an explicit empty set
+```
+
+Changes that restart a device ask first (`--yes` for scripts). A host that owns the
+flows, such as an NDIMon appliance, writes `[control] locked = ["flows"]` and every
+change is then refused. An old `/etc/tessera/config.d/90-probe-flows.toml` is still read
+with a warning until a set has been stored; the file is no longer supported from 0.4.0.
+Reference: `configuration.md`, "Controller flows and host ownership".
 
 **Clock**
 
@@ -404,11 +438,16 @@ receiver keepalive counters yet; `/api/v1/status` and `/api/v1/metrics` carry
 them. Reference: `web-portal.md`.
 
 ```sh
-sudo apt install ./tessera-web_*.deb
-sudo tessera-web set-password                 # every page needs it
+sudo apt install ./tessera-web_*.deb          # a fresh install starts the portal with the password "tessera"
+sudo tessera-web set-password                 # replace it; every page needs a password
 sudo usermod -aG tessera-admin tessera-web    # only if the portal may change settings
 sudo systemctl enable --now tessera-web
 ```
+
+Put your site settings in `/etc/tessera/web.d/*.toml`; they are read after
+`web.toml`. An upgrade keeps an existing password and restarts a running portal.
+On a speaker the portal also controls the services, the volume and the EQ engine
+(`web-portal.md`, "Appliance mode"; `dsp.md`).
 
 By default it answers on `http://127.0.0.1:8090` only. From another machine,
 use an SSH tunnel (`ssh -L 8090:127.0.0.1:8090 box`) or put a TLS reverse
@@ -437,7 +476,7 @@ DELETE /api/v1/session     (with X-CSRF-Token)
 
 ## 5. Discovery
 
-With `[discovery] advertise_devices = true` the daemon announces each logical
+With `[discovery] advertise_devices = true` (the default) the daemon announces each logical
 device on the local network with multicast DNS (records for the device's
 control services and one per transmit channel), updates the records on a
 rename or a label change, and withdraws them when it stops. The
@@ -445,14 +484,17 @@ rename or a label change, and withdraws them when it stops. The
 it is on the bus, otherwise a built-in responder; never both), `avahi`,
 `builtin` or `off`. That is why the package **recommends `avahi-daemon`**.
 
-**Status:** advertising is **off by default**, because the records name
+**Status:** advertising is **on by default** (`advertise_devices = true`), because
+the packages also enable the Controller compatibility runtime. The records name
 control ports (ARC 4440, CMC 8800, flow control 4455, plus 10 per further
-device) on which `tesserad` does not answer yet: a controller that finds the
-device cannot talk to it, and shows it greyed out. With advertising on, the
-daemon warns once per advertised port that no socket is bound to (see
-`troubleshooting.md`). `tesserad` does not browse for other devices. The
-record contents follow a provisional specification. Multicast DNS must be
-allowed between the devices (UDP 5353 on the media network).
+device); `tesserad` does not answer on them itself, the runtime serves the first
+logical device's base ports. A controller that finds a device whose runtime is not
+running, or a further logical device, cannot talk to it and shows it greyed out.
+The daemon warns once per advertised port that no socket is bound to (see
+`troubleshooting.md`); set `advertise_devices = false` to advertise nothing.
+`tesserad` does not browse for other devices. The record contents follow a
+provisional specification. Multicast DNS must be allowed between the devices
+(UDP 5353 on the media network).
 
 ## 6. Audio clients
 
@@ -508,13 +550,12 @@ aplay -D tessera some.wav
 ```
 
 The package ships its configuration at `/etc/alsa/conf.d/60-tessera.conf`
-(a link to `/usr/share/alsa/alsa.conf.d/60-tessera.conf`). In the current
-packaging script that file is a minimal definition (`pcm.tessera { type
-tessera }`, every option at its default: the daemon's default device, 2
-channels from channel 1, the device's rate); the commented sample with every
-option and a `tessera_plug` PCM is
-`crates/tessera-backend-alsa/dist/alsa.conf.d/50-tessera.conf` in the source
-tree. For other sample formats, rates or mmap access open `plug:tessera`.
+(a link to `/usr/share/alsa/alsa.conf.d/60-tessera.conf`). The file is the
+commented sample of the source tree
+(`crates/tessera-backend-alsa/dist/alsa.conf.d/50-tessera.conf`): `pcm.tessera`
+with every option at its default (the daemon's default device, 2 channels from
+channel 1, the device's rate) and a `tessera_plug` PCM. For other sample formats,
+rates or mmap access open `plug:tessera` or `tessera_plug`.
 Options, formats and the poll behaviour are in `audio-backends.md`.
 
 `[backends] enabled = [...]` (default `["pipewire", "alsa"]`) is meant to
@@ -530,7 +571,9 @@ the sound card itself: no PipeWire, no `arecord | ...` pipes. A
 `[[bridge]]` entry connects a card to a device's channels; the card's clock
 is independent of the network's, and the bridge absorbs the difference with
 a resampler and a slow PI loop (reference: `configuration.md`, "Hardware-card
-bridges").
+bridges"). The `speaker` profile of the add-on bundle does **not** use the bridge
+unless installed with `--no-dsp`: by default CamillaDSP owns the card and reads
+`pcm.tessera`, and a card has one owner (`dsp.md`).
 
 The bridge is a build option: `tesserad` must be built with the cargo
 feature `alsa-bridge` (it links libasound; needs `libasound2-dev` and
@@ -540,7 +583,7 @@ leaves it out. Add the service user to the `audio` group for card access:
 
 ```sh
 cargo build --release -p tesserad --features alsa-bridge
-TESSERA_DAEMON_FEATURES=alsa-bridge packaging/build-deb.sh    # packages with the bridge
+TESSERA_DAEMON_FEATURES=alsa-bridge cargo xtask build-deb    # packages with the bridge
 ```
 
 A `tesserad` without it refuses a configuration with `[[bridge]]` and says
@@ -661,13 +704,21 @@ sudo apt install ./tessera_NEW_amd64.deb ./tessera-pw_NEW_amd64.deb
     `main`, and the daemon creates `main` by itself only while no file defines a device. If a drop-in adds another device (say
     `id = "b"`) and you relied on the sample's `main`, only `b` exists after the upgrade and its default name loses the `-b` suffix,
     which is visible on the network. Add a `[[device]]` entry with `id = "main"` to the drop-in, and check with `tesseractl config show`.
-  * Files in `config.d/` are never touched. The package also prints this in its NEWS (`apt-listchanges`). Details: [bundle guide](bundle.md)
+  * Files in `config.d/` are never touched. The package also prints this in its NEWS (`apt-listchanges`). Details: `packaging/README.md`
     in the sources.
 * An upgrade **does not restart** a running daemon (that would interrupt
   audio). The new version runs after `sudo systemctl restart tesserad`, at a
   time you choose. The upgrade tells you when a restart is pending.
 * `state.toml` carries a `schema_version`; a newer daemon migrates an older
   file on load.
+* A speaker installed with the add-on bundle is upgraded with the new bundle
+  (`tessera-bundle install`, [bundle.md](bundle.md#upgrades-and-repeated-installs)),
+  not with `apt install` alone: it upgrades the packages as a set and keeps your
+  configuration, the portal drop-ins and the CamillaDSP files. From 0.2.x read the
+  upgrade notes in the release notes first (the installer is a program now and
+  authenticates the release).
+* `tessera-dsp` depends on the exact version of `tessera` and `tessera-alsa`:
+  upgrade it with them. A running EQ engine is not restarted by an upgrade.
 
 Rollback: install the previous package files (`sudo apt install
 ./tessera_OLD_amd64.deb ...`, answer "keep" for the configuration) and restart.
@@ -693,10 +744,19 @@ sudo apt remove tessera tessera-pw     # stops the daemon; keeps /etc/tessera an
 sudo apt purge tessera tessera-pw      # also deletes /etc/tessera (config.d too) and /var/lib/tessera (state)
 ```
 
-Removing `tessera` also removes `tessera-pw`, `tessera-alsa` and
-`tessera-web`, which depend on it. Purging `tessera-web` deletes
-`/etc/tessera/web.toml` and the password file `/etc/tessera/web-password`; its
-user `tessera-web` stays, like the others.
+Removing `tessera` also removes `tessera-pw`, `tessera-alsa`, `tessera-web` and
+`tessera-dsp`, which depend on it. Purging `tessera-web` deletes
+`/etc/tessera/web.toml`, the password file `/etc/tessera/web-password` and the
+portal's saved volume (`/var/lib/tessera-web`); its user `tessera-web` stays, like
+the others. Purging `tessera-dsp` deletes the CamillaDSP configurations, filter
+files and GUI settings (`/opt/camilladsp`, `/etc/camilladsp`; `dsp.md`); a plain
+removal keeps them.
+
+Removal and purge also take back what the packages left loaded: the helper's
+firewall table `inet tessera_network`, the audio and controller slices and the
+raised socket-buffer ceilings (`net.core.rmem_max`, `wmem_max`). The network
+configuration the portal committed (Netplan or networkd files, VLAN links) stays on
+purpose: it is the host's addressing.
 
 The user `tessera` and the groups `tessera` and `tessera-admin` are **not**
 deleted, even by purge: that is how `systemd-sysusers` accounts are managed
@@ -718,26 +778,28 @@ On a Debian 13 (or newer) machine with Rust, `dpkg-dev` and:
   `pkg-config`).
 
 ```sh
-packaging/build-deb.sh          # output: target/deb/*.deb and SHA256SUMS
-TESSERA_DAEMON_FEATURES=alsa-bridge packaging/build-deb.sh   # tesserad with the sound-card bridge
+cargo xtask build-deb          # output: target/deb/*.deb and SHA256SUMS
+TESSERA_DAEMON_FEATURES=alsa-bridge cargo xtask build-deb   # tesserad with the sound-card bridge
 ```
 
 | Variable | Effect |
 |---|---|
 | `TESSERA_DAEMON_FEATURES` | cargo features of `tesserad`, comma-separated (`alsa-bridge`); default none, so the default packages have no bridge. With the bridge the `tessera` package depends on `libasound2` |
 | `SKIP_PW=1` | no `tessera-pw` |
-| `SKIP_ALSA=1` | no ALSA plugin, no `tessera-alsa` |
+| `SKIP_ALSA=1` | no ALSA plugin, no `tessera-alsa` (and so no `tessera-dsp`) |
+| `SKIP_DSP=1` | no `tessera-dsp`; the bundle then records `"dsp": false` |
+| `TESSERA_DSP_CACHE` | where the pinned CamillaDSP archives are cached and verified (default `~/.cache/tessera-dsp`; [dsp.md](dsp.md#building)) |
 | `TARGET` | Rust target triple (amd64, arm64, armhf); default the host |
 | `NO_BUILD=1` | package the binaries already under `target/` |
 | `SYSTEMD_MIN` | minimum systemd in `Depends` (default 253) |
-| `SOURCE_DATE_EPOCH`, `TESSERA_DEB_REVISION` | file timestamps (default: commit time), Debian revision (default 1) |
+| `SOURCE_DATE_EPOCH`, `TESSERA_DEB_REVISION` | file timestamps (default: commit time), Debian revision (default: the first-parent commit count of `origin/main`; a source archive without that history needs the variable) |
 
 The build is reproducible: the same source gives byte-identical packages
 (`SOURCE_DATE_EPOCH` defaults to the commit time). The packages depend on
 `systemd (>= 253)` because the unit uses `Type=notify-reload`.
 
 *Older systemd (Debian 12 has 252)*: build with `SYSTEMD_MIN=252
-packaging/build-deb.sh` and add `/etc/systemd/system/tesserad.service.d/old-systemd.conf`:
+cargo xtask build-deb` and add `/etc/systemd/system/tesserad.service.d/old-systemd.conf`:
 
 ```ini
 [Service]
@@ -757,7 +819,7 @@ which links the target's libasound:
 sudo apt install gcc-aarch64-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-TARGET=aarch64-unknown-linux-gnu SKIP_PW=1 SKIP_ALSA=1 packaging/build-deb.sh
+TARGET=aarch64-unknown-linux-gnu SKIP_PW=1 SKIP_ALSA=1 cargo xtask build-deb
 ```
 
 (`armhf`: `gcc-arm-linux-gnueabihf`, `armv7-unknown-linux-gnueabihf`,
@@ -768,7 +830,7 @@ pkg-config set up for the target. A cross build has hand-written
 dependencies (`libc6, libgcc-s1`, plus `libasound2` for every binary whose ELF
 `NEEDED` entries name `libasound.so.2`) and no completions or man pages (the
 tools cannot run on the build machine). For a supported native Pi
-package, run `build-deb.sh` on the Pi itself, or on an arm64 machine,
+package, run `cargo xtask build-deb` on the Pi itself, or on an arm64 machine,
 natively.
 
 ## 11. Where to go next
@@ -777,8 +839,9 @@ natively.
   latency.
 * `troubleshooting.md`: symptoms and fixes.
 * `configuration.md`: every configuration key.
-* `cli.md`, `audio-backends.md`, `web-portal.md`, `raspberry-pi-speaker.md`
-  and the rest of the documentation: `index.md` (in the source tree; the
-  package ships this guide, `configuration.md`, `rt-tuning.md` and
-  `troubleshooting.md`).
+* `cli.md`, `audio-backends.md`, `web-portal.md`, `network-vlans.md`,
+  `bundle.md`, `dsp.md`, `raspberry-pi-speaker.md` and the rest of the
+  documentation: `index.md` (in the source tree; the `tessera` package ships this
+  guide, `configuration.md`, `rt-tuning.md`, `network-vlans.md` and
+  `troubleshooting.md`, and `tessera-dsp` ships `dsp.md`).
 * `man tesserad`, `man tesseractl`, `man tessera-pw`, `man tessera-web`.

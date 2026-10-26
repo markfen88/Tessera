@@ -1,8 +1,12 @@
 //! Standalone OS networking. The root helper is deliberately independent of
 //! the audio daemon and web process, so their failures cannot cancel recovery.
 
+pub mod backend;
 pub mod engine;
+pub mod handoff;
 pub mod host;
+pub mod ifupdown;
+pub mod networkmanager;
 pub mod store;
 pub mod yaml;
 
@@ -11,7 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use tessera_state::network_profiles::{NETWORK_API, Reply, Request};
+use tessera_state::network_profiles::{Reply, Request};
 
 /// Default private IPC endpoint; accessible only to root and tessera-web.
 pub const SOCKET: &str = "/run/tessera-network/control.sock";
@@ -50,7 +54,7 @@ pub fn request(path: &Path, request: &Request) -> Result<Reply> {
     }
     stream.write_all(&data).map_err(|e| e.to_string())?;
     let reply: Reply = read_line(stream)?;
-    if reply.api != NETWORK_API {
+    if reply.api != request.api {
         return Err("Network helper API is incompatible; update the matching packages.".into());
     }
     Ok(reply)

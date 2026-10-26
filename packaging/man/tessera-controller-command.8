@@ -1,0 +1,13 @@
+.TH TESSERA-CONTROLLER-COMMAND 8 "" "Tessera" "System administration"
+.SH NAME
+tessera-controller-command \- Tessera system helper
+.SH SYNOPSIS
+.nf
+tessera-controller-command -n COMMAND [ARGUMENT ...]
+.fi
+.SH DESCRIPTION
+Bounded unprivileged adapter used by the compatibility runtime. Accepts only its flow replacement, reload and local control forms. It never grants privileges; use tesseractl for operator commands.
+.PP
+A flow report that names flows replaces the daemon's controller flow set. An empty report is applied only if the runtime has already applied a report in its current systemd invocation, so the empty report the runtime makes when it starts does not remove flows stored with tesseractl flows set. The invocation that last applied a report is kept in /var/lib/tessera-controller/flows-run.
+.SH SEE ALSO
+tesserad(8), tesseractl(1)

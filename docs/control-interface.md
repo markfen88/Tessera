@@ -36,7 +36,7 @@ configuration files are the other input: a reload is itself a command
 
 ## Stability
 
-`tessera-control-types` (`crates/tessera-control-types`, version 0.2.1) is the
+`tessera-control-types` (`crates/tessera-control-types`, version 0.3.0) is the
 typed public integration contract. Its rules:
 
 - Changes are **additive**. Most enums and structs are `#[non_exhaustive]`
@@ -49,7 +49,7 @@ typed public integration contract. Its rules:
   this way). The envelope version `v` is `1` (`WIRE_VERSION`).
 - The default features are `std` and `serde`; without default features the
   crate builds `no_std` with `alloc` (serde support is the feature `serde`).
-- During beta, consult the release notes and [integration contract](integration-contract.json)
+- Before the crate reaches 1.0, consult the release notes and [integration contract](integration-contract.json)
   before updating an independently versioned client.
 
 `tesseractl`'s human-readable output is **not** a stable interface; its
@@ -133,6 +133,7 @@ Request:
 |--------|---------|
 | `{"command": <Command>}` | change something; a change that restarts a device is refused with `confirmation_required` (below) |
 | `{"confirmed_command": {"command": <Command>, "expect": <token or null>}}` | change something the user has confirmed after seeing its impact |
+| `{"protocol_command": {"peer": "<controller identity>", "command": <SetProtocolFlows>}}` | trusted local protocol adapter, admin-only; preserves protocol origin and its confirmation exemption |
 | `{"query": <Query>}` | read something |
 | `"subscribe_events"` | turn this connection into an event stream |
 
@@ -167,6 +168,7 @@ The shapes above are the `tessera-control-types` `Request` and `Response` envelo
 
 | Command | Fields | `tesseractl` |
 |---------|--------|--------------|
+| `set_protocol_flows` | `flows` (complete array of `FlowSpec`, the `[[flow]]` fields with identical defaults; empty clears); retains host flows, refused by `[control] locked = ["flows"]` | `flows set FILE`, `flows clear` |
 | `set_device_name` | `device`, `name` (at most 31 bytes, no control characters, unique ignoring ASCII case) | `set-name` |
 | `set_channel_label` | `device`, `direction` (`rx`/`tx`), `channel`, `label` (`null` restores the default) | `set-label` |
 | `subscribe` | `device`, `rx_channel`, `tx_channel` (name), `tx_device` (name) | `subscribe` |
@@ -191,13 +193,14 @@ The shapes above are the `tessera-control-types` `Request` and `Response` envelo
 A key listed in `locked` in the configuration is refused with `locked`. A
 value outside its bounds is refused with `invalid` and the field and reason.
 Subscriptions are stored by name and kept while they do not resolve. The
-current daemon has no flow control: a subscription is `in_progress` until a
-static `[[flow]]` carries its rx channel, then `receiving` or `no_media`
-according to the media that arrives (see Status below and
+daemon itself has no flow control: a subscription is `in_progress` until a
+static `[[flow]]` or a controller flow carries its rx channel, then `receiving`
+or `no_media` according to the media that arrives (see Status below and
 [interoperability.md](interoperability.md)).
 
-There is no command for flows or bridges: they are configuration, and
-`reload_config` applies them.
+There is no command for host flows or bridges: they are configuration, and
+`reload_config` applies them. The flows a controller sets up are the exception:
+`set_protocol_flows` replaces that set as a whole.
 
 ---
 
@@ -232,12 +235,45 @@ response per event, all with the subscription request's `id`:
 | `clock_state_changed` | `status` (a `ClockStatus`) |
 | `clock_settings_changed` | `role`, `priority`, `origin` |
 | `network_settings_changed` | `selected` (or `null`), `origin` |
-| `config_reloaded` | none |
+| `config_reloaded` | none (legacy; implicit origin `config`) |
+| `config_reloaded_with_origin` | `origin` (`config`) |
+| `subscription_changed_with_origin` | `device`, `status`, `origin` (companion to the legacy event) |
+| `protocol_flows_changed` | `flows` (effective controller IDs), `origin` |
+| `locked_value_refused` | `field` (full path), `origin`, `attempted` (small value or `null`) |
+| `runtime_value_changed` | `field` (full path), `origin`; runtime intent queued for `state.toml` |
 
 `origin` is `{"cli":{"uid":N}}`, `"config"`, `"internal"`,
-`{"protocol":{"peer":"..."}}` or `{"api":{"principal":"..."}}` (the last two
-are not produced yet; the portal's commands arrive as `cli` with the portal's
-uid).
+`{"protocol":{"peer":"..."}}` or `{"api":{"principal":"..."}}`. The compatibility
+adapter uses peer `controller-compatibility`: its historical command supplies
+no remote controller address. Other socket commands, including the portal's,
+arrive as `cli` with the caller's uid. `protocol_command` is accepted only for
+`set_protocol_flows`, with ordinary admin authorization; audit metadata never
+grants permission or exempts other commands from confirmation.
+
+**Who owns the controller flow set.** There is one controller set in `state.toml`
+(`[[protocol_flows]]`), replaced as a whole by `set_protocol_flows` from any
+origin: `tesseractl flows set|clear`, a host, or the Controller compatibility
+runtime through its adapter. The set survives a restart of the daemon, and the
+compatibility runtime restarts with the daemon (`PartOf=`). The runtime knows no
+flows when it starts and reports an empty set; that report is not an instruction
+to remove flows someone else stored, so the adapter applies it by this rule:
+
+* The controller owns the flows it has submitted **in its current run** (one systemd
+  invocation of `tessera-controller@.service`, identified by `INVOCATION_ID`; the
+  adapter keeps the run that last applied a report in
+  `/var/lib/tessera-controller/flows-run`).
+* A report that names flows is applied: it replaces the set as a whole, like any
+  `set_protocol_flows`.
+* An empty report is applied only from a run that has already applied a report: the
+  controller then removes what it set. An empty report from a run that has applied
+  none (the one at start) is answered with success and ignored: the stored set, and
+  its running flows, stay as they are.
+* Explicit commands are never filtered: `tesseractl flows clear` and a
+  `set_protocol_flows` from another origin always apply, and a host's
+  `[control] locked = ["flows"]` still refuses every one of them.
+
+So `tesseractl flows set FILE` followed by `systemctl restart tesserad` leaves the
+flows stored and running with the controller runtime enabled.
 
 ```json
 {"v":1,"id":5,"result":{"ok":{"event":{"clock_settings_changed":{"role":"leader","priority":64,"origin":{"cli":{"uid":1000}}}}}}}
@@ -310,8 +346,8 @@ their media comes from, so `receiving` means that the channel is receiving media
 media comes from the `tx_channel` and `tx_device` named in the subscription.
 
 `effective_latency` is `null` today. `tesserad` does not implement the vendor
-control plane, so vendor controllers cannot route to it on their own
-([interoperability.md](interoperability.md)).
+control plane itself; the packaged Controller compatibility runtime submits the
+flows a controller sets up ([interoperability.md](interoperability.md)).
 
 ---
 

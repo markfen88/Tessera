@@ -1,0 +1,4 @@
+Description: ALSA PCM plugin for the tessera daemon
+ Provides the ALSA PCM device 'tessera', backed by the channels of a tessera
+ device, for applications that talk to ALSA directly. The user must be a
+ member of the tessera group.

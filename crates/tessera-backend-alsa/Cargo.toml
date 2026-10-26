@@ -12,11 +12,12 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-test = false
-doctest = false
 # `cdylib`: the ALSA plugin (installed as libasound_module_pcm_tessera.so).
 # `rlib`: the bridge for the daemon, and the tests.
 crate-type = ["cdylib", "rlib"]
+test = false
+bench = false
+doctest = false
 
 [features]
 default = ["plugin"]
@@ -30,11 +31,11 @@ plugin = []
 bridge = ["dep:alsa", "dep:tessera-media", "dep:tessera-resample", "dep:rtrb"]
 
 [dependencies]
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.2.1" }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.3.0" }
 libc = "0.2"
 nix = { version = "0.31", default-features = false, features = ["socket", "poll", "fs", "user"] }
-tessera-media = { path = "../tessera-media", version = "0.2.1", optional = true }
-tessera-resample = { path = "../tessera-resample", version = "0.2.1", optional = true }
+tessera-media = { path = "../tessera-media", version = "0.3.0", optional = true }
+tessera-resample = { path = "../tessera-resample", version = "0.3.0", optional = true }
 alsa = { version = "0.12", optional = true }
 rtrb = { version = "0.4", optional = true }
 

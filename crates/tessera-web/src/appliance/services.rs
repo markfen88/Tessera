@@ -429,9 +429,9 @@ fn code_text(code: Option<i32>) -> String {
 /// What the operator may do to a unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// `systemctl enable --now --no-reload`.
+    /// `systemctl enable --now`.
     Enable,
-    /// `systemctl disable --now --no-reload`.
+    /// `systemctl disable --now`.
     Disable,
     /// `systemctl restart`.
     Restart,
@@ -522,9 +522,9 @@ pub const UNITFILE_TEMPLATE: &str = "tessera-web-unitfile@";
 /// What the helper may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelperVerb {
-    /// `systemctl enable --now --no-reload`.
+    /// `systemctl enable --now`.
     Enable,
-    /// `systemctl disable --now --no-reload`.
+    /// `systemctl disable --now`.
     Disable,
     /// `systemctl restart`.
     Restart,
@@ -625,16 +625,17 @@ pub fn parse_instance(s: &str) -> Result<(HelperVerb, String), String> {
     Ok((verb, canonical_unit(&stem)))
 }
 
-/// What the helper runs as root for a checked instance.
+/// What the helper runs as root for a checked instance. Enable and disable let `systemctl`
+/// reload systemd afterwards (no `--no-reload`): the units that want a service are read from
+/// the links this changes, and without the reload a service that was switched off is brought
+/// back by the next start of the unit that wanted it (the EQ engine by the daemon), and one
+/// that was switched on is not.
 #[must_use]
 pub fn unitfile_args(verb: HelperVerb, unit: &str) -> Vec<String> {
     match verb {
-        HelperVerb::Enable | HelperVerb::Disable => vec![
-            verb.name().to_owned(),
-            "--now".to_owned(),
-            "--no-reload".to_owned(),
-            unit.to_owned(),
-        ],
+        HelperVerb::Enable | HelperVerb::Disable => {
+            vec![verb.name().to_owned(), "--now".to_owned(), unit.to_owned()]
+        }
         HelperVerb::Restart => vec!["restart".to_owned(), unit.to_owned()],
     }
 }
@@ -1195,17 +1196,11 @@ mod tests {
         let r = FakeRunner::default();
         // The three root commands, argv-exact.
         r.script(
-            &[
-                SYSTEMCTL,
-                "enable",
-                "--now",
-                "--no-reload",
-                "tesserad.service",
-            ],
+            &[SYSTEMCTL, "enable", "--now", "tesserad.service"],
             Output::ok(""),
         );
         r.script(
-            &[SYSTEMCTL, "disable", "--now", "--no-reload", "a.service"],
+            &[SYSTEMCTL, "disable", "--now", "a.service"],
             Output::ok(""),
         );
         r.script(&[SYSTEMCTL, "restart", "b.service"], Output::ok(""));
@@ -1215,21 +1210,15 @@ mod tests {
         assert_eq!(
             r.calls(),
             [
-                argv(&[
-                    SYSTEMCTL,
-                    "enable",
-                    "--now",
-                    "--no-reload",
-                    "tesserad.service"
-                ]),
-                argv(&[SYSTEMCTL, "disable", "--now", "--no-reload", "a.service"]),
+                argv(&[SYSTEMCTL, "enable", "--now", "tesserad.service"]),
+                argv(&[SYSTEMCTL, "disable", "--now", "a.service"]),
                 argv(&[SYSTEMCTL, "restart", "b.service"]),
             ]
         );
         // The exit code of systemctl is handed back.
         r.clear_calls();
         r.script(
-            &[SYSTEMCTL, "disable", "--now", "--no-reload", "b.service"],
+            &[SYSTEMCTL, "disable", "--now", "b.service"],
             Output::fail(5, "Failed to disable unit: ...\n"),
         );
         assert_eq!(run_unitfile(&r, &c, "disable-b").await, Ok(5));
@@ -1276,13 +1265,13 @@ mod tests {
         assert!(r.calls().is_empty(), "{:?}", r.calls());
         // A systemctl that cannot run is an error, not an exit code.
         r.script_error(
-            &[SYSTEMCTL, "enable", "--now", "--no-reload", "a.service"],
+            &[SYSTEMCTL, "enable", "--now", "a.service"],
             RunError::Timeout,
         );
         assert!(run_unitfile(&r, &c, "enable-a").await.is_err());
         assert_eq!(
             unitfile_args(HelperVerb::Disable, "a.service"),
-            ["disable", "--now", "--no-reload", "a.service"]
+            ["disable", "--now", "a.service"]
         );
         assert_eq!(
             unitfile_args(HelperVerb::Restart, "a.service"),

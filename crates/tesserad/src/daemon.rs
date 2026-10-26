@@ -57,7 +57,7 @@ use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use tessera_control_types::{Command, Origin};
 use tessera_state::{
     Config, ConfigPaths, Effect, Environment, MonotonicClock, Overrides, Paths, RestartReason,
-    StateEngine, load_config_with,
+    StateEngine, load_from_sources_with,
 };
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -290,8 +290,18 @@ fn start(
 
     // A read-only look at the effective configuration (the command line
     // included), to learn where the sockets go and how they are made.
+    // The reserved legacy file can only contain flows. It cannot affect
+    // socket setup, and only the state engine knows whether it is still
+    // eligible for fallback. Ignore it during this read-only preflight.
+    let mut sources =
+        tessera_state::loader::read_sources(&paths.config).map_err(|e| e.to_string())?;
+    sources.retain(|s| {
+        s.path
+            .file_name()
+            .is_none_or(|n| n != "90-probe-flows.toml")
+    });
     let pre =
-        load_config_with(&paths.config, &environment(), &overrides).map_err(|e| e.to_string())?;
+        load_from_sources_with(&sources, &environment(), &overrides).map_err(|e| e.to_string())?;
     let runtime_dir: PathBuf = opts
         .runtime_dir
         .clone()

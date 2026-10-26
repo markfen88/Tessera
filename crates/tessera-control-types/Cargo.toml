@@ -4,7 +4,7 @@ autoexamples = false
 autobenches = false
 name = "tessera-control-types"
 description = "Public command and event types (the future API contract; semver-stable)"
-version.workspace = true
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -18,10 +18,11 @@ default = ["std", "serde"]
 std = ["serde?/std"]
 serde = ["dep:serde"]
 
+[lib]
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
 
-
-[lib]
-test = false
-doctest = false
