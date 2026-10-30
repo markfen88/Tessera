@@ -47,9 +47,11 @@ has no unsigned bypass. `install` requires the same verification by default.
 
 ### Trusted release keys
 
-The program carries **no built-in key**: its compiled public-key list is empty, and
-an empty list fails closed. A release is accepted only when a key listed in
-`/etc/tessera/trusted-release-keys` vouches for it. The file holds bare minisign
+The program carries the project's release key from 0.5.2
+(`packaging/tessera-release.pub`, key id `4E330826A26C2812`); every GitHub release
+is signed with it. A release is accepted only when a trusted key vouches for it:
+the built-in key or one listed in `/etc/tessera/trusted-release-keys`. An empty
+list (0.5.1 and earlier installers without that file) fails closed. The file holds bare minisign
 public keys, one base64 key per line (no `.pub` comment header, no comments); it
 must be a regular file owned by root with mode exactly 0644, in directories that
 are owned by root and not writable by group or others, with no symlinks on the
@@ -308,6 +310,13 @@ TESSERA_DEB_REVISION=1 cargo xtask build-bundle
 # Ubuntu 24.04 arm64 only:
 TESSERA_DEB_REVISION=1 cargo xtask build-bundle --allow-ubuntu-24.04
 ```
+
+The files of a GitHub release come from the release workflow
+(`.github/workflows/release.yml`) with exactly these commands: Debian 13 amd64
+and arm64 in `debian:trixie` containers, the Ubuntu 24.04 arm64 bundle on an
+Ubuntu runner, all from the `v*` tag. It then signs them, records GitHub build
+provenance (`gh attestation verify <file> --repo markfen88/Tessera`) and
+publishes them once a maintainer approves.
 
 Package files appear in target/deb; bundles appear in target/bundle. A build
 produces artifacts and does not install them or restart services. On amd64 and arm64

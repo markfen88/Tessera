@@ -259,7 +259,7 @@ Exact human-readable output may change; use `--json` for integrations.
 
 ```
 $ tesseractl status
-tessera 0.5.1
+tessera 0.5.2
 
 DEVICE  NAME       RATE      BITS  LATENCY  RX  TX  LOCKED       ACCESS
 main    studio-pc  48000 Hz  24    6000 us  4   2   sample_rate  open

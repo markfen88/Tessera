@@ -37,14 +37,14 @@ alsa-bridge = ["dep:tessera-backend-alsa"]
 bridge-test-hooks = ["alsa-bridge"]
 
 [dependencies]
-tessera-control = { path = "../tessera-control", version = "0.5.1" }
-tessera-backend-alsa = { path = "../tessera-backend-alsa", version = "0.5.1", default-features = false, features = ["bridge"], optional = true }
+tessera-control = { path = "../tessera-control", version = "0.5.2" }
+tessera-backend-alsa = { path = "../tessera-backend-alsa", version = "0.5.2", default-features = false, features = ["bridge"], optional = true }
 tessera-control-types = { workspace = true }
-tessera-state = { path = "../tessera-state", version = "0.5.1" }
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.5.1" }
-tessera-clock = { path = "../tessera-clock", version = "0.5.1", features = ["linux"] }
-tessera-media = { path = "../tessera-media", version = "0.5.1" }
-tessera-discovery = { path = "../tessera-discovery", version = "0.5.1" }
+tessera-state = { path = "../tessera-state", version = "0.5.2" }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.5.2" }
+tessera-clock = { path = "../tessera-clock", version = "0.5.2", features = ["linux"] }
+tessera-media = { path = "../tessera-media", version = "0.5.2" }
+tessera-discovery = { path = "../tessera-discovery", version = "0.5.2" }
 rtrb = "0.4"
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros", "io-util", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }

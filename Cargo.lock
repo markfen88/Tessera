@@ -1831,18 +1831,18 @@ dependencies = [
 
 [[package]]
 name = "tessera-aes67"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "tessera-audio-ipc"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "nix",
 ]
 
 [[package]]
 name = "tessera-backend-alsa"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "alsa",
  "libc",
@@ -1855,11 +1855,11 @@ dependencies = [
 
 [[package]]
 name = "tessera-backend-jack"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "tessera-backend-pipewire"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "pipewire",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-bundle"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "minisign-verify",
  "nix",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-clock"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "nix",
@@ -1901,18 +1901,18 @@ dependencies = [
 
 [[package]]
 name = "tessera-control"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "tessera-control-types"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "tessera-discovery"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "futures-util",
  "mdns-sd",
@@ -1926,11 +1926,11 @@ dependencies = [
 
 [[package]]
 name = "tessera-media"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "tessera-network"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -1946,18 +1946,18 @@ dependencies = [
 
 [[package]]
 name = "tessera-package"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "tessera-bundle",
 ]
 
 [[package]]
 name = "tessera-proto"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "tessera-resample"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rubato",
  "tessera-media",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-state"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "argon2",
  "getrandom 0.4.3",
@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-web"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "argon2",
  "axum",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "tesseractl"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "tesserad"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "clap",
  "getrandom 0.4.3",
@@ -2607,7 +2607,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "minisign",
  "nix",

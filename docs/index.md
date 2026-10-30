@@ -1,6 +1,6 @@
 # Tessera documentation
 
-Tessera 0.5.1 is an experimental audio-over-IP runtime for Linux, interoperable with Dante® media
+Tessera 0.5.2 is an experimental audio-over-IP runtime for Linux, interoperable with Dante® media
 networks in the areas its [compatibility limits](interoperability.md) list; it is not certified.
 Start with the [README](../README.md) and [release notes](../CHANGELOG.md).
 

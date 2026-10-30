@@ -50,12 +50,12 @@ then checks both manifests and every payload file. Unsafe paths, links, duplicat
 checksum records, missing/unlisted files and mismatches are refused before apt.
 It changes no host state. `install` requires the same verification by default.
 
-The installer has no built-in key: the compiled public-key list is empty until
-the owner provisions first trust. `/etc/tessera/trusted-release-keys` can add bare
+The installer carries the project's release key (`packaging/tessera-release.pub`,
+key id `4E330826A26C2812`, from 0.5.2). `/etc/tessera/trusted-release-keys` can add bare
 public keys, one per line; it must be a root-owned regular file, exactly 0644,
 under root-owned parents without group/world write access or symlinks. A bundle
 that no trusted key vouches for is refused with `untrusted_key` and nothing is
-changed. For unsigned **development builds only** (or until a key is provisioned),
+changed. For unsigned **development builds only**,
 explicitly use `install --allow-unsigned`; integrity and lifecycle checks still
 apply. `verify` deliberately refuses an unsigned/untrusted bundle.
 

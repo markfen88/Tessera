@@ -1,0 +1,198 @@
+name: Release packages
+
+# Builds the Debian 13 packages and bundles (amd64, arm64) and the
+# experimental Ubuntu 24.04 arm64 bundle with the project's own `cargo xtask`
+# tasks. Pull requests build and check only. A `v*` tag also signs the release
+# (both checksum layers, docs/bundle.md "Trusted release keys"), records build
+# provenance and publishes the GitHub release; that job runs in the `release`
+# environment, which holds the signing key and waits for a maintainer's
+# approval.
+
+on:
+  pull_request:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  TESSERA_DEB_REVISION: 1
+
+jobs:
+  debian:
+    name: Debian 13 ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: debian:trixie
+    timeout-minutes: 75
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential pkg-config libasound2-dev \
+            dpkg-dev groff-base lintian systemd udev git curl ca-certificates xz-utils
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/tessera-dsp
+          key: debian13-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'packaging/dsp/dsp.lock') }}
+      - name: Install Rust (the version in rust-toolchain.toml)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build, check and bundle
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge
+          # A tag must be on main: the release version has no preview suffix.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then export TESSERA_RELEASE=1; fi
+          cargo xtask build-deb
+          cargo xtask check-deb
+          BUNDLE_DEB_DIR=target/deb cargo xtask build-bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessera-debian13-${{ matrix.arch }}
+          path: |
+            target/deb/*.deb
+            target/bundle/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  ubuntu-arm64:
+    name: Ubuntu 24.04 arm64 (experimental bundle)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/tessera-dsp
+          key: ubuntu2404-arm64-${{ hashFiles('Cargo.lock', 'packaging/dsp/dsp.lock') }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libasound2-dev dpkg-dev groff-base lintian
+          rustup show active-toolchain || rustup toolchain install
+      - name: Build the bundle
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then export TESSERA_RELEASE=1; fi
+          cargo xtask build-bundle --allow-ubuntu-24.04
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessera-ubuntu2404-arm64
+          path: target/bundle/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign and publish
+    if: github.ref_type == 'tag'
+    needs: [debian, ubuntu-arm64]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Install Rust (the version in rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Sign both checksum layers
+        env:
+          TESSERA_RELEASE_KEY: ${{ secrets.TESSERA_RELEASE_KEY }}
+          TESSERA_RELEASE_KEY_PASSWORD: ${{ secrets.TESSERA_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TESSERA_RELEASE_KEY" ] || [ -z "$TESSERA_RELEASE_KEY_PASSWORD" ]; then
+            echo "the release environment has no signing key; nothing is published" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}-${TESSERA_DEB_REVISION}"
+          epoch="$(git log -1 --format=%ct)"
+          # Artifacts keep their folders (deb/, bundle/): gather the files.
+          mkdir -p artifacts
+          find dist -type f \( -name '*.deb' -o -name '*.tar.gz' \) -exec mv -t artifacts {} +
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$TESSERA_RELEASE_KEY" > "$key"
+          export TESSERA_RELEASE_KEY_FILE="$key"
+          unset TESSERA_RELEASE_KEY
+          mkdir -p work bundles
+          # The installer authenticates each bundle's own checksums: sign the
+          # extracted tree, then archive it again as build-bundle does.
+          for archive in artifacts/tessera-bundle_*.tar.gz; do
+            name="$(basename "$archive" .tar.gz)"
+            tar -xpzf "$archive" -C work
+            cargo xtask release --version "$version" --bundle "work/$name"
+            cargo xtask verify-release --version "$version" --dir "work/$name"
+            tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+              -C work -czf "bundles/$name.tar.gz" "$name"
+          done
+          cargo xtask release --version "$version" --out release artifacts/*.deb bundles/*.tar.gz
+          unset TESSERA_RELEASE_KEY_FILE TESSERA_RELEASE_KEY_PASSWORD
+          # Verified with the key compiled into this release's installer.
+          cargo xtask verify-release --version "$version" --dir release
+          ls -l release
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          {
+            awk -v head="## $version" '$0 == head {found = 1; next} /^## / {if (found) exit} found' CHANGELOG.md
+            cat <<EOF
+
+          ### Verifying
+
+          \`SHA256SUMS\` is signed with the project's minisign key \`$(sed -n 2p packaging/tessera-release.pub)\`
+          (also in \`packaging/tessera-release.pub\` and compiled into \`tessera-bundle\`). Check it before
+          installing (docs/bundle.md, "Verifying and installing"):
+
+              minisign -Vm SHA256SUMS -p tessera-release.pub -x SHA256SUMS.minisig
+              sha256sum --check --strict SHA256SUMS
+
+          Build provenance: \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\`.
+          EOF
+          } > notes.md
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/* --verify-tag --title "Tessera $version" --notes-file notes.md
+          fi

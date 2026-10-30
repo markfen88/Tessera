@@ -401,7 +401,7 @@ the engine's state and names the usual causes in a notice.
 
 | Message or symptom | Cause and fix |
 |---|---|
-| `untrusted_key: no trusted release key is installed. Trusted keys are read from /etc/tessera/trusted-release-keys …` | the installer has no built-in key and the file is absent. Provision the release's public key from a channel you trust (`bundle.md`, "Trusted release keys"), or, for a development build only, install with `--allow-unsigned`. Nothing was changed |
+| `untrusted_key: no trusted release key is installed. Trusted keys are read from /etc/tessera/trusted-release-keys …` | an installer from 0.5.1 or earlier has no built-in key and the file is absent. Use the 0.5.2 or later bundle, or provision the release's public key from a channel you trust (`bundle.md`, "Trusted release keys"), or, for a development build only, install with `--allow-unsigned`. Nothing was changed |
 | `untrusted_key: the release is not signed by any trusted release key` | a key file exists but none of its keys vouches for this archive: wrong archive, wrong key or an unsigned build. Do not add a key because it came with the download |
 | `bad_signature`, `wrong_product`, `wrong_version`, `missing_file`, `checksum_mismatch` | the archive is damaged or altered, or its parts come from different releases. Download it again, check it against the release's `SHA256SUMS`, and extract it into an empty directory |
 | `malformed: trusted keys require a root-owned regular file with mode 0644`, or `trusted-key parent must be root-owned and not group/world-writable` | fix the owner and mode of `/etc/tessera/trusted-release-keys` and of its directories; symlinks are refused |
