@@ -25,9 +25,9 @@ bench = false
 
 [dependencies]
 tessera-control-types = { workspace = true }
-tessera-state = { path = "../tessera-state", version = "0.5.1" }
-tessera-network = { path = "../tessera-network", version = "0.5.1" }
-tesseractl = { path = "../tesseractl", version = "0.5.1" }
+tessera-state = { path = "../tessera-state", version = "0.5.2" }
+tessera-network = { path = "../tessera-network", version = "0.5.2" }
+tesseractl = { path = "../tesseractl", version = "0.5.2" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json", "query", "multipart"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "process", "signal", "sync", "time", "macros", "fs"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

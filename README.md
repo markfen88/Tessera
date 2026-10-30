@@ -1,7 +1,11 @@
-# Tessera 0.5.1
+# Tessera 0.5.2
 
-Tessera 0.5.1 tells network controllers the device latency range a change may
-use, and the portal can make a speaker's whole audio chain (bridge, ALSA bus,
+Tessera 0.5.2 is a packaging release: the software of 0.5.1, published as signed
+Debian 13 packages and bundles built by the public release workflow, with the
+project's release key built into the bundle installer.
+
+Tessera 0.5.1 told network controllers the device latency range a change may
+use, and let the portal make a speaker's whole audio chain (bridge, ALSA bus,
 CamillaDSP) follow the tessera device's sample rate.
 
 Tessera 0.5.0 added an opt-in native device role to the daemon (`--native-device`):
@@ -102,13 +106,16 @@ sudo tar --no-same-owner --strip-components=1 -xzf /root/tessera-addon/bundle.ta
 sudo /root/tessera-addon/tessera-bundle install --profile speaker --audio-card hw:CARD=MyDAC --yes
 ```
 
-**Trust.** The installer has no built-in key. It installs a bundle only when a key
-listed in the root-owned `/etc/tessera/trusted-release-keys` (mode 0644, one bare
-minisign public key per line) vouches for the release; otherwise it stops with
-`untrusted_key` and changes nothing. Until you have provisioned the key of a signed
-release, a build is installed with `tessera-bundle install --allow-unsigned`, an
-option for development builds that keeps every checksum, manifest and platform
-check. `tessera-bundle verify` has no such bypass. Check the release's
+**Trust.** From 0.5.2 the installer carries the project's release key
+(`packaging/tessera-release.pub`, key id `4E330826A26C2812`), and the release
+workflow signs every GitHub release with it. The installer installs a bundle only
+when a trusted key vouches for the release: the built-in key, or one listed in the
+root-owned `/etc/tessera/trusted-release-keys` (mode 0644, one bare minisign public
+key per line); otherwise it stops with `untrusted_key` and changes nothing. A
+bundle you build yourself is unsigned and is installed with
+`tessera-bundle install --allow-unsigned`, an option for development builds that
+keeps every checksum, manifest and platform check. `tessera-bundle verify` has no
+such bypass. Check the release's
 `SHA256SUMS` (and its `SHA256SUMS.minisig` with `minisign`) before you run
 anything you downloaded; [bundle guide](docs/bundle.md#verifying-and-installing).
 
@@ -254,7 +261,7 @@ SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge TESSERA_DEB_REVISION=1 cargo xtask
 ```
 
 Build on the target OS/architecture. `TESSERA_DEB_REVISION` makes the package
-revision explicit in source archives. Version `0.5.1` is packaged as `0.5.1-*`. To create an
+revision explicit in source archives. Version `0.5.2` is packaged as `0.5.2-*`. To create an
 add-on bundle, use `cargo xtask build-bundle`, or its explicit Ubuntu opt-in.
 The tree contains no shell or Python scripts: packaging, bundle and test entry
 points are `cargo xtask` tasks. See [build/package options](docs/bundle.md#building).

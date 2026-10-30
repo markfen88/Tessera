@@ -971,7 +971,10 @@ pub(crate) fn check(root: &Path, paths: &[PathBuf]) -> Result<()> {
         &problems.join("; "),
     );
     for deb in paths {
-        let lint = Command::new("lintian").arg(&deb).output()?;
+        let lint = Command::new("lintian")
+            .arg(&deb)
+            .output()
+            .map_err(|e| Failure::new(format!("lintian: {e} (install the lintian package)")))?;
         let report = String::from_utf8_lossy(&lint.stdout);
         print!("{report}");
         eprint!("{}", String::from_utf8_lossy(&lint.stderr));

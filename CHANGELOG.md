@@ -1,5 +1,28 @@
 # Tessera changelog
 
+## 0.5.2
+
+Tessera 0.5.2 is a packaging release. The daemon, the CLI and the portal are
+those of 0.5.1; the only reason for this version is to publish signed release
+packages and bundles, built and signed in public.
+
+### Packaging
+
+- Release workflow: GitHub Actions builds the Debian 13 packages and bundles
+  (amd64 and arm64, in `debian:trixie` containers) and the experimental Ubuntu
+  24.04 arm64 bundle from the `v*` tag with `cargo xtask build-deb`,
+  `check-deb` and `build-bundle`, signs both checksum layers, records GitHub
+  build provenance for every file and publishes the GitHub release once a
+  maintainer approves. Pull requests build and check the same way. It replaces
+  the bundle-only workflow, which failed because its runner had no `lintian`.
+- Release key: `packaging/tessera-release.pub` (minisign, key id
+  `4E330826A26C2812`) is built into `tessera-bundle`, so a release bundle
+  installs without `--allow-unsigned` and without provisioning
+  `/etc/tessera/trusted-release-keys`. An installer from 0.5.1 or earlier still
+  needs that file (or the option). [Verifying](docs/bundle.md#verifying-and-installing).
+- `cargo xtask check-deb` names `lintian` when it is not installed instead of
+  failing with `xtask: No such file or directory`.
+
 ## 0.5.1
 
 Tessera 0.5.1 answers a controller's question for the device latency range, and

@@ -9,8 +9,11 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
-/// First trust and offline/CI key custody remain an owner decision.
-pub const TRUSTED_KEYS: &[&str] = &[];
+/// The project's release key (`packaging/tessera-release.pub`, key id
+/// 4E330826A26C2812), from 0.5.2. Releases are signed by the public release
+/// workflow in its approval-gated `release` environment
+/// (`packaging/README.md`, "Signed releases").
+pub const TRUSTED_KEYS: &[&str] = &["RWQSKGyiJggzTsm26Ka9OgO4I+RhXqXDTrVl2LXP1ZHFBCJ2lsE/TlgE"];
 pub const OVERRIDE_FILE: &str = "/etc/tessera/trusted-release-keys";
 pub const MAX_SUMS: usize = 1024 * 1024;
 pub const MAX_SIGNATURE: usize = 4096;

@@ -1,3 +1,15 @@
+tessera (0.5.2-1) unstable; urgency=medium
+
+  A packaging release: tesserad, tesseractl and the portal are those of
+  0.5.1, so an upgrade changes no behaviour. A running tesserad is not
+  restarted by the upgrade.
+
+  tessera-bundle now trusts the project's release key (key id
+  4E330826A26C2812, packaging/tessera-release.pub in the sources), so a
+  signed release bundle installs without --allow-unsigned.
+
+ -- tessera maintainers <tessera@invalid>  Fri, 30 Oct 2026 16:00:00 +0000
+
 tessera (0.5.1-1) unstable; urgency=medium
 
   A running tesserad is not restarted by the upgrade: restart it when an
