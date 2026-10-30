@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-discovery"
 description = "mDNS/DNS-SD advertisement and browsing"
 version.workspace = true
@@ -9,14 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+autotests = false
+autoexamples = false
+autobenches = false
 
 [lints]
 workspace = true
-
-[lib]
-test = false
-bench = false
-doctest = false
 
 [dependencies]
 mdns-sd = "0.21"
@@ -28,3 +23,7 @@ thiserror = "2"
 serde = { version = "1", default-features = false }
 nix = { version = "0.31", default-features = false, features = ["net"] }
 
+[lib]
+test = false
+bench = false
+doctest = false

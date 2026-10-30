@@ -4,7 +4,7 @@
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query as Params, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -13,7 +13,10 @@ use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use serde_json::json;
-use tessera_control_types::{Command, CommandError, DeviceKey, Query, Reply, RequestBody};
+use tessera_control_types::{
+    Command, CommandError, DeviceKey, Direction, EndpointRef, Query, Reply, RequestBody,
+    RoutingChannelsQuery, RoutingCursor, RoutingDevicesQuery, RoutingReceiverQuery,
+};
 use tesseractl::client::ClientError;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -28,6 +31,16 @@ pub fn routes() -> Router<Shared> {
         .route("/metrics", get(metrics))
         .route("/config", get(config))
         .route("/devices/{key}", get(device))
+        .route("/routing/peer", post(crate::routing_peers::receive))
+        .route(
+            "/routing/peer-operation",
+            get(crate::routing_peers::operation).post(crate::routing_peers::retire),
+        )
+        .route("/routing/devices", get(routing_devices))
+        .route("/routing/carrier-recovery", get(routing_carriers))
+        .route("/routing/channels", get(routing_channels))
+        .route("/routing/receiver", get(routing_receiver))
+        .route("/routing/operation", get(routing_operation))
         .route("/commands", post(command))
         .route("/events", get(events))
         .route("/session", post(login).delete(logout))
@@ -67,6 +80,9 @@ fn code_of(e: &CommandError) -> StatusCode {
     match e {
         CommandError::Invalid { .. } => StatusCode::BAD_REQUEST,
         CommandError::Locked { .. } => StatusCode::CONFLICT,
+        CommandError::RoutingSnapshotExpired => StatusCode::CONFLICT,
+        CommandError::ReceiverReadTimeout => StatusCode::GATEWAY_TIMEOUT,
+        CommandError::ReceiverReadUnavailable { .. } => StatusCode::BAD_GATEWAY,
         // The command restarts something and was sent unconfirmed; the
         // error carries the impact. Nothing was changed.
         CommandError::ConfirmationRequired { .. } => StatusCode::CONFLICT,
@@ -76,11 +92,14 @@ fn code_of(e: &CommandError) -> StatusCode {
         CommandError::PermissionDenied => StatusCode::FORBIDDEN,
         CommandError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         CommandError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        // The device access lock refuses the change; a wrong PIN.
+        CommandError::AccessLocked { .. } => StatusCode::CONFLICT,
+        CommandError::IncorrectPin => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
-fn daemon_error(e: &ClientError) -> Response {
+pub(crate) fn daemon_error(e: &ClientError) -> Response {
     match e {
         ClientError::Command(c) => (
             code_of(c),
@@ -99,6 +118,11 @@ async fn query(st: &Shared, headers: &HeaderMap, q: Query) -> Response {
         Ok(Reply::Status(s)) => Json(s).into_response(),
         Ok(Reply::Metrics(m)) => Json(m).into_response(),
         Ok(Reply::Device(d)) => Json(d).into_response(),
+        Ok(Reply::RoutingDevices(page)) => Json(page).into_response(),
+        Ok(Reply::RoutingChannels(page)) => Json(page).into_response(),
+        Ok(Reply::RoutingReceiver(page)) => Json(page).into_response(),
+        Ok(Reply::ReceiverRecovery(review)) => Json(review).into_response(),
+        Ok(Reply::RuntimeCarrierRecovery(review)) => Json(review).into_response(),
         Ok(Reply::EffectiveConfig(t)) => (
             [(header::CONTENT_TYPE, "application/toml; charset=utf-8")],
             t,
@@ -114,6 +138,10 @@ async fn query(st: &Shared, headers: &HeaderMap, q: Query) -> Response {
 
 async fn status(State(st): State<Shared>, headers: HeaderMap) -> Response {
     query(&st, &headers, Query::Status).await
+}
+
+async fn routing_carriers(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    query(&st, &headers, Query::InspectRuntimeCarriers).await
 }
 
 async fn metrics(State(st): State<Shared>, headers: HeaderMap) -> Response {
@@ -135,6 +163,119 @@ async fn device(State(st): State<Shared>, headers: HeaderMap, Path(key): Path<St
     .await
 }
 
+#[derive(Debug, Deserialize)]
+struct DeviceParams {
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelParams {
+    endpoint: String,
+    generation: String,
+    direction: Direction,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiverParams {
+    endpoint: String,
+    generation: String,
+    first: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct OperationParams {
+    operation: Option<String>,
+}
+
+async fn routing_operation(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    params: Result<Params<OperationParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Params(params) = match params {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    query(
+        &st,
+        &headers,
+        Query::InspectReceiverOperation {
+            operation: params
+                .operation
+                .map(tessera_control_types::ReceiverExpectation),
+        },
+    )
+    .await
+}
+
+async fn routing_receiver(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    params: Result<Params<ReceiverParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if session_of(&st, &headers).is_none() {
+        return unauthorized();
+    }
+    let Params(params) = match params {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    query(
+        &st,
+        &headers,
+        Query::RoutingReceiver(RoutingReceiverQuery::new(
+            EndpointRef::new(params.endpoint, params.generation),
+            params.first.unwrap_or(1),
+        )),
+    )
+    .await
+}
+
+async fn routing_devices(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    params: Result<Params<DeviceParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if session_of(&st, &headers).is_none() {
+        return unauthorized();
+    }
+    let Params(params) = match params {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    query(
+        &st,
+        &headers,
+        Query::RoutingDevices(RoutingDevicesQuery::new(params.cursor.map(RoutingCursor))),
+    )
+    .await
+}
+
+async fn routing_channels(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    params: Result<Params<ChannelParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if session_of(&st, &headers).is_none() {
+        return unauthorized();
+    }
+    let Params(params) = match params {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    query(
+        &st,
+        &headers,
+        Query::RoutingChannels(RoutingChannelsQuery::new(
+            EndpointRef::new(params.endpoint, params.generation),
+            params.direction,
+            params.cursor.map(RoutingCursor),
+        )),
+    )
+    .await
+}
+
 /// `POST /commands`: one `Command` (JSON), with the `X-CSRF-Token` header.
 async fn command(State(st): State<Shared>, headers: HeaderMap, body: String) -> Response {
     let Some((_, s)) = session_of(&st, &headers) else {
@@ -151,11 +292,19 @@ async fn command(State(st): State<Shared>, headers: HeaderMap, body: String) -> 
         Ok(c) => c,
         Err(e) => return error(StatusCode::BAD_REQUEST, format!("not a command: {e}")),
     };
+    // A lock is reset without its PIN only by an administrator on the
+    // device (`device-lock.md` §9.1 L2); the daemon refuses it the portal too.
+    if matches!(cmd, Command::ResetAccessLock { .. }) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "reset the access lock on the device: tesseractl access reset",
+        );
+    }
     let kind = cmd.kind();
     let r = call(&st, RequestBody::Command(cmd)).await;
     tracing::info!(session = %s.id, command = kind, ok = r.is_ok(), "api command");
     match r {
-        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Ok(reply) => Json(json!({ "ok": true, "reply": reply })).into_response(),
         Err(e) => daemon_error(&e),
     }
 }

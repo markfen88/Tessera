@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use tessera_audio_ipc::{
     ClockOverlayReader, ClockOverlayWriter, ClockSnapshot, ClockState as IpcState, raw_monotonic_ns,
 };
+use tessera_clock::action::PortEvent;
 use tessera_clock::config::{LocalClock, PortConfig, Role};
 use tessera_clock::media_clock::{ClockPublisher, MediaClockSnapshot};
 use tessera_clock::platform::publisher::to_overlay;
@@ -53,7 +54,9 @@ use tessera_clock::platform::runner::RunnerEventKind;
 use tessera_clock::platform::{
     CommandError, OverlaySnapshot, RunnerCommand, RunnerConfig, RunnerHandle, TimestampMode, tai_ns,
 };
-use tessera_control_types::{ClockRole, ClockState, ClockStatus, Timestamping};
+use tessera_control_types::{
+    ClockRole, ClockState, ClockStatus, PREFERRED_LEADER_BELOW, Timestamping,
+};
 use tessera_state::config::Timestamping as TsMode;
 
 use crate::engine_thread::EngineHandle;
@@ -101,27 +104,45 @@ impl ClockPlan {
     }
 }
 
+/// The default `[clock] priority`.
+const DEFAULT_PRIORITY: u8 = 128;
+
 /// PROVISIONAL, tessera-only (confidence: guess; source: OQ-CLK-1, PTPv1 has
 /// no priority field): what `[clock] priority` (lower wins, default 128)
 /// makes a leader-capable port advertise. The PTPv1 comparison goes preferred
 /// flag, stratum, identifier, variance, and a lower priority never loses on
 /// any of them:
 ///
-/// * `preferred` for priority below 64 (a Dante-style "preferred leader"),
-/// * stratum 4 (the leader-capable default) up to priority 128, then one
-///   step worse for every further 32 (255 gives 7), so a node that is told
-///   to yield does so against default-priority nodes and hardware alike,
-/// * variance scaled around the reference default ([`priority_variance`]),
-///   the fine ordering between tessera nodes.
+/// * below [`PREFERRED_LEADER_BELOW`] (64): a Dante-style "preferred leader".
+///   Preferred changes the flag only, the stratum and variance are those of
+///   the default priority (clock-ptp.md §5.4 item 2: "Preferred changes byte
+///   77 and clock-status +0x06 only; stratum and variance stay as when not
+///   preferred"), so turning Preferred Leader on and off from a controller
+///   (priorities 10 and 128) changes nothing else on the wire. Between two
+///   preferred clocks only the lower MAC decides (§5.4 item 1), so the
+///   priority orders nothing among them;
+/// * otherwise stratum 0x2A (the leader-capable default, worse than the only
+///   hardware leader value seen, 0x29) up to priority 128, then one step
+///   worse for every further 32 (255 gives 0x2D), so a node that is told to
+///   yield does so against default-priority nodes and hardware alike, and
+///   the variance scaled around the reference default
+///   ([`priority_variance`]), the fine ordering between tessera nodes.
 ///
 /// The default priority therefore advertises exactly what a leader-capable
-/// port advertises with no configuration (stratum 4, not preferred,
-/// variance -4000). Never stratum 1 to 3, which could outrank hardware.
+/// port advertises with no configuration (stratum 0x2A, not preferred,
+/// variance -4000). Never a stratum at or below 0x29, which could outrank
+/// hardware (§5.4 item 2).
 #[must_use]
 pub fn priority_clock(priority: u8) -> LocalClock {
-    let yield_steps = priority.saturating_sub(128) / 32;
+    if priority < PREFERRED_LEADER_BELOW {
+        return LocalClock {
+            preferred: true,
+            ..priority_clock(DEFAULT_PRIORITY)
+        };
+    }
+    let yield_steps = priority.saturating_sub(DEFAULT_PRIORITY) / 32;
     LocalClock {
-        preferred: priority < 64,
+        preferred: false,
         stratum: LocalClock::leader_capable().stratum + yield_steps,
         variance: priority_variance(priority),
         ..LocalClock::leader_capable()
@@ -159,6 +180,39 @@ const HOLDOVER_WITHOUT_IFACE: Duration = Duration::from_secs(60);
 const FALLBACK_PERIOD: Duration = Duration::from_millis(250);
 /// A status row is re-sent at least this often while its numbers move.
 const REPORT_EVERY: Duration = Duration::from_secs(2);
+/// While another preferred leader is heard (clock-ptp.md §5.4 item 1), the
+/// status notice is renewed this often ...
+const RIVAL_NOTICE_EVERY: Duration = Duration::from_secs(5);
+/// ... and each renewal lasts this long, so the notice leaves the status
+/// shortly after the condition ends.
+const RIVAL_NOTICE_FOR: Duration = Duration::from_secs(15);
+
+/// Whether the preferred-rival notice must be (re)sent: a rival is heard
+/// (`rival != 0`) and it is new or the last notice for it is due a renewal.
+fn rival_notice_due(last: Option<(u64, Instant)>, rival: u64, now: Instant) -> bool {
+    rival != 0
+        && last.is_none_or(|(r, at)| r != rival || now.duration_since(at) >= RIVAL_NOTICE_EVERY)
+}
+
+/// A MAC held in the low 48 bits, as `aa:bb:cc:dd:ee:ff`.
+fn mac_text(mac: u64) -> String {
+    let b = mac.to_be_bytes();
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b[2], b[3], b[4], b[5], b[6], b[7]
+    )
+}
+
+/// The warning shown while this device leads (role auto or leader) and hears
+/// another preferred leader.
+fn rival_text(iface: &str, rival: u64) -> String {
+    format!(
+        "PTP on {iface}: this device leads and also hears Preferred Leader {}; both may be \
+         sending Sync. Keep one leader: set Preferred Leader on one device only, and do not \
+         force clock role `leader` beside a preferred device",
+        mac_text(rival)
+    )
+}
 
 enum Msg {
     Apply(Box<ClockPlan>),
@@ -412,6 +466,8 @@ struct Domain {
     /// look for it every [`IFACE_CHECK`], not every [`RETRY`], and keep a
     /// usable clock in holdover for [`HOLDOVER_WITHOUT_IFACE`].
     iface_lost: Option<Instant>,
+    /// The preferred rival last put in the status notice, and when.
+    rival_noticed: Option<(u64, Instant)>,
 }
 
 fn initial_snapshot(now: u64) -> ClockSnapshot {
@@ -461,6 +517,7 @@ impl Domain {
             started_on: None,
             last_iface_check: Instant::now(),
             iface_lost: None,
+            rival_noticed: None,
         };
         Ok((d, export))
     }
@@ -749,6 +806,12 @@ impl Domain {
                 RunnerEventKind::StateChanged { from, to } => {
                     tracing::info!("ptp {}: port {from:?} -> {to:?}", self.iface);
                 }
+                // Once per rival clock per episode (the port rate-limits it);
+                // the status notice follows the live condition (`rival_notice`).
+                RunnerEventKind::Port(PortEvent::PreferredRival { gm_uuid }) => {
+                    let mac = gm_uuid.iter().fold(0u64, |a, b| (a << 8) | u64::from(*b));
+                    tracing::warn!("{}", rival_text(&self.iface, mac));
+                }
                 RunnerEventKind::Port(e) => tracing::debug!("ptp {}: {e:?}", self.iface),
                 RunnerEventKind::RealtimeStep => {
                     tracing::warn!(
@@ -780,6 +843,28 @@ impl Domain {
                 self.iface
             );
         }
+    }
+
+    /// While the port leads and hears another preferred leader
+    /// (clock-ptp.md §5.4 item 1): the status notice to (re)send now, as
+    /// `(field, message)`. Renewed every [`RIVAL_NOTICE_EVERY`] while the
+    /// condition holds; it expires [`RIVAL_NOTICE_FOR`] after the last one.
+    fn rival_notice(&mut self, now: Instant) -> Option<(String, String)> {
+        let rival = self
+            .runner
+            .as_ref()
+            .map_or(0, |r| r.status().preferred_rival.load(Ordering::Relaxed));
+        if !rival_notice_due(self.rival_noticed, rival, now) {
+            if rival == 0 {
+                self.rival_noticed = None;
+            }
+            return None;
+        }
+        self.rival_noticed = Some((rival, now));
+        Some((
+            format!("clock.{}", self.iface),
+            rival_text(&self.iface, rival),
+        ))
     }
 
     fn status(&self) -> ClockStatus {
@@ -944,6 +1029,11 @@ fn manager(rx: &mpsc::Receiver<Msg>, mut domains: Vec<Domain>, engine: &EngineHa
                 d.reconcile(p, now);
             }
             d.drain_events();
+            if let Some((field, text)) = d.rival_notice(now) {
+                if !engine.report_notice(&field, text, RIVAL_NOTICE_FOR) {
+                    d.rival_noticed = None; // queue full: again on the next poll
+                }
+            }
             if d.primary {
                 d.fallback_publish(now);
             }
@@ -1267,6 +1357,53 @@ mod tests {
     }
 
     #[test]
+    fn preferred_changes_the_flag_only() {
+        // clock-ptp.md §5.4 item 2: stratum and variance stay as when not
+        // preferred; a controller toggles between priorities 10 and 128.
+        let default = priority_clock(DEFAULT_PRIORITY);
+        for p in 0..PREFERRED_LEADER_BELOW {
+            assert_eq!(
+                priority_clock(p),
+                LocalClock {
+                    preferred: true,
+                    ..default
+                },
+                "priority {p}"
+            );
+        }
+        assert_eq!(priority_clock(10).variance, -4000);
+        assert_eq!(priority_clock(10).stratum, 0x2A);
+        assert!(!priority_clock(PREFERRED_LEADER_BELOW).preferred);
+    }
+
+    #[test]
+    fn the_preferred_rival_notice_is_renewed_while_heard_and_stops_with_it() {
+        let t0 = Instant::now();
+        let a = 0x0200_0000_0001;
+        assert!(!rival_notice_due(None, 0, t0), "no rival, no notice");
+        assert!(rival_notice_due(None, a, t0), "a new rival at once");
+        let sent = Some((a, t0));
+        assert!(!rival_notice_due(sent, a, t0 + Duration::from_secs(1)));
+        assert!(rival_notice_due(sent, a, t0 + RIVAL_NOTICE_EVERY));
+        assert!(
+            rival_notice_due(sent, 0x0200_0000_0002, t0 + Duration::from_secs(1)),
+            "another rival at once"
+        );
+        // A renewal comes well before the notice expires.
+        assert!(RIVAL_NOTICE_EVERY * 2 < RIVAL_NOTICE_FOR);
+        assert_eq!(mac_text(a), "02:00:00:00:00:01");
+        assert!(rival_text("eth0", a).contains("02:00:00:00:00:01"));
+    }
+
+    #[test]
+    fn a_domain_without_a_runner_has_no_rival_notice() {
+        let (mut d, _fd) = Domain::new("x".into(), true).unwrap();
+        d.rival_noticed = Some((1, Instant::now()));
+        assert_eq!(d.rival_notice(Instant::now()), None);
+        assert_eq!(d.rival_noticed, None, "a later rival is noticed at once");
+    }
+
+    #[test]
     fn a_lower_priority_never_loses_on_any_comparison_criterion() {
         // The PTPv1 comparison order: preferred (set wins), stratum (lower
         // wins), identifier (equal here), variance (lower wins).
@@ -1278,10 +1415,10 @@ mod tests {
             assert!(key(p) <= key(p + 1), "priority {p}");
         }
         assert!(key(0) < key(255));
-        // Never slave-only, never a stratum that could outrank hardware (1-3).
+        // Never follower-only, never a stratum that could outrank hardware.
         for p in 0..=255u8 {
             let l = priority_clock(p);
-            assert!((4..=7).contains(&l.stratum), "priority {p}");
+            assert!((0x2A..=0x2D).contains(&l.stratum), "priority {p}");
         }
         assert!(priority_clock(10).preferred && !priority_clock(100).preferred);
     }

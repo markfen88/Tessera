@@ -427,7 +427,8 @@ impl Control {
                 }
                 self.reserve(Table::Tx);
                 self.push(Cmd::AddTx(rt));
-                self.stats.add_tx(&p.id, &p.device, metrics, send_failures);
+                self.stats
+                    .add_tx(&p.id, &p.device, &p.channels, metrics, send_failures);
                 self.applied.insert(
                     p.id.clone(),
                     Applied {

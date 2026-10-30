@@ -8,6 +8,26 @@ use toml::{Table, Value};
 use crate::config::{FlowConfig, extract};
 use crate::{Environment, Issue};
 
+/// Use exactly the geometry the authority currently exposes, including saved
+/// channel-count overrides. Flow validation and all-channel expansion must use
+/// the same view.
+pub(crate) fn effective_validation_config(
+    config: &crate::config::Config,
+    devices: &[crate::model::DeviceModel],
+) -> crate::config::Config {
+    let mut effective = config.clone();
+    for configured in &mut effective.devices {
+        if let Some(device) = devices.iter().find(|d| d.key.0 == configured.id) {
+            configured.rx_channels = device.rx_channels;
+            configured.tx_channels = device.tx_channels;
+            configured.sample_rate = device.sample_rate;
+            configured.encoding = device.encoding;
+            configured.latency_us = device.latency_us;
+        }
+    }
+    effective
+}
+
 /// Parse the compatibility runtime's restricted `[[flow]]` document.
 /// No other top-level keys, tables or scalar flow entries are accepted.
 /// Semantic validation against the effective device model happens in the actor.

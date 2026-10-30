@@ -26,7 +26,8 @@ use crate::config::{BackendKind, DiscoveryConfig, PortConflict};
 use crate::error::Error;
 use crate::ifaces;
 use crate::model::{
-    BrowseEvent, ConflictScope, DeviceServices, ResponderEvent, ServiceKind, ServiceSpec,
+    BrowseEvent, ConflictScope, DeviceServices, PublishedService, ResponderEvent, ServiceId,
+    ServiceInstance, ServiceKind, ServiceSpec,
 };
 use crate::names::{full_name, parse_full_name};
 use crate::provisional::DOMAIN;
@@ -96,6 +97,7 @@ struct Dev {
 #[derive(Debug, Default)]
 struct Shared {
     devices: HashMap<String, Dev>,
+    revision: u64,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -220,6 +222,19 @@ impl Builtin {
         })
     }
 
+    pub(crate) fn revision(&self) -> u64 {
+        lock(&self.shared).revision
+    }
+
+    pub(crate) fn dropped_events(&self) -> u64 {
+        self.events_dropped.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn published(&self) -> Vec<PublishedService> {
+        let automatic = ifaces::interface_addresses(&self.interfaces);
+        published(&lock(&self.shared), &automatic)
+    }
+
     fn info(&self, dev: &DeviceServices, s: &ServiceSpec) -> Result<ServiceInfo, Error> {
         let props: Vec<TxtProperty> = s
             .txt
@@ -318,6 +333,7 @@ impl Builtin {
                 last_announce: Instant::now(),
             },
         );
+        sh.revision += 1;
         Ok(())
     }
 
@@ -404,6 +420,7 @@ impl Builtin {
             dev.svcs = svcs;
             dev.spec = new;
             pending = to_register;
+            sh.revision += 1;
         }
         // Goodbyes first: re-announcing right behind them confuses caches.
         let withdrew = !waits.is_empty();
@@ -481,10 +498,15 @@ impl Builtin {
     }
 
     async fn withdraw_locked(&self, device: &str) -> Result<(), Error> {
-        let dev = lock(&self.shared)
-            .devices
-            .remove(device)
-            .ok_or_else(|| Error::NotRegistered(device.to_owned()))?;
+        let dev = {
+            let mut shared = lock(&self.shared);
+            let dev = shared
+                .devices
+                .remove(device)
+                .ok_or_else(|| Error::NotRegistered(device.to_owned()))?;
+            shared.revision += 1;
+            dev
+        };
         let mut waits = Vec::new();
         let mut events = Vec::new();
         for svc in &dev.svcs {
@@ -702,7 +724,38 @@ fn handle_daemon_event(sh: &mut Shared, ev: &DaemonEvent) -> Vec<ResponderEvent>
         }
         _ => {}
     }
+    if !out.is_empty() {
+        sh.revision += 1;
+    }
     out
+}
+
+fn published(shared: &Shared, automatic: &[IpAddr]) -> Vec<PublishedService> {
+    let mut rows = Vec::new();
+    for (key, dev) in &shared.devices {
+        let host = dev.host_assigned.as_deref().unwrap_or(&dev.spec.hostname);
+        for svc in dev.svcs.iter().filter(|svc| svc.announced) {
+            rows.push(PublishedService {
+                device: key.clone(),
+                service: ServiceInstance {
+                    id: ServiceId::new(
+                        svc.spec.kind,
+                        svc.assigned.as_deref().unwrap_or(&svc.spec.instance),
+                    ),
+                    host: format!("{host}.{DOMAIN}"),
+                    port: svc.spec.port,
+                    addresses: if dev.spec.addresses.is_empty() {
+                        automatic.to_vec()
+                    } else {
+                        dev.spec.addresses.clone()
+                    },
+                    txt: svc.spec.txt.clone(),
+                },
+            });
+        }
+    }
+    rows.sort_by(|a, b| (&a.device, &a.service.id).cmp(&(&b.device, &b.service.id)));
+    rows
 }
 
 /// One daemon browse of one kind, shared by all subscribers.
@@ -833,6 +886,7 @@ fn resolved_to_cache(
         id,
         SOURCE.to_owned(),
         SourceView {
+            interface: None,
             host: rs.host.clone(),
             port: rs.port,
             addresses,
@@ -870,6 +924,27 @@ mod tests {
             },
         );
         sh
+    }
+
+    #[test]
+    fn published_names_follow_current_registration_after_conflict_and_rename() {
+        let mut shared = dev_with("Original");
+        let dev = shared.devices.get_mut("d").unwrap();
+        dev.host_assigned = Some("conflict-host".into());
+        dev.svcs[0].assigned = Some("Assigned".into());
+        dev.svcs[0].announced = true;
+        let rows = published(&shared, &[]);
+        assert_eq!(rows[0].service.id.instance, "Assigned");
+        assert_eq!(rows[0].service.host, "conflict-host.local.");
+        shared.devices.remove("d");
+        assert!(published(&shared, &[]).is_empty());
+        let mut replacement = dev_with("Replacement");
+        let dev = replacement.devices.get_mut("d").unwrap();
+        dev.spec.hostname = "new-host".into();
+        dev.svcs[0].announced = true;
+        let rows = published(&replacement, &[]);
+        assert_eq!(rows[0].service.id.instance, "Replacement");
+        assert_eq!(rows[0].service.host, "new-host.local.");
     }
 
     #[test]

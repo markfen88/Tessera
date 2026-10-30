@@ -222,12 +222,22 @@ pub struct RxMetrics {
     /// Largest lateness seen since the last [`RxMetrics::take_max_lateness_ns`]
     /// (clamped at zero).
     pub max_lateness_ns: Counter,
+    /// Per wire channel, the largest absolute sample received since the last
+    /// [`RxMetrics::take_peaks`] (signal metering; one atomic max per channel
+    /// and packet, no allocation on the RT path).
+    pub peaks: alloc::boxed::Box<[Counter]>,
 }
 
 impl RxMetrics {
     /// Reads and resets the maximum lateness (for the periodic heartbeat).
     pub fn take_max_lateness_ns(&self) -> u64 {
         self.max_lateness_ns.take()
+    }
+
+    /// Reads and resets the per-channel peaks (for the periodic heartbeat),
+    /// as absolute values of left-justified 32-bit samples.
+    pub fn take_peaks(&self) -> impl Iterator<Item = u64> + '_ {
+        self.peaks.iter().map(Counter::take)
     }
 
     /// A plain copy of all counters.
@@ -348,6 +358,7 @@ impl<F: PacketFormat> RxFlow<F> {
         let capacity = cfg.buffer_capacity();
         let buffer = MediaBuffer::new(cfg.channels, capacity)?;
         let scratch = vec![0i32; cfg.channels * cfg.max_frames_per_packet];
+        let peaks = (0..cfg.channels).map(|_| Counter::default()).collect();
         Ok(Self {
             latency_samples: cfg.effective_latency_samples(),
             cap: capacity as u64,
@@ -357,7 +368,10 @@ impl<F: PacketFormat> RxFlow<F> {
             cfg,
             epoch: None,
             expected_next: None,
-            metrics: Arc::new(RxMetrics::default()),
+            metrics: Arc::new(RxMetrics {
+                peaks,
+                ..RxMetrics::default()
+            }),
         })
     }
 
@@ -440,6 +454,21 @@ impl<F: PacketFormat> RxFlow<F> {
         m.packets.inc();
         m.frames.add(frames);
         m.bytes.add(datagram.len() as u64);
+        let channels = m.peaks.len();
+        if channels > 0 {
+            if let Some(samples) = self.scratch.get(..decoded.frames * channels) {
+                for (ch, peak) in m.peaks.iter().enumerate() {
+                    let level = samples
+                        .iter()
+                        .skip(ch)
+                        .step_by(channels)
+                        .map(|s| s.unsigned_abs())
+                        .max()
+                        .unwrap_or(0);
+                    peak.record_max(u64::from(level));
+                }
+            }
+        }
 
         let now_ns = snap.media_ns;
         let now = ns_to_samples(now_ns, rate);

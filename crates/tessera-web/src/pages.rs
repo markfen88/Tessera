@@ -24,6 +24,9 @@ use crate::signal::{self, Sample};
 use crate::theme::{self, Theme};
 use crate::{Flash, Shared, call, clear_cookie, explain, peer, session_cookie, session_of};
 
+pub(crate) mod mapping;
+pub(crate) mod routing;
+
 const RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 const BITS: [u8; 3] = [16, 24, 32];
 
@@ -204,9 +207,10 @@ pub(crate) fn sub_class(s: &SubscriptionState) -> &'static str {
 /// The pill navigation: path and label, in order. The current page is the
 /// one whose path equals the page's `active`. Appliance mode prepends a
 /// "Speaker" entry and moves the overview ([`crate::appliance::nav`]).
-const NAV: [(&str, &str); 8] = [
+const NAV: [(&str, &str); 9] = [
     ("/", "Overview"),
     ("/devices", "Device"),
+    ("/routing", "Routing"),
     ("/network", "Network"),
     ("/clock", "Clock"),
     ("/metrics", "Metrics"),
@@ -308,7 +312,7 @@ fn top_bar(chrome: &Chrome, active: &str, s: Option<&Session>) -> Markup {
 fn footer(refresh: Option<u32>) -> Markup {
     html! {
         footer.foot {
-            span { "tessera-web " (env!("CARGO_PKG_VERSION")) }
+            span { "tessera-web " (tessera_control_types::BUILD_VERSION) }
             @match refresh {
                 Some(r) => { span data-live-status { "live updates every " (r) " s" } }
                 None => { span { "no automatic refresh" } }
@@ -600,7 +604,7 @@ pub async fn logout(
 pub(crate) fn devices_table(s: &Status) -> Markup {
     html! {
         div.table { table {
-            thead { tr { th { "Device" } th { "Name" } th { "Rate" } th { "Bits" } th { "Latency" } th { "RX" } th { "TX" } th { "Subscriptions" } } }
+            thead { tr { th { "Device" } th { "Name" } th { "Rate" } th { "Bits" } th { "Latency" } th { "RX" } th { "TX" } th { "Subscriptions" } th { "Access" } } }
             tbody {
                 @for d in &s.devices {
                     @let rec = d.subscriptions.iter().filter(|x| matches!(x.state, SubscriptionState::Receiving)).count();
@@ -613,6 +617,7 @@ pub(crate) fn devices_table(s: &Status) -> Markup {
                         td { (d.rx_channels.len()) }
                         td { (d.tx_channels.len()) }
                         td { (rec) " of " (d.subscriptions.len()) " receiving" }
+                        td { @if d.access_locked { strong { "locked" } } @else { "open" } }
                     }
                 }
             }
@@ -808,32 +813,54 @@ pub async fn set_primary(
 fn device_card(d: &DeviceStatus, csrf: &str) -> Markup {
     let key = &d.key.0;
     let locked = |k: &str| d.locked.iter().any(|l| l == k);
-    let mut rates = RATES.to_vec();
-    if !rates.contains(&d.sample_rate.0) {
-        rates.push(d.sample_rate.0);
-        rates.sort_unstable();
-    }
+    let subscriptions_locked = d
+        .routing_locks
+        .as_ref()
+        .is_some_and(|locks| locks.iter().any(|lock| lock == "subscriptions"));
+    // The values the daemon accepts now and why not, when it accepts nothing
+    // else (`device-settings.md` §3.3 item 10); a daemon that does not say
+    // gets the documented lists.
+    let (rates, rate_pin, bits, bits_pin) = match &d.formats {
+        Some(f) => (
+            f.sample_rates.clone(),
+            f.sample_rate_pin.clone(),
+            f.encodings.clone(),
+            f.encoding_pin.clone(),
+        ),
+        None => {
+            let mut rates = RATES.to_vec();
+            if !rates.contains(&d.sample_rate.0) {
+                rates.push(d.sample_rate.0);
+                rates.sort_unstable();
+            }
+            (rates, None, BITS.to_vec(), None)
+        }
+    };
     html! {
         section.card {
             h2 { (d.name) span.n { (key) } }
+            (access_lock_form(d, csrf))
             form.fields method="post" action=(dev_path(key, "settings")) {
                 input type="hidden" name="csrf" value=(csrf);
                 label { "Name" input type="text" name="name" value=(d.name) maxlength="31" disabled[locked("name")]; }
                 label { "Sample rate"
-                    select name="rate" disabled[locked("sample_rate")] {
+                    select name="rate" disabled[locked("sample_rate") || rate_pin.is_some()] {
                         @for r in &rates { option value=(r) selected[*r == d.sample_rate.0] { (khz(*r)) } }
                     }
                 }
                 label { "Encoding"
-                    select name="bits" disabled[locked("encoding")] {
-                        @for b in BITS { option value=(b) selected[b == d.encoding.0] { (b) " bit" } }
+                    select name="bits" disabled[locked("encoding") || bits_pin.is_some()] {
+                        @for b in &bits { option value=(b) selected[*b == d.encoding.0] { (b) " bit" } }
                     }
                 }
                 label { "Latency (µs)" input type="number" name="latency_us" min="1" value=(d.latency.0) disabled[locked("latency")]; }
                 button.btn.primary type="submit" { "Apply" }
                 @if !d.locked.is_empty() { p.muted { "Locked by the configuration: " (d.locked.join(", ")) } }
+                @if let Some(pin) = &rate_pin { p.muted { "Sample rate fixed at " (khz(d.sample_rate.0)) ": " (pin) "." } }
+                @if let Some(pin) = &bits_pin { p.muted { "Encoding fixed at " (d.encoding.0) " bit: " (pin) "." } }
             }
             p.muted { "A new rate or encoding rebuilds the flows; audio clients re-attach." }
+            p.muted { "Device names: 1–31 ASCII letters, digits or hyphens; no leading or trailing hyphen. Case is preserved; names are compared ignoring case. Renaming can break existing subscriptions." }
 
             h3 { "Channels" }
             (channels_form(
@@ -844,7 +871,42 @@ fn device_card(d: &DeviceStatus, csrf: &str) -> Markup {
                 &d.tx_channels.len().to_string(),
             ))
 
-            h3 { "Subscriptions" }
+            @if let Some(locks) = &d.routing_locks {
+                @if !locks.is_empty() { p.muted { "Host routing locks: " (locks.join(", ")) } }
+            }
+            @if d.rx_channels.iter().any(|channel| channel.routing.is_some()) {
+                h3 { "Receive inputs" }
+                p.muted { "RX is network → application. Packet activity does not verify the selected source." }
+                div.table { table {
+                    thead { tr { th { "RX input" } th { "Saved source intent" } th { "Carrier" } th { "Media observation" } th { "Source evidence" } } }
+                    tbody {
+                        @for channel in &d.rx_channels {
+                            @if let Some(route) = &channel.routing {
+                                tr {
+                                    td { (channel.channel.get()) " · " bdi { (channel.label) } }
+                                    td { @if let Some(intent) = &route.intent {
+                                        bdi { (intent.tx_channel) } " @ " bdi { (intent.tx_device) }
+                                    } @else { "None saved" } }
+                                    td { @match &route.carrier {
+                                        tessera_control_types::ReceiverCarrier::None => { "None" },
+                                        tessera_control_types::ReceiverCarrier::ConfigurationFlow { id } => { "Configuration flow: " bdi { (id) } },
+                                        tessera_control_types::ReceiverCarrier::ControllerFlow { id } => { "Controller flow: " bdi { (id) } },
+                                        _ => { "Unknown" },
+                                    } }
+                                    td { @if let Some(media) = &route.media { (output::sub_state(media)) } @else { "Unknown" } }
+                                    td { "Not source-verified" }
+                                }
+                            }
+                        }
+                    }
+                } }
+            }
+
+            p { a.btn.primary href="/routing" { "Open audio routing" } }
+            details {
+            summary { "Advanced: saved subscription intent (offline only)" }
+            h3 { "Saved subscription intent" }
+            p.muted { "These names record intent. They do not create a carrier or prove which source is arriving." }
             @if d.subscriptions.is_empty() { p.muted { "None." } } @else {
                 div.table { table {
                     thead { tr { th { "RX channel" } th { "From" } th { "State" } th { "Latency" } th {} } }
@@ -859,7 +921,7 @@ fn device_card(d: &DeviceStatus, csrf: &str) -> Markup {
                                     form.inline method="post" action=(dev_path(key, "unsubscribe")) {
                                         input type="hidden" name="csrf" value=(csrf);
                                         input type="hidden" name="rx_channel" value=(x.rx_channel.get());
-                                        button.btn.sm.danger type="submit" { "Remove" }
+                                        button.btn.sm.danger type="submit" disabled[subscriptions_locked] { "Remove saved intent" }
                                     }
                                 }
                             }
@@ -867,19 +929,32 @@ fn device_card(d: &DeviceStatus, csrf: &str) -> Markup {
                     }
                 } }
             }
-            form.fields method="post" action=(dev_path(key, "subscribe")) {
-                input type="hidden" name="csrf" value=(csrf);
-                label { "RX channel"
-                    select name="rx_channel" {
+            form.fields method="get" action=(dev_path(key, "mapping")) {
+                label { "Receiving input (RX)"
+                    select name="rx_channel" disabled[subscriptions_locked] {
                         @for c in &d.rx_channels { option value=(c.channel.get()) { (c.channel.get()) " · " (c.label) } }
                     }
                 }
-                label { "TX channel" input type="text" name="tx_channel" required placeholder="channel name"; }
-                label { "TX device" input type="text" name="tx_device" required placeholder="device name"; }
-                button.btn.primary type="submit" { "Subscribe" }
+                button.btn.primary type="submit" disabled[subscriptions_locked || d.rx_channels.is_empty()] { "Choose source device" }
+            }
+            details {
+            summary { "Advanced: enter an offline source by name" }
+            form.fields method="post" action=(dev_path(key, "subscribe")) {
+                input type="hidden" name="csrf" value=(csrf);
+                label { "RX channel"
+                    select name="rx_channel" disabled[subscriptions_locked] {
+                        @for c in &d.rx_channels { option value=(c.channel.get()) { (c.channel.get()) " · " (c.label) } }
+                    }
+                }
+                label { "TX channel" input type="text" name="tx_channel" required placeholder="channel name" disabled[subscriptions_locked]; }
+                label { "TX device" input type="text" name="tx_device" required placeholder="device name" disabled[subscriptions_locked]; }
+                button.btn type="submit" disabled[subscriptions_locked] { "Save subscription intent" }
+            }
             }
 
+            }
             h3 { "Channel labels" }
+            p.muted { "Custom labels: 1–31 ASCII characters; spaces and mixed case are allowed. Do not use =, . or @. Labels must be unique within each direction, ignoring case. Renaming a transmitter channel can break existing subscriptions." }
             div.cols {
                 @for (dir, title, chans, lock) in [("rx", "Receive", &d.rx_channels, "rx_channel_labels"), ("tx", "Transmit", &d.tx_channels, "tx_channel_labels")] {
                     div {
@@ -907,6 +982,147 @@ fn device_card(d: &DeviceStatus, csrf: &str) -> Markup {
             }
         }
     }
+}
+
+/// The device access lock (`device-lock.md` §9.3 L13): Lock with the PIN
+/// typed twice, or Unlock with it. A forgotten PIN is reset on the device
+/// itself (`tesseractl access reset`), never from here.
+fn access_lock_form(d: &DeviceStatus, csrf: &str) -> Markup {
+    let key = &d.key.0;
+    let pin = |name: &str, label: &str| {
+        html! {
+            label { (label)
+                input type="password" name=(name) inputmode="numeric" pattern="[0-9]{4}"
+                    minlength="4" maxlength="4" autocomplete="off" required;
+            }
+        }
+    };
+    html! {
+        details.access open[d.access_locked] {
+            summary {
+                "Access lock: "
+                @if d.access_locked { strong { "locked" } } @else { "open" }
+            }
+            @if d.access_locked {
+                p.flash.bad {
+                    "This device is locked: changes to its settings, channels and routing are refused, "
+                    "from controllers, this portal and the command line, until it is unlocked. "
+                    "Audio keeps flowing."
+                }
+                form.fields method="post" action=(dev_path(key, "unlock")) {
+                    input type="hidden" name="csrf" value=(csrf);
+                    (pin("pin", "PIN"))
+                    button.btn.primary type="submit" { "Unlock" }
+                }
+                p.muted { "Forgot the PIN? An administrator on the device runs " code { "tesseractl access reset" } "." }
+            } @else {
+                form.fields method="post" action=(dev_path(key, "lock")) {
+                    input type="hidden" name="csrf" value=(csrf);
+                    (pin("pin", "PIN (four digits)"))
+                    (pin("pin_confirm", "PIN again"))
+                    button.btn type="submit" { "Lock" }
+                }
+                p.muted {
+                    "Locking freezes this device's configuration and routing until it is unlocked with the same PIN. "
+                    "Existing audio keeps flowing. Controllers on the network cannot lock or unlock tessera yet."
+                }
+            }
+        }
+    }
+}
+
+/// The access lock forms. The PIN is never logged, echoed or kept.
+#[derive(Deserialize)]
+pub struct AccessForm {
+    csrf: String,
+    pin: Option<String>,
+    pin_confirm: Option<String>,
+}
+
+impl std::fmt::Debug for AccessForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccessForm { .. }")
+    }
+}
+
+/// `POST /devices/{key}/lock`: the PIN twice, equal and four digits.
+pub async fn device_lock(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Form(f): Form<AccessForm>,
+) -> Response {
+    let (token, s) = match need_post(&st, &headers, &f.csrf) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let pin = tessera_control_types::AccessPin::new(f.pin.unwrap_or_default());
+    if !pin.is_well_formed() {
+        return back(
+            &st,
+            &token,
+            "/devices",
+            Err("The PIN must be exactly four digits.".into()),
+        );
+    }
+    if f.pin_confirm.map(tessera_control_types::AccessPin::new) != Some(pin.clone()) {
+        return back(
+            &st,
+            &token,
+            "/devices",
+            Err("The two PINs differ; nothing was changed.".into()),
+        );
+    }
+    let o = drive(
+        &st,
+        &s,
+        vec![Command::LockAccess {
+            device: DeviceKey(key.clone()),
+            pin,
+        }],
+    )
+    .await;
+    settle(
+        &st,
+        &token,
+        &s,
+        &headers,
+        "/devices",
+        |_| format!("Device `{key}` locked."),
+        o,
+    )
+}
+
+/// `POST /devices/{key}/unlock`.
+pub async fn device_unlock(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Form(f): Form<AccessForm>,
+) -> Response {
+    let (token, s) = match need_post(&st, &headers, &f.csrf) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let pin = tessera_control_types::AccessPin::new(f.pin.unwrap_or_default());
+    let o = drive(
+        &st,
+        &s,
+        vec![Command::UnlockAccess {
+            device: DeviceKey(key.clone()),
+            pin,
+        }],
+    )
+    .await;
+    settle(
+        &st,
+        &token,
+        &s,
+        &headers,
+        "/devices",
+        |_| format!("Device `{key}` unlocked."),
+        o,
+    )
 }
 
 /// The channel counts form: submitting it shows what the change does and
@@ -1502,7 +1718,9 @@ pub async fn subscribe(
         &s,
         &headers,
         "/devices",
-        |_| "Subscription added.".into(),
+        |_| {
+            "Subscription saved. With the native device role the receiver connects it; with the compatibility runtime, existing flows are unchanged.".into()
+        },
         o,
     )
 }
@@ -1548,7 +1766,9 @@ pub async fn unsubscribe(
         &s,
         &headers,
         "/devices",
-        |_| "Subscription removed.".into(),
+        |_| {
+            "Saved subscription removed. With the native device role the receiver disconnects it; with the compatibility runtime, existing flows are unchanged.".into()
+        },
         o,
     )
 }

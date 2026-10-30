@@ -131,10 +131,16 @@ Usage: tesseractl status [OPTIONS]
 Options: the [global options](#global-options).
 
 Without `--device`: the version, a device table (`DEVICE NAME RATE BITS LATENCY
-RX TX LOCKED`), subscriptions, the primary interface and how it was chosen,
+RX TX LOCKED ACCESS`; `LOCKED` lists the keys the configuration pins, `ACCESS`
+is the [device access lock](#access), `locked` or `open`), subscriptions, the primary interface and how it was chosen,
 the clock settings, a `Clocks` table, a `Bridges` table and warnings (each
-section only when it has content). With `--device KEY`: that device in
-detail, with its channels and labels.
+section only when it has content). Below the device table, a line per sample
+rate or encoding that cannot change now and why: ``main: sample rate fixed at
+48000 Hz: bridge `speaker` runs its card at 48000 Hz (`sample_rate` in its
+configuration)``, or ``... locked by the configuration (`locked` of the device)``. With `--device KEY`: that
+device in detail, with the values it can be set to now (`can be set to: 44100,
+48000, ... Hz; 16, 24, 32 bit`, the same lists a network controller is
+offered), the same `fixed at` lines, and its channels and labels.
 
 ```sh
 tesseractl status
@@ -253,7 +259,8 @@ Arguments:
 ```
 
 Supported rates: 44100, 48000, 88200, 96000, 176400, 192000. Refused while an
-enabled `[[bridge]]` of the device pins another `sample_rate`. A rate change
+enabled `[[bridge]]` of the device pins another `sample_rate`. `tesseractl
+--device KEY status` lists the rates the device accepts now. A rate change
 rebuilds the device's flows and detaches its audio clients, which re-attach.
 
 #### `set-encoding`
@@ -376,20 +383,27 @@ Arguments:
   <RX_CHANNEL>  Local receive channel, from 1
 ```
 
-> `tesserad` does not implement the vendor control plane, so vendor
-> controllers cannot route to it on their own; see
-> [interoperability.md](interoperability.md).
+> What a subscription does depends on who serves the device role; see
+> [interoperability.md](interoperability.md). For a reviewed change with lock
+> and selection checks, prefer [`routing`](#routing) or the portal's Routing page.
 
 A subscription is stored by name, exactly as given (names are treated as
-case-sensitive, provisional; the daemon does not resolve them yet), and kept
-even while the transmitter is not there. **The current daemon does not
-implement flow control**, so a subscription carries no audio by itself; audio
-between devices is configured with `[[flow]]`
-([configuration.md](configuration.md#static-flows-provisional)). The subscription
-shows `in progress` until a rx flow carries its channel, then `receiving` while
-packets arrive and `no media` when they stop (shown about 2 to 3 s after the last
-packet; for a flow that never received one, 5 s after it started). That state is read from the flow,
-so it does not prove that the media comes from the transmitter named in the subscription.
+case-sensitive, provisional), and kept even while the transmitter is not there.
+
+* **With the native device role** (`--native-device`), the daemon resolves the
+  names through discovery and requests a flow for the input from the
+  transmitter; `unsubscribe` stops it. Changing one input does not interrupt the
+  others.
+* **Without it**, the daemon does not implement flow control, so a subscription
+  carries no audio by itself: audio between devices is configured with
+  `[[flow]]` ([configuration.md](configuration.md#static-flows-provisional)) or
+  submitted by the compatibility runtime.
+
+The subscription shows `in progress` until a rx flow carries its channel, then
+`receiving` while packets arrive and `no media` when they stop (shown about 2 to
+3 s after the last packet; for a flow that never received one, 5 s after it
+started). That state is read from the flow, so it does not prove that the media
+comes from the transmitter named in the subscription.
 
 ```sh
 tesseractl subscribe 2 "Out 2" stagebox-a
@@ -408,6 +422,48 @@ refuses either change. See [flow ownership](configuration.md#controller-flows-an
 `watch` displays lock-refusal, runtime-intent and controller-flow events with
 their origins. Runtime intent is queued for the ordinary debounced state write;
 it is visible in `config show --effective` immediately.
+
+### Routing
+
+#### `routing`
+
+```text
+Inspect discovered endpoints, channels and receiver-reported selections
+
+Usage: tesseractl routing [OPTIONS] <COMMAND>
+
+Commands:
+  inspect-carriers  Review retired-runtime carrier ownership; no routing change
+  release-carriers  Return the reviewed occurrences to current runtime management
+  grant-next-run    Authorize the next runtime start to replace reviewed first-device carriers
+  inspect           Inspect complete local receiver state after an uncertain operation
+  reconcile         Accept a fresh reviewed baseline; never retries a receiver mutation
+  execute           Execute one Connect, Replace or Disconnect using a fresh receiver token
+  devices           Show a page of available local and discovered endpoints
+  channels          Show advertised or local channel rows for a current endpoint
+  receiver          Read one page of selections currently reported by the receiver
+  help              Print this message or the help of the given subcommand(s)
+```
+
+The same operations as the portal's Routing page
+([web-portal.md](web-portal.md#routing)). The subcommands' arguments were not
+captured; from the source (`crates/tesseractl/src/cli.rs`):
+
+| Command | Arguments | Effect |
+|---------|-----------|--------|
+| `routing devices` | `[--cursor C]` | one page of local and discovered devices, each with its endpoint `id` and `generation` |
+| `routing channels` | `--endpoint ID --generation G rx\|tx [--cursor C]` | the device's channels in that direction |
+| `routing receiver` | `--endpoint ID --generation G [--first N]` | the selections the receiver reports, one page from input `N`; an input that can be changed carries a single-use expectation token (30 s), otherwise the page says why not |
+| `routing execute` | `--expectation TOKEN --change JSON` | one Connect, Replace or Disconnect (`ReceiverChange` JSON with source references from `routing channels`); the daemon checks the selection and the locks again, sends one command and reports the receiver's answer; it never retries |
+| `routing inspect`, `routing reconcile` | `[--operation ID]`; `--review TOKEN` | after an operation whose outcome is unknown: read the receiver's state, then accept it as the new baseline ([troubleshooting](troubleshooting.md#recovering-an-uncertain-routing-operation)) |
+| `routing inspect-carriers`, `release-carriers`, `grant-next-run` | `--review TOKEN` for the last two | carrier recovery for a host on the compatibility runtime ([troubleshooting](troubleshooting.md#reviewing-carriers-after-a-runtime-restart)) |
+
+`execute`, `reconcile` and the carrier commands are changes: root or the admin
+group. A source on another host must be listed in `[control] routing_sources`
+(its 16-digit device ID, shown in that device's column title on the Routing
+page) on the host that sends the change. A locked receiver (`[control] locked =
+["subscriptions"]`, or the device access lock) is refused before anything is
+sent.
 
 ### Clock and network
 
@@ -510,6 +566,58 @@ tesseractl config show --provenance
 tesseractl config show --effective
 ```
 
+### Access
+
+#### `access`
+
+```text
+The device access lock: freeze the device's configuration and routing behind a four-digit PIN
+
+Usage: tesseractl access [OPTIONS] <COMMAND>
+
+Commands:
+  lock    Lock the device: changes from any controller, the portal or this command are refused until it is unlocked
+  unlock  Unlock the device with the PIN it was locked with
+  reset   Unlock without the PIN, for a forgotten PIN (local administrators only)
+```
+
+The device access lock is the lock a controller of the vendor's protocol shows as a padlock.
+It is not the configuration's `locked` lists (the `LOCKED` column): those pin single keys to the files; the access lock
+freezes the whole device until it is unlocked.
+
+While a device is locked, every change to it is refused with `device ... is locked against changes (device access lock)`
+(exit 1), whoever asks: `tesseractl`, the web portal, a network controller (its write is answered with the refusal
+code of its protocol). That covers the name, labels, rate, encoding, latency, channel counts, saved subscriptions,
+receiver operations and carrier reviews of the local receiver, its controller flows, and a factory reset or clear
+configuration. Locking any device also refuses the host-wide clock role, clock priority (preferred leader) and
+primary-interface selection. What continues: reading (`status`, `watch`, routing reads), a configuration reload (the
+files are the administrator's), the audio already flowing, receivers already served by this device as a transmitter
+(a new receiver or a new channel is refused), heartbeats and controller status reads. Reboot requests from the network
+are refused too.
+
+The PIN is exactly four digits. It is never an argument (the process list would show it): on a terminal it is typed
+without echo (twice for `lock`); otherwise one line is read from standard input (`printf '%s\n' "$PIN" | tesseractl
+access unlock`). `tesseractl` checks its form before sending anything (exit 2). A wrong PIN answers `incorrect PIN`;
+after five wrong PINs for one device, unlocking it from the same kind of client (command line, portal, network) is
+refused with `rate limited` for 60 s. To change the PIN, unlock and lock again (locking a locked device is refused).
+
+`access reset` removes the lock without the PIN. Like every change it needs root or the admin group; in addition the
+daemon refuses it to the portal and to network controllers. It is the recovery for a forgotten PIN.
+
+The lock survives restarts and reloads. The daemon stores it in `access-lock.toml` beside `state.toml`
+([configuration](configuration.md#device-access-lock)). Controllers of the vendor's protocol see the state (lock-state
+record 0x1009) but cannot set or clear it yet, and tessera does not advertise itself as lockable to them.
+
+```sh
+tesseractl access lock            # asks for the PIN twice
+tesseractl --device main access unlock
+tesseractl access reset           # forgotten PIN; root or the admin group
+tesseractl --json status | jq '.devices[] | {key, access_locked}'
+```
+
+`--json status` adds `"access_locked": true` to a locked device (absent when it is open). `watch` prints
+`main: access lock set (cli uid 1000)` and `... removed ...` on each change.
+
 #### `completions`
 
 ```text
@@ -540,8 +648,19 @@ defaults, with what each does and why. Each option below overrides one key
 a value given on the command line wins over every file, is logged at start,
 and a reload (`SIGHUP`) does not change it. Prefer a drop-in in
 `/etc/tessera/config.d/` to an `ExecStart=` override: it can be reloaded.
-Only `--config-dir`, `--state-dir`, `--runtime-dir` and the action
-`--print-default-config` have no key.
+Only `--config-dir`, `--state-dir`, `--runtime-dir`, the action
+`--print-default-config` and the native device role's options have no key.
+
+The native device role (`--native-device`, `--native-vendor`,
+`--native-identify-secs`) is a deployment choice, not a configuration key: set
+it with `Environment=` lines in a drop-in for `tesserad.service`, on a host whose
+`tessera-controller@main` is stopped and disabled
+([how to enable it and go back](interoperability.md#native-device-role)). The
+environment variable takes `true` or `false` (`TESSERA_NATIVE_DEVICE=true`; `1`
+is refused). `--native-vendor` is the `--vendor` value of
+`/usr/lib/tessera/controller.args`. The help also lists two `--native-lab-*`
+options for protocol diagnostics; they are not product settings and are not
+described here.
 
 ```text
 tessera audio-over-IP daemon.
@@ -575,6 +694,23 @@ Options:
 
       --socket-mode <SOCKET_MODE>
           Permission bits of the sockets, octal. Overrides `[control] socket_mode` (default 0o660)
+
+      --native-device
+          Serve the device role in this daemon: ARC, CMC and device-info listeners and receive-flow negotiation. Only on a host whose compatibility runtime is stopped and disabled: the ports are bound exclusively and are not shared
+
+          [env: TESSERA_NATIVE_DEVICE=]
+
+      --native-vendor <NATIVE_VENDOR>
+          Vendor field of the native role's device-info messages (8 ASCII bytes, space padded)
+
+          [env: TESSERA_NATIVE_VENDOR=]
+          [default: tessera]
+
+      --native-identify-secs <NATIVE_IDENTIFY_SECS>
+          How long a controller's identify request stays visible (a notice on the portal's status page and in `tesseractl status`), seconds; at least 1
+
+          [env: TESSERA_NATIVE_IDENTIFY_SECS=]
+          [default: 10]
 
       --audio-socket <AUDIO_SOCKET>
           Listen on `audio.sock` for audio clients. Overrides `[audio] socket` (default auto)

@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-media"
 description = "Flow RX/TX, jitter buffers, packetization, sample-format conversion"
 version.workspace = true
@@ -9,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+autotests = false
+autoexamples = false
+autobenches = false
 
 [lints]
 workspace = true

@@ -237,7 +237,7 @@ impl<const N: usize> Port<N> {
         };
         let seq = self.dreq_seq;
         self.dreq_seq = seq.wrapping_add(1);
-        let l = &self.cfg.local;
+        let l = &self.advertised_local();
         let pb = &parent.body;
         let body = SyncBody {
             origin_timestamp: Timestamp::default(),
@@ -252,7 +252,10 @@ impl<const N: usize> Port<N> {
             gm_variance: pb.gm_variance,
             gm_preferred: pb.gm_preferred,
             gm_is_boundary_clock: pb.gm_is_boundary_clock,
-            sync_interval: self.cfg.delay_req_sync_interval_field,
+            sync_interval: self
+                .cfg
+                .delay_req_sync_interval_field
+                .unwrap_or(pb.sync_interval),
             local_clock_variance: l.variance,
             local_steps_removed: pb.local_steps_removed.saturating_add(1),
             local_clock_stratum: l.stratum,

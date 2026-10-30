@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-resample"
 description = "rubato-backed resamplers for tessera drift compensation (cubic and sinc quality levels)"
 version.workspace = true
@@ -12,16 +9,18 @@ rust-version = "1.87"
 license.workspace = true
 repository.workspace = true
 publish = false
+autotests = false
+autoexamples = false
+autobenches = false
 
 [lints]
 workspace = true
-
-[lib]
-test = false
-bench = false
-doctest = false
 
 [dependencies]
 tessera-media = { path = "../tessera-media" }
 rubato = { version = "5.0.1", default-features = false }
 
+[lib]
+test = false
+bench = false
+doctest = false

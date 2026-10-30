@@ -210,10 +210,6 @@ impl ServiceBrowser {
     pub fn path(&self) -> &str {
         self.0.path()
     }
-
-    pub async fn free(&self) -> zbus::Result<()> {
-        self.0.free().await
-    }
 }
 
 /// `org.freedesktop.Avahi.ServiceResolver`.
@@ -231,5 +227,9 @@ impl ServiceResolver {
 
     pub async fn free(&self) -> zbus::Result<()> {
         self.0.free().await
+    }
+
+    pub fn path(&self) -> &str {
+        self.0.path()
     }
 }

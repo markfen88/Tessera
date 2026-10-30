@@ -174,9 +174,21 @@ pub struct TxMetrics {
     pub resyncs: Counter,
     /// Largest delay between a packet's release time and when it was sent.
     pub max_send_lag_ns: Counter,
+    /// Per wire position, the largest absolute sample sent since the last
+    /// [`TxMetrics::take_peaks`] (signal metering).
+    pub peaks: alloc::boxed::Box<[Counter]>,
+    /// Monotonic time (ns) of the latest datagram the flow's receiver sent
+    /// back (a keepalive), 0 if none yet. Written by the I/O loop that owns
+    /// the socket; read by the control plane to expire silent receivers.
+    pub last_keepalive_ns: Counter,
 }
 
 impl TxMetrics {
+    /// Reads and resets the per-position peaks (for the periodic heartbeat).
+    pub fn take_peaks(&self) -> impl Iterator<Item = u64> + '_ {
+        self.peaks.iter().map(Counter::take)
+    }
+
     /// A plain copy of all counters.
     #[must_use]
     pub fn snapshot(&self) -> TxSnapshot {
@@ -271,7 +283,12 @@ impl<F: PacketFormat> TxFlow<F> {
             next_ts: None,
             epoch: None,
             dither: cfg.dither_seed.map(Dither::new),
-            metrics: Arc::new(TxMetrics::default()),
+            metrics: Arc::new(TxMetrics {
+                peaks: (0..cfg.channel_map.len())
+                    .map(|_| Counter::default())
+                    .collect(),
+                ..TxMetrics::default()
+            }),
             cfg,
             format,
         })
@@ -281,6 +298,12 @@ impl<F: PacketFormat> TxFlow<F> {
     #[must_use]
     pub fn metrics(&self) -> Arc<TxMetrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// The metrics, borrowed (no reference count change on the RT path).
+    #[must_use]
+    pub fn metrics_ref(&self) -> &TxMetrics {
+        &self.metrics
     }
 
     /// The configuration.
@@ -434,11 +457,18 @@ impl<F: PacketFormat> TxFlow<F> {
         let fpp = self.cfg.frames_per_packet;
         let channels = self.cfg.channel_map.len();
         let mut underrun = 0u64;
-        for (plane, map) in self.planes.chunks_exact_mut(fpp).zip(&self.cfg.channel_map) {
+        for ((plane, map), peak) in self
+            .planes
+            .chunks_exact_mut(fpp)
+            .zip(&self.cfg.channel_map)
+            .zip(m.peaks.iter())
+        {
             match map {
                 Some(src_ch) => {
                     let valid = source.read(*src_ch, ts, plane).min(fpp);
                     underrun += (fpp - valid) as u64;
+                    let level = plane.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                    peak.record_max(u64::from(level));
                 }
                 None => plane.iter_mut().for_each(|s| *s = 0),
             }
@@ -694,6 +724,37 @@ mod tests {
         let (_, s) = decode(&f, &buf[..p.len]);
         assert_eq!(&s[..3], &[7 << 8, 0, 5 << 8]);
         // The silent position is not an underrun.
+        assert_eq!(tx.metrics().snapshot().underrun_samples, 0);
+    }
+
+    #[test]
+    fn repeated_source_is_encoded_in_each_wire_slot() {
+        let f = ReferenceFormat::new(2, RATE, WireFormat::BE24).unwrap();
+        let mut cfg = TxConfig::new(RATE, 2, 8);
+        cfg.channel_map = vec![Some(0), Some(0)];
+        let mut tx = TxFlow::new(cfg, f).unwrap();
+        let mut src = MediaBuffer::new(1, 8192).unwrap();
+        let clk = Clk::new(T0);
+        let mut buf = vec![0u8; tx.packet_len()];
+        tx.poll(&clk, &mut src, &mut buf).unwrap();
+        let ts = tx.next_timestamp().unwrap();
+        let samples = [1, 2, 3, 4, 5, 6, 7, 8].map(|s| s << 8);
+        src.write(0, ts, &samples);
+        clk.now.set(tx.next_due_ns().unwrap());
+        let TxPoll::Sent(p) = tx.poll(&clk, &mut src, &mut buf).unwrap() else {
+            panic!()
+        };
+        let (_, decoded) = decode(&f, &buf[..p.len]);
+        assert_eq!(
+            decoded,
+            samples.into_iter().flat_map(|s| [s, s]).collect::<Vec<_>>()
+        );
+        // Each wire position meters the samples it carried.
+        assert_eq!(
+            tx.metrics().take_peaks().collect::<Vec<_>>(),
+            [8 << 8, 8 << 8]
+        );
+        assert_eq!(tx.metrics().take_peaks().collect::<Vec<_>>(), [0, 0]);
         assert_eq!(tx.metrics().snapshot().underrun_samples, 0);
     }
 

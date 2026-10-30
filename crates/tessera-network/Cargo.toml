@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-network"
 description = "Privileged, recoverable standalone VLAN configuration"
 version.workspace = true
@@ -9,20 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-
-[lib]
-test = false
-bench = false
-doctest = false
-
-[[bin]]
-name = "tessera-network"
-path = "src/main.rs"
-test = false
-bench = false
+autotests = false
+autoexamples = false
+autobenches = false
 
 [dependencies]
-tessera-state = { path = "../tessera-state", version = "0.3.0" }
+tessera-state = { path = "../tessera-state", version = "0.5.0" }
 tessera-control-types = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,3 +24,14 @@ nix = { version = "0.31", default-features = false, features = ["fs", "user", "s
 
 [lints]
 workspace = true
+
+[lib]
+test = false
+bench = false
+doctest = false
+
+[[bin]]
+name = "tessera-network"
+path = "src/main.rs"
+test = false
+bench = false

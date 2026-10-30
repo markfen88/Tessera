@@ -14,7 +14,10 @@ pub enum Role {
     Follower,
     /// Leader-capable: the best-master comparison decides.
     Auto,
-    /// Always the leader, whatever it hears (lab and isolated networks).
+    /// Always the leader, whatever it hears (lab and isolated networks). It
+    /// never yields, also not to a preferred clock (spec:5.4: item 1's
+    /// yielding applies to role auto only); hearing one while leading is
+    /// reported ([`crate::action::PortEvent::PreferredRival`]).
     Leader,
 }
 
@@ -119,8 +122,9 @@ pub struct PortConfig {
     /// Number of path-delay measurements taken at one per sync interval after
     /// a parent is selected, before the randomised mean interval applies.
     pub delay_req_startup_burst: u8,
-    /// Value written into the syncInterval field of our Delay_Req.
-    pub delay_req_sync_interval_field: i8,
+    /// Value written into the syncInterval field of our Delay_Req; `None`
+    /// copies the parent's last Sync, as followers seen do (spec:5.4 item 4).
+    pub delay_req_sync_interval_field: Option<i8>,
     /// Syncs needed to qualify a foreign master.
     pub foreign_master_threshold: u8,
     /// Qualification window in sync intervals.
@@ -195,7 +199,7 @@ impl PortConfig {
             listen_intervals: p::LISTEN_INTERVALS,
             delay_req_interval_log2: p::DELAY_REQ_INTERVAL_LOG2,
             delay_req_startup_burst: 6,
-            delay_req_sync_interval_field: p::DELAY_REQ_SYNC_INTERVAL_FIELD,
+            delay_req_sync_interval_field: None,
             foreign_master_threshold: p::FOREIGN_MASTER_THRESHOLD,
             foreign_master_window: p::FOREIGN_MASTER_WINDOW,
             bmc: compare_std2002,

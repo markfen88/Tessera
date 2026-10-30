@@ -31,6 +31,10 @@ use crate::netif::IfInfo;
 /// (ADR 0011: 32 frames at 48 kHz), nanoseconds.
 pub const DEFAULT_PACKET_PERIOD_NS: u64 = 666_667;
 
+/// In [`FlowPlan::channels`]: a wire position no device channel takes (an rx
+/// flow on a multicast group lists it as channel 0).
+pub const UNUSED: u32 = u32::MAX;
+
 /// A value that never makes two plans differ.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ignored<T>(pub T);
@@ -52,7 +56,8 @@ pub struct FlowPlan {
     pub device: String,
     /// `rx` or `tx`.
     pub direction: Direction,
-    /// Device channels (0-based) in wire order.
+    /// Device channels (0-based) in wire order; [`UNUSED`] for a position
+    /// no device channel takes.
     pub channels: Vec<u32>,
     /// Sample rate.
     pub rate: u32,
@@ -62,7 +67,8 @@ pub struct FlowPlan {
     pub latency_ns: u64,
     /// Largest latency the device may be configured to, nanoseconds.
     pub max_latency_ns: u64,
-    /// Local address to bind.
+    /// Local address to bind; for rx, a multicast group to bind and join on
+    /// the interface (`flows-media.md` §5).
     pub local: Ipv4Addr,
     /// rx: local port; tx: destination port.
     pub port: u16,
@@ -165,15 +171,30 @@ fn plan_one(
         Direction::Rx => dev.rx_channels,
         Direction::Tx => dev.tx_channels,
     };
+    let group = f.direction == Direction::Rx && f.local_address.is_some_and(|a| a.is_multicast());
     let channels: Vec<u32> = if f.channels.is_empty() {
         (0..u32::from(count)).collect()
     } else {
-        f.channels.iter().map(|c| u32::from(*c) - 1).collect()
+        f.channels
+            .iter()
+            .map(|c| u32::from(*c).checked_sub(1).unwrap_or(UNUSED))
+            .collect()
     };
     if channels.is_empty() {
         return Err("the flow carries no channels".into());
     }
-    if channels.iter().any(|c| *c >= u32::from(count)) {
+    // 0 is an unused position in a group listener and a silent one in a tx
+    // flow (`control-flows.md` §1); a tx flow still needs one real channel.
+    if channels.contains(&UNUSED) && !group && f.direction == Direction::Rx {
+        return Err("channel numbers start at 1".into());
+    }
+    if f.direction == Direction::Tx && channels.iter().all(|c| *c == UNUSED) {
+        return Err("the flow carries no channels".into());
+    }
+    if channels
+        .iter()
+        .any(|c| *c != UNUSED && *c >= u32::from(count))
+    {
         return Err(format!(
             "a channel is beyond the device's {count} channel(s) in that direction"
         ));
@@ -296,8 +317,19 @@ pub fn build_rx(
     let flow = RxFlow::new(cfg, fmt).map_err(|e| e.to_string())?;
     let metrics = flow.metrics();
     let counters = Arc::new(RxFlowCounters::default());
+    // A multicast group is bound and joined, and needs no keepalives: there
+    // is no unicast session to keep alive (`flows-media.md` §5).
+    let group = p.local.is_multicast();
     let sock = match reuse {
         Some(s) => RxSock::from_socket(s, t.socket_buffer, t.rx_batch, cap),
+        None if group => RxSock::join(
+            SocketAddrV4::new(p.local, p.port),
+            &p.interface,
+            p.ifindex,
+            t.socket_buffer,
+            t.rx_batch,
+            cap,
+        ),
         None => RxSock::bind(
             SocketAddrV4::new(p.local, p.port),
             &p.interface,
@@ -307,6 +339,14 @@ pub fn build_rx(
         ),
     }
     .map_err(|e| format!("cannot listen on {}:{}: {e}", p.local, p.port))?;
+    let keepalive = if group {
+        KeepaliveConfig {
+            interval_ns: 0,
+            ..KeepaliveConfig::default()
+        }
+    } else {
+        p.keepalive.0.unwrap_or(t.keepalive)
+    };
     let dup = sock
         .try_clone_socket()
         .map_err(|e| format!("cannot duplicate the socket: {e}"))?;
@@ -333,7 +373,7 @@ pub fn build_rx(
             last_rx: 0,
             seen: false,
             stalled: false,
-            keepalive: Keepalive::new(p.keepalive.0.unwrap_or(t.keepalive)),
+            keepalive: Keepalive::new(keepalive),
             counters: Arc::clone(&counters),
         }),
     })
@@ -365,6 +405,13 @@ pub fn build_tx(p: &FlowPlan, key: u64, device_ix: u32, sock_key: u64) -> Result
         .ok_or_else(|| "a tx flow needs a destination address".to_owned())?;
     let fmt = AnyFormat::build(p.format, p.channels.len(), p.rate, p.bits)?;
     let mut cfg = TxConfig::new(p.rate, p.channels.len(), p.fpp as usize);
+    // A silent position is sent as zeros without reading a ring.
+    cfg.channel_map = p
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (*c != UNUSED).then_some(i))
+        .collect();
     cfg.send_offset_ns = p.send_offset_ns;
     cfg.max_lag_ns = p.max_lag_ns.or(Some(p.default_lag_ns.0.max(1)));
     cfg.max_payload = p.mtu_payload as usize;
@@ -521,6 +568,56 @@ mod tests {
         let (p, e) = plan(f, &["eth0"]);
         assert!(e.is_empty());
         assert_eq!(p[0].channels, vec![2, 0], "wire order is kept");
+    }
+
+    #[test]
+    fn a_tx_flow_sends_an_empty_position_as_silence() {
+        // `control-flows.md` §1: channel id 0 is an empty position.
+        let mut f = flow(Direction::Tx);
+        f.channels = vec![1, 0];
+        let (p, e) = plan(f.clone(), &["eth0"]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(p[0].channels, vec![0, UNUSED]);
+        let tx = build_tx(&p[0], 2, 0, 7).unwrap().rt;
+        assert_eq!(tx.flow.config().channel_map, vec![Some(0), None]);
+        // Silent positions only: nothing to send.
+        f.channels = vec![0, 0];
+        let (_, e) = plan(f, &["eth0"]);
+        assert!(e[0].1.contains("no channels"), "{e:?}");
+    }
+
+    #[test]
+    fn a_group_listener_keeps_its_unused_positions_and_sends_no_keepalives() {
+        let group = Ipv4Addr::new(239, 255, 77, 2);
+        let mut f = flow(Direction::Rx);
+        f.local_address = Some(group);
+        f.channels = vec![0, 3, 0];
+        let (p, e) = plan(f.clone(), &["eth0"]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(p[0].channels, vec![UNUSED, 2, UNUSED], "wire width kept");
+        assert_eq!(p[0].local, group);
+        // Outside a group listener 0 is not a channel.
+        let mut u = f.clone();
+        u.local_address = None;
+        let (_, e) = plan(u, &["eth0"]);
+        assert!(e[0].1.contains("start at 1"), "{e:?}");
+        // Built on the loopback interface: bound to the group, joined, and
+        // silent towards the sender.
+        let mut p = p[0].clone();
+        p.interface = "lo".into();
+        p.ifindex = nix::net::if_::if_nametoindex("lo").unwrap();
+        p.port = 0;
+        p.keepalive = Ignored(Some(KeepaliveConfig::default()));
+        let mut b = build_rx(&p, 1, 0, &Tuning::default(), None).unwrap();
+        assert_eq!(b.rt.chan, vec![UNUSED, 2, UNUSED]);
+        let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 4321);
+        b.rt.keepalive.on_media(src, 1);
+        assert_eq!(
+            b.rt.keepalive.poll(1),
+            None,
+            "no keepalive to a group's sender"
+        );
+        assert!(!b.rt.keepalive.active());
     }
 
     #[test]

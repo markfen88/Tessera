@@ -171,6 +171,3 @@ impl<'a> Message<'a> {
         Ok(w.len())
     }
 }
-
-#[cfg(test)]
-mod tests;

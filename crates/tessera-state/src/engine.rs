@@ -20,17 +20,21 @@ use std::time::Duration;
 
 use tessera_control_types::{
     BridgeDirection as WireBridgeDirection, BridgeState, BridgeStatus, Channel, ChannelStatus,
-    ClockSettings, ClockStatus, Command, CommandError, DeviceKey, DeviceStatus, Direction,
-    Encoding, Event, Impact, ImpactToken, LatencyUs, Limits, NetworkStatus, Origin, Query, Reply,
-    SampleRate, Status, SubscriptionState, SubscriptionStatus,
+    ClockRole, ClockSettings, ClockStatus, Command, CommandError, DeviceKey, DeviceStatus,
+    Direction, Encoding, Event, Impact, ImpactToken, LatencyUs, Limits, NetworkStatus, Origin,
+    PREFERRED_LEADER_BELOW, Query, Reply, SampleRate, Status, SubscriptionState,
+    SubscriptionStatus,
 };
 
 use crate::bus::{EventBus, Subscription};
 use crate::config::{
     BridgeConfig, BridgeDirection, ClockLock, Config, ControlLock, DeviceLock, NetworkLock,
 };
-use crate::env::{Clock, Environment, RateLimit, validate_name};
+use crate::env::{
+    Clock, Environment, RateLimit, validate_channel_label, validate_device_name, validate_name,
+};
 use crate::error::{Issue, StartError, StateError};
+use crate::formats::Refusal;
 use crate::loader::{
     ConfigPaths, LoadedConfig, Overrides, load_from_sources_for_state, read_sources,
 };
@@ -38,10 +42,14 @@ use crate::model::{
     DeviceModel, Model, SubscriptionEntry, WireDeviceId, latency_allowed, reconcile,
 };
 use crate::persist::{
-    Debouncer, StateFile, StateLoad, SubscriptionIntent, load_state, remove_stale_temporaries,
-    write_atomic,
+    ClockIntent, Debouncer, DeviceIntent, NetworkIntent, StateFile, StateLoad, SubscriptionIntent,
+    load_state, remove_stale_temporaries, write_atomic,
 };
 use crate::validate::validate_for_start;
+
+mod access_guard;
+mod runtime_reports;
+pub use runtime_reports::{RuntimeCarrierReview, RuntimeRead, RuntimeRun};
 
 /// File locations for the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +262,9 @@ pub struct StateEngine {
     model: Model,
     state_warnings: Vec<Issue>,
     persist_error: Option<String>,
+    /// Short-lived notices shown with the warnings until their deadline
+    /// (engine clock), e.g. a controller's identify request.
+    notices: Vec<(Issue, Duration)>,
     runtime_subs: BTreeMap<(String, u16), RuntimeSub>,
     clocks: Vec<ClockStatus>,
     /// Interfaces with a PTP port now (`None`: not reported; show all).
@@ -264,6 +275,19 @@ pub struct StateEngine {
     bus: EventBus,
     debounce: Debouncer,
     limiter: Option<RateLimiter>,
+    /// Ownership is acquired through an admitted report path, never by matching
+    /// stored content. No wire decoder can create a runtime run or read ticket.
+    runtime_reports: runtime_reports::RuntimeReports,
+    /// The device access lock (`device-lock.md` §9), in its own file.
+    access: crate::access::AccessLocks,
+    // Private default-off diagnostics. It never decides the actual command's
+    // outcome, adopts candidate flows, persists data or dispatches natively.
+    #[cfg(any(test, feature = "routing-shadow"))]
+    pub(crate) admission_probe: Option<crate::report_admission::AcceptanceProbe>,
+    // Instance-local diagnostic context revision. Never persisted, exposed on
+    // the wire or usable as a lifetime/grant. Exhaustion stays unavailable.
+    #[cfg(any(test, feature = "routing-shadow"))]
+    routing_query_revision: Option<u64>,
 }
 
 impl StateEngine {
@@ -342,6 +366,13 @@ impl StateEngine {
             .collect();
 
         let (model, warnings, changed) = reconcile(&loaded.config, &mut intent, &env);
+        let access_path = state_path.with_file_name(crate::access::FILE_NAME);
+        remove_stale_temporaries(&access_path);
+        let access = crate::access::AccessLocks::load(
+            access_path,
+            loaded.config.devices.iter().map(|d| d.id.as_str()),
+            env.pin_cost,
+        );
         let mut engine = Self {
             debounce: Debouncer::new(env.persist_delay),
             limiter: env.rate_limit.map(RateLimiter::new),
@@ -356,12 +387,19 @@ impl StateEngine {
             model,
             state_warnings: warnings,
             persist_error: None,
+            notices: Vec::new(),
             runtime_subs: BTreeMap::new(),
             clocks: Vec::new(),
             clock_interfaces: None,
             host_network: None,
             bridge_reports: BTreeMap::new(),
             bus: EventBus::new(),
+            runtime_reports: runtime_reports::RuntimeReports::default(),
+            access,
+            #[cfg(any(test, feature = "routing-shadow"))]
+            admission_probe: None,
+            #[cfg(any(test, feature = "routing-shadow"))]
+            routing_query_revision: Some(1),
         };
         let needs_write = changed
             || !matches!(
@@ -386,12 +424,149 @@ impl StateEngine {
         Ok((engine, report))
     }
 
+    /// Internal, feature-gated diagnostics; no routing authority is opened.
+    /// A daemon instance label is an identity namespace, not a process proof.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "routing-shadow"))]
+    pub fn enable_routing_shadow(&mut self, instance: u128) -> bool {
+        if instance == 0 || self.admission_probe.is_some() {
+            return false;
+        }
+        let Some(probe) = crate::report_admission::AcceptanceProbe::new(
+            &self.config.config,
+            &self.model.devices,
+            &self.intent,
+            instance,
+        ) else {
+            return false;
+        };
+        self.admission_probe = Some(probe);
+        true
+    }
+
+    /// Observe an unattributed protocol proposal using current engine intent.
+    /// No holder or source claim is inferred from connector liveness or labels.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "routing-shadow"))]
+    pub fn observe_routing_proposal(&mut self, snapshot: &[tessera_control_types::FlowSpec]) {
+        if let Some(probe) = &mut self.admission_probe {
+            probe.observe_unverified(snapshot, &self.intent);
+        }
+    }
+
+    /// Private fixture premises only. No listener or request decoder calls this.
+    #[doc(hidden)]
+    #[cfg(feature = "routing-shadow-test-hooks")]
+    pub fn routing_shadow_test_event(
+        &mut self,
+        event: crate::routing_shadow_test_hooks::TestEvent,
+    ) -> Result<
+        crate::routing_shadow_test_hooks::TestReply,
+        crate::routing_shadow_test_hooks::TestError,
+    > {
+        use crate::routing_shadow_test_hooks::TestError;
+        self.admission_probe
+            .as_mut()
+            .ok_or(TestError::Unavailable)?
+            .test_event(
+                event,
+                &self.config.config,
+                &self.model.devices,
+                &self.intent,
+                &self.env,
+            )
+    }
+
     // ---- read access ----------------------------------------------------
 
     /// The effective model.
     #[must_use]
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// Instance-local revision for private launch-query diagnostics only.
+    /// Compare only within this engine instance; this is no native revision,
+    /// process identity, registration, lifetime or permission.
+    #[cfg(any(test, feature = "routing-shadow"))]
+    #[must_use]
+    pub fn routing_query_revision(&self) -> Option<u64> {
+        self.routing_query_revision
+    }
+
+    /// Borrow the same host observation used by Status's primary/interface
+    /// fields. Stored selection/locks are read separately from the model.
+    #[cfg(any(test, feature = "routing-shadow"))]
+    #[must_use]
+    pub fn routing_query_network(&self) -> Option<&NetworkStatus> {
+        self.host_network.as_ref()
+    }
+
+    #[cfg(any(test, feature = "routing-shadow"))]
+    fn advance_routing_query_revision(&mut self) {
+        self.routing_query_revision = self.routing_query_revision.and_then(|r| r.checked_add(1));
+    }
+
+    // Compare only the first device's launch context and the effective primary
+    // binding. Periodic equal observations, unrelated interfaces, flow reports
+    // and unchanged reloads must not consume a one-time launch observation.
+    // This is broader than just interface/IP: identity, geometry, tuning and
+    // applicable locks also affect the context served by the two queries.
+    #[cfg(any(test, feature = "routing-shadow"))]
+    fn routing_query_context_eq(
+        &self,
+        config: &Config,
+        model: &Model,
+        network: Option<&NetworkStatus>,
+    ) -> bool {
+        let same_device = match (self.model.devices.first(), model.devices.first()) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                (
+                    &a.key,
+                    a.wire_device_id,
+                    &a.name,
+                    a.sample_rate,
+                    a.encoding,
+                    a.latency_us,
+                    a.rx_channels,
+                    a.tx_channels,
+                    &a.locked,
+                ) == (
+                    &b.key,
+                    b.wire_device_id,
+                    &b.name,
+                    b.sample_rate,
+                    b.encoding,
+                    b.latency_us,
+                    b.rx_channels,
+                    b.tx_channels,
+                    &b.locked,
+                )
+            }
+            _ => false,
+        };
+        if !same_device
+            || self.model.network != model.network
+            || self.config.config.network.interfaces.first() != config.network.interfaces.first()
+            || self.config.config.control.locked != config.control.locked
+            || self.host_network.as_ref().map(|n| &n.primary) != network.map(|n| &n.primary)
+        {
+            return false;
+        }
+        let old = self.host_network.as_ref().into_iter().flat_map(|n| {
+            n.interfaces
+                .iter()
+                .filter(|i| Some(i.name.as_str()) == n.primary.as_deref())
+                .map(|i| (&i.name, &i.mac, &i.ipv4, i.wireless, i.carrier))
+        });
+        let new = network.into_iter().flat_map(|n| {
+            n.interfaces
+                .iter()
+                .filter(|i| Some(i.name.as_str()) == n.primary.as_deref())
+                .map(|i| (&i.name, &i.mac, &i.ipv4, i.wireless, i.carrier))
+        });
+        old.eq(new)
     }
 
     /// The loaded configuration (with provenance).
@@ -412,18 +587,36 @@ impl StateEngine {
         &self.state_path
     }
 
+    /// Show `message` (under `field`) with the warnings for `for_`, replacing
+    /// an earlier notice of the same field. Not persisted.
+    pub fn report_notice(&mut self, field: &str, message: String, for_: Duration) {
+        let now = self.clock.now();
+        self.notices
+            .retain(|(i, until)| *until > now && i.path != field);
+        self.notices
+            .push((Issue::warning(field, message), now.saturating_add(for_)));
+    }
+
     /// Current warnings: configuration, state repairs, and a failed
     /// state-file write if any.
     #[must_use]
     pub fn warnings(&self) -> Vec<Issue> {
         let mut w = self.config.warnings.clone();
         w.extend(self.state_warnings.iter().cloned());
+        let now = self.clock.now();
+        w.extend(
+            self.notices
+                .iter()
+                .filter(|(_, until)| *until > now)
+                .map(|(i, _)| i.clone()),
+        );
         if let Some(e) = &self.persist_error {
             w.push(Issue::warning(
                 "state",
                 format!("cannot write the state file, will retry: {e}"),
             ));
         }
+        w.extend(self.access.warning());
         // A bridge pins its card's rate but the effective device rate (a
         // value stored at run time) differs: it cannot run until one of the
         // two changes. Validation can only see the configured rate.
@@ -491,7 +684,7 @@ impl StateEngine {
             .map(|d| self.device_status_of(d))
             .collect();
         let warnings = self.warnings().iter().map(ToString::to_string).collect();
-        let s = Status::new(env!("CARGO_PKG_VERSION"))
+        let s = Status::new(tessera_control_types::BUILD_VERSION)
             .with_devices(devices)
             .with_clocks(self.current_clocks())
             .with_clock_settings(
@@ -578,7 +771,7 @@ impl StateEngine {
                 Some(subscription_status(Channel::new(*ch)?, entry, state, eff))
             })
             .collect();
-        DeviceStatus::new(
+        let mut status = DeviceStatus::new(
             d.key.clone(),
             d.name.as_str(),
             SampleRate(d.sample_rate),
@@ -589,6 +782,74 @@ impl StateEngine {
         .with_tx_channels(channel_statuses(d.tx_channels, |c| d.tx_label(c)))
         .with_subscriptions(subscriptions)
         .with_locked(d.locked.iter().map(|l| l.as_str().to_owned()).collect())
+        .with_formats(crate::formats::options(&self.config.config, &self.env, d))
+        .with_access_locked(self.access.is_locked(&d.key.0));
+        if !self.config.config.control.locked.is_empty() {
+            status.routing_locks = Some(
+                self.config
+                    .config
+                    .control
+                    .locked
+                    .iter()
+                    .map(|lock| lock.as_str().to_owned())
+                    .collect(),
+            );
+        }
+        use tessera_control_types::{ReceiverCarrier, ReceiverIntent, ReceiverRoute};
+        let configured: BTreeSet<_> = self
+            .config
+            .config
+            .flows
+            .iter()
+            .map(|flow| &flow.id)
+            .collect();
+        let mut carriers = BTreeMap::new();
+        for flow in self
+            .model
+            .flows
+            .iter()
+            .filter(|flow| flow.device == d.key.0 && flow.direction == Direction::Rx)
+        {
+            let carrier = if configured.contains(&flow.id) {
+                ReceiverCarrier::ConfigurationFlow {
+                    id: flow.id.clone(),
+                }
+            } else {
+                ReceiverCarrier::ControllerFlow {
+                    id: flow.id.clone(),
+                }
+            };
+            if flow.channels.is_empty() {
+                for channel in 1..=d.rx_channels {
+                    carriers.entry(channel).or_insert_with(|| carrier.clone());
+                }
+            } else {
+                for &channel in &flow.channels {
+                    carriers.entry(channel).or_insert_with(|| carrier.clone());
+                }
+            }
+        }
+        for channel in &mut status.rx_channels {
+            let carrier = carriers
+                .remove(&channel.channel.get())
+                .unwrap_or(ReceiverCarrier::None);
+            let mut route = ReceiverRoute::new(carrier);
+            route.intent = d
+                .subscriptions
+                .get(&channel.channel.get())
+                .map(|intent| ReceiverIntent::new(&intent.tx_device, &intent.tx_channel));
+            route.media = self
+                .runtime_subs
+                .get(&(d.key.0.clone(), channel.channel.get()))
+                .map(|(state, _)| state.clone());
+            if route.intent.is_some()
+                || !matches!(route.carrier, ReceiverCarrier::None)
+                || route.media.is_some()
+            {
+                channel.routing = Some(route);
+            }
+        }
+        status
     }
 
     // ---- runtime observations (not commands, never persisted) ------------
@@ -732,7 +993,12 @@ impl StateEngine {
     /// and not an event; `status` reports the latest one, with the stored
     /// selection and the lock taken from the model.
     pub fn report_network_status(&mut self, status: NetworkStatus) {
+        #[cfg(any(test, feature = "routing-shadow"))]
+        if !self.routing_query_context_eq(&self.config.config, &self.model, Some(&status)) {
+            self.advance_routing_query_revision();
+        }
         self.host_network = Some(status);
+        self.revalidate_runtime_binding();
     }
 
     /// Record what the daemon's bridges are doing: one row per bridge it
@@ -808,7 +1074,10 @@ impl StateEngine {
 
     /// The network part of [`status`](Self::status): `None` until the daemon
     /// has reported the host.
-    fn network_status(&self) -> Option<NetworkStatus> {
+    /// Current host-network observation with effective selection and locks.
+    /// It is an observation, not an atomic network configuration revision.
+    #[must_use]
+    pub fn network_status(&self) -> Option<NetworkStatus> {
         let mut n = self.host_network.clone()?;
         n.selected.clone_from(&self.intent.network.primary);
         n.locked = self.model.network.locked;
@@ -895,9 +1164,16 @@ impl StateEngine {
     /// As [`apply`](Self::apply) (validation, locks), except
     /// `ConfirmationRequired` and rate limiting.
     pub fn impact(&self, cmd: &Command) -> Result<Impact, CommandError> {
+        if self.access.any_locked().is_some() {
+            self.access_refusal(cmd)?;
+        }
+        if access_guard::is_access_command(cmd) {
+            return Ok(crate::impact::no_impact(cmd));
+        }
         if matches!(cmd, Command::ReloadConfig) {
             return Ok(self.prepare_reload()?.impact);
         }
+        self.guard_managed_intent(cmd)?;
         let mut intent = self.intent.clone();
         if !self.mutate(&mut intent, cmd)? {
             return Ok(crate::impact::no_impact(cmd));
@@ -919,6 +1195,16 @@ impl StateEngine {
         cmd: Command,
         confirm: Confirm,
     ) -> Result<Applied, CommandError> {
+        self.apply_inner_from(origin, cmd, confirm, true)
+    }
+
+    fn apply_inner_from(
+        &mut self,
+        origin: Origin,
+        cmd: Command,
+        confirm: Confirm,
+        host_write: bool,
+    ) -> Result<Applied, CommandError> {
         // Every surface that can issue commands is limited per principal:
         // network peers, local CLI users (by uid) and API principals. Config
         // reloads and the daemon's own commands are not.
@@ -936,6 +1222,12 @@ impl StateEngine {
                 }
             }
         }
+        // The device access lock comes before any other validation
+        // (`device-lock.md` §9.2 L5).
+        self.access_guard(&origin, &cmd)?;
+        if access_guard::is_access_command(&cmd) {
+            return self.apply_access(origin, &cmd);
+        }
         let gated = !matches!(
             origin,
             Origin::Protocol { .. } | Origin::Config | Origin::Internal
@@ -946,6 +1238,7 @@ impl StateEngine {
         }
 
         let dry_run = matches!(cmd, Command::SetDeviceChannels { dry_run: true, .. });
+        self.guard_managed_intent(&cmd)?;
         let mut intent = self.intent.clone();
         let changed = match self.mutate(&mut intent, &cmd) {
             Ok(changed) => changed,
@@ -964,6 +1257,22 @@ impl StateEngine {
             }
         };
         if !changed {
+            if host_write && !dry_run {
+                self.record_runtime_host_write(&cmd);
+            }
+            #[cfg(any(test, feature = "routing-shadow"))]
+            if !dry_run {
+                if let Some(probe) = &mut self.admission_probe {
+                    probe.accepted(
+                        &origin,
+                        &cmd,
+                        false,
+                        &self.config.config,
+                        &self.model.devices,
+                        &intent,
+                    );
+                }
+            }
             return Ok(Applied {
                 impact: dry_run.then(|| crate::impact::no_impact(&cmd)),
                 ..Applied::default()
@@ -987,6 +1296,17 @@ impl StateEngine {
         if let Some(c) = gate {
             c.check(&impact)?;
         }
+        #[cfg(any(test, feature = "routing-shadow"))]
+        if let Some(probe) = &mut self.admission_probe {
+            probe.accepted(
+                &origin,
+                &cmd,
+                true,
+                &self.config.config,
+                &model.devices,
+                &intent,
+            );
+        }
         let mut events = self.diff_models(&self.model, &model, &origin);
         events.extend(runtime_changes(&self.intent, &intent, &origin));
         let effects: Vec<Effect> = model
@@ -1004,10 +1324,18 @@ impl StateEngine {
             .collect();
 
         // Commit: nothing below can fail.
+        #[cfg(any(test, feature = "routing-shadow"))]
+        if !self.routing_query_context_eq(&self.config.config, &model, self.host_network.as_ref()) {
+            self.advance_routing_query_revision();
+        }
         self.intent = intent;
         self.prune_runtime(&model);
         self.model = model;
         self.state_warnings = warnings;
+        if host_write {
+            self.record_runtime_host_write(&cmd);
+        }
+        self.revalidate_runtime_binding();
         self.debounce.mark_dirty(self.clock.now());
         for e in &events {
             self.bus.publish(e);
@@ -1029,6 +1357,16 @@ impl StateEngine {
     /// Validate `cmd` completely, then modify `intent`. Returns whether
     /// anything changed. Never modifies `intent` on error.
     fn mutate(&self, intent: &mut StateFile, cmd: &Command) -> Result<bool, CommandError> {
+        if matches!(cmd, Command::Subscribe { .. } | Command::Unsubscribe { .. })
+            && self
+                .config
+                .config
+                .control
+                .locked
+                .contains(&ControlLock::Subscriptions)
+        {
+            return Err(locked("subscriptions"));
+        }
         match cmd {
             Command::SetProtocolFlows { flows } => {
                 if self
@@ -1041,17 +1379,11 @@ impl StateEngine {
                     return Err(locked("flows"));
                 }
                 let converted = crate::flows::from_specs(flows, &self.env).map_err(flow_invalid)?;
-                let mut config = self.config.config.clone();
+                let mut config = crate::flows::effective_validation_config(
+                    &self.config.config,
+                    &self.model.devices,
+                );
                 config.flows.extend(converted);
-                for dc in &mut config.devices {
-                    if let Some(d) = self.model.device(&dc.id) {
-                        dc.rx_channels = d.rx_channels;
-                        dc.tx_channels = d.tx_channels;
-                        dc.sample_rate = d.sample_rate;
-                        dc.encoding = d.encoding;
-                        dc.latency_us = d.latency_us;
-                    }
-                }
                 let issues: Vec<Issue> = crate::validate::validate(&config, &self.env)
                     .into_iter()
                     .filter(Issue::is_error)
@@ -1070,7 +1402,13 @@ impl StateEngine {
                 if d.locked.contains(&DeviceLock::Name) {
                     return Err(locked(DeviceLock::Name.as_str()));
                 }
-                validate_name(name, self.env.max_name_bytes)
+                // An unchanged legacy name is a no-op, not a migration. New
+                // names must meet the separate device naming rules.
+                let stored = intent.device.get(&device.0).and_then(|s| s.name.as_ref());
+                if stored.map_or(*name == d.name, |s| s == name) {
+                    return Ok(false);
+                }
+                validate_device_name(name, self.env.max_name_bytes)
                     .map_err(|e| invalid("name", format!("name {e}")))?;
                 let lower = name.to_ascii_lowercase();
                 let clash = self
@@ -1100,12 +1438,6 @@ impl StateEngine {
                         format!("`{name}` is already used by another device"),
                     ));
                 }
-                // A stored value that differs from the effective one (it is
-                // inactive, see `reconcile`) is overwritten, not left behind.
-                let stored = intent.device.get(&device.0).and_then(|s| s.name.as_ref());
-                if stored.map_or(*name == d.name, |s| s == name) {
-                    return Ok(false);
-                }
                 intent.device.entry(device.0.clone()).or_default().name = Some(name.clone());
                 Ok(true)
             }
@@ -1127,33 +1459,72 @@ impl StateEngine {
                 // Clearing a label (`None`) is allowed for any channel number
                 // so that a stored label beyond the current channel count
                 // (kept but inactive) can still be removed.
-                if let Some(l) = label {
-                    if ch > count {
+                if label.is_some() && ch > count {
+                    return Err(invalid(
+                        "channel",
+                        format!("channel {ch} is beyond the device's {count} channel(s)"),
+                    ));
+                }
+                let key = ch.to_string();
+                let stored = intent.device.get(&device.0).and_then(|s| match direction {
+                    Direction::Rx => s.rx_channel_labels.get(&key),
+                    Direction::Tx => s.tx_channel_labels.get(&key),
+                });
+                let current = match direction {
+                    Direction::Rx => d.rx_label(ch),
+                    Direction::Tx => d.tx_label(ch),
+                };
+                if label.as_ref().map_or(stored.is_none(), |l| {
+                    stored.map_or(current == *l, |s| s == l)
+                }) {
+                    return Ok(false);
+                }
+                let wanted = if let Some(l) = label {
+                    validate_channel_label(l, self.env.max_name_bytes)
+                        .map_err(|e| invalid("label", format!("label {e}")))?;
+                    l.clone()
+                } else {
+                    // Reset restores configuration before the factory label.
+                    self.config
+                        .config
+                        .devices
+                        .iter()
+                        .find(|c| c.id == device.0)
+                        .and_then(|c| match direction {
+                            Direction::Rx => c.rx_channel_labels.get(&ch),
+                            Direction::Tx => c.tx_channel_labels.get(&ch),
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| match direction {
+                            Direction::Rx => format!("RX {ch}"),
+                            Direction::Tx => format!("TX {ch}"),
+                        })
+                };
+                if ch <= count {
+                    let clash = (1..=count).find(|other| {
+                        *other != ch
+                            && match direction {
+                                Direction::Rx => d.rx_label(*other),
+                                Direction::Tx => d.tx_label(*other),
+                            }
+                            .eq_ignore_ascii_case(&wanted)
+                    });
+                    if let Some(other) = clash {
                         return Err(invalid(
-                            "channel",
-                            format!("channel {ch} is beyond the device's {count} channel(s)"),
+                            "label",
+                            format!(
+                                "`{wanted}` is already used by channel {other} in this direction (names ignore case)"
+                            ),
                         ));
                     }
-                    validate_name(l, self.env.max_name_bytes)
-                        .map_err(|e| invalid("label", format!("label {e}")))?;
                 }
                 let dev = intent.device.entry(device.0.clone()).or_default();
                 let map = match direction {
                     Direction::Rx => &mut dev.rx_channel_labels,
                     Direction::Tx => &mut dev.tx_channel_labels,
                 };
-                let key = ch.to_string();
                 match label {
                     Some(l) => {
-                        // Compare with the stored value when there is one (it
-                        // may be inactive), else with the effective label.
-                        let current = match direction {
-                            Direction::Rx => d.rx_label(ch),
-                            Direction::Tx => d.tx_label(ch),
-                        };
-                        if map.get(&key).map_or(current == *l, |s| s == l) {
-                            return Ok(false);
-                        }
                         map.insert(key, l.clone());
                         Ok(true)
                     }
@@ -1209,32 +1580,31 @@ impl StateEngine {
             }
             Command::SetSampleRate { device, rate } => {
                 let d = self.device_for(device)?;
-                if d.locked.contains(&DeviceLock::SampleRate) {
-                    return Err(locked(DeviceLock::SampleRate.as_str()));
-                }
-                if !self.env.supported_sample_rates.contains(&rate.0) {
-                    return Err(invalid(
-                        "sample_rate",
-                        format!("{} Hz is not supported", rate.0),
-                    ));
+                // The same rule gives the status's list of rates
+                // (`crate::formats`). A bridge that pins its card's rate
+                // cannot follow: refuse instead of leaving it unable to run.
+                match crate::formats::sample_rate_refusal(&self.config.config, &self.env, d, rate.0)
+                {
+                    None => {}
+                    Some(Refusal::Locked) => return Err(locked(DeviceLock::SampleRate.as_str())),
+                    Some(Refusal::Unsupported) => {
+                        return Err(invalid(
+                            "sample_rate",
+                            format!("{} Hz is not supported", rate.0),
+                        ));
+                    }
+                    Some(Refusal::Bridge { name, sample_rate }) => {
+                        return Err(invalid(
+                            "sample_rate",
+                            format!(
+                                "bridge `{name}` runs its card at {sample_rate} Hz (`sample_rate` in its configuration); change or remove that first"
+                            ),
+                        ));
+                    }
                 }
                 let stored = intent.device.get(&device.0).and_then(|s| s.sample_rate);
                 if stored.map_or(rate.0 == d.sample_rate, |s| s == rate.0) {
                     return Ok(false);
-                }
-                // A bridge that pins its card's rate cannot follow: refuse
-                // instead of leaving it unable to run.
-                if let Some(b) = self.config.config.bridges.iter().find(|b| {
-                    b.enabled && b.device == device.0 && b.sample_rate.is_some_and(|r| r != rate.0)
-                }) {
-                    return Err(invalid(
-                        "sample_rate",
-                        format!(
-                            "bridge `{}` runs its card at {} Hz (`sample_rate` in its configuration); change or remove that first",
-                            b.name,
-                            b.sample_rate.unwrap_or(0)
-                        ),
-                    ));
                 }
                 intent
                     .device
@@ -1245,14 +1615,16 @@ impl StateEngine {
             }
             Command::SetEncoding { device, encoding } => {
                 let d = self.device_for(device)?;
-                if d.locked.contains(&DeviceLock::Encoding) {
-                    return Err(locked(DeviceLock::Encoding.as_str()));
-                }
-                if !self.env.supported_encodings.contains(&encoding.0) {
-                    return Err(invalid(
-                        "encoding",
-                        format!("{} bits is not supported", encoding.0),
-                    ));
+                match crate::formats::encoding_refusal(&self.env, d, encoding.0) {
+                    // A bridge never pins the encoding: it converts samples.
+                    None | Some(Refusal::Bridge { .. }) => {}
+                    Some(Refusal::Locked) => return Err(locked(DeviceLock::Encoding.as_str())),
+                    Some(Refusal::Unsupported) => {
+                        return Err(invalid(
+                            "encoding",
+                            format!("{} bits is not supported", encoding.0),
+                        ));
+                    }
                 }
                 let stored = intent.device.get(&device.0).and_then(|s| s.encoding);
                 if stored.map_or(encoding.0 == d.encoding, |s| s == encoding.0) {
@@ -1301,6 +1673,17 @@ impl StateEngine {
                 if *role == self.model.clock.role {
                     return Ok(false);
                 }
+                // Preferred leader and follower-only exclude each other
+                // (device-settings.md §2.3).
+                if *role == ClockRole::Follower
+                    && self.model.clock.priority < PREFERRED_LEADER_BELOW
+                {
+                    return Err(invalid(
+                        "clock.role",
+                        "this device is a preferred leader; clear preferred leader \
+                         (priority 64 or more) before making it follower-only",
+                    ));
+                }
                 intent.clock.role = Some(*role);
                 Ok(true)
             }
@@ -1311,6 +1694,15 @@ impl StateEngine {
                 if *priority == self.model.clock.priority {
                     return Ok(false);
                 }
+                if *priority < PREFERRED_LEADER_BELOW
+                    && self.model.clock.role == ClockRole::Follower
+                {
+                    return Err(invalid(
+                        "clock.priority",
+                        "a follower-only device cannot be a preferred leader; set the \
+                         clock role to auto or leader first",
+                    ));
+                }
                 intent.clock.priority = Some(*priority);
                 Ok(true)
             }
@@ -1320,6 +1712,10 @@ impl StateEngine {
             Command::SetDeviceChannels { device, rx, tx, .. } => {
                 self.set_channels(intent, device, *rx, *tx)
             }
+            Command::ClearConfiguration {
+                device,
+                keep_network,
+            } => self.clear_configuration(intent, device, *keep_network),
             // ReloadConfig is handled by the caller; anything else is a
             // command added to control-types after this crate was written.
             _ => Err(CommandError::Unsupported {
@@ -1431,6 +1827,16 @@ impl StateEngine {
         tx: u16,
     ) -> Result<bool, CommandError> {
         let d = self.device_for(device)?;
+        if rx < d.rx_channels
+            && self
+                .config
+                .config
+                .control
+                .locked
+                .contains(&ControlLock::Subscriptions)
+        {
+            return Err(locked("subscriptions"));
+        }
         for (lock, now, want) in [
             (DeviceLock::RxChannels, d.rx_channels, rx),
             (DeviceLock::TxChannels, d.tx_channels, tx),
@@ -1532,6 +1938,85 @@ impl StateEngine {
         Ok(true)
     }
 
+    /// `ClearConfiguration` (`device-settings.md` §6, factory reset and
+    /// clear configuration): drop every value stored at run time for
+    /// `device`, so that the configuration applies again. Its wire identity
+    /// and channel counts stay: they are not controller settings. The clock
+    /// values are the host's, so they go too; the primary interface
+    /// selection unless `keep_network`. Refused unless `[control]
+    /// allow_factory_reset`, and when it would change subscriptions the host
+    /// owns (`[control] locked`). The device access lock refuses it before
+    /// this runs, and it never clears that lock (`device-lock.md` §9.1 L3).
+    fn clear_configuration(
+        &self,
+        intent: &mut StateFile,
+        device: &DeviceKey,
+        keep_network: bool,
+    ) -> Result<bool, CommandError> {
+        let control = &self.config.config.control;
+        if !control.allow_factory_reset {
+            return Err(CommandError::Unsupported {
+                what: "clearing the configuration is disabled on this host \
+                       ([control] allow_factory_reset)"
+                    .into(),
+            });
+        }
+        self.device_for(device)?;
+        let mut next = intent.clone();
+        if let Some(stored) = next.device.get_mut(&device.0) {
+            *stored = DeviceIntent {
+                wire_device_id: stored.wire_device_id.take(),
+                rx_channels: stored.rx_channels,
+                tx_channels: stored.tx_channels,
+                ..DeviceIntent::default()
+            };
+        }
+        if control.locked.contains(&ControlLock::Subscriptions)
+            && intent
+                .device
+                .get(&device.0)
+                .is_some_and(|d| !d.subscription.is_empty())
+        {
+            return Err(locked("subscriptions"));
+        }
+        // The device's controller flows, manual multicast flows included;
+        // other devices keep theirs. With `locked = ["flows"]` there are none.
+        if !control.locked.contains(&ControlLock::Flows) {
+            match &intent.protocol_flows {
+                Some(flows) => {
+                    next.protocol_flows = Some(
+                        flows
+                            .iter()
+                            .filter(|f| f.device != *device)
+                            .cloned()
+                            .collect(),
+                    );
+                }
+                None => {
+                    let legacy = &self.config.config.legacy_protocol_flows;
+                    if legacy.iter().any(|f| f.device == device.0) {
+                        let kept = legacy
+                            .iter()
+                            .filter(|f| f.device != device.0)
+                            .map(crate::flows::to_spec)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| invalid("flows", e))?;
+                        next.protocol_flows = Some(kept);
+                    }
+                }
+            }
+        }
+        next.clock = ClockIntent::default();
+        if !keep_network {
+            next.network = NetworkIntent::default();
+        }
+        if next == *intent {
+            return Ok(false);
+        }
+        *intent = next;
+        Ok(true)
+    }
+
     // ---- reload ----------------------------------------------------------
 
     /// A reload: for a gated origin (`gate`), refused with
@@ -1550,12 +2035,30 @@ impl StateEngine {
         if let Some(c) = gate {
             c.check(&impact)?;
         }
+        #[cfg(any(test, feature = "routing-shadow"))]
+        if let Some(probe) = &mut self.admission_probe {
+            // Reload is the configuration authority's transition here. The
+            // caller origin is not retained by this existing reload interface.
+            probe.accepted(
+                &Origin::Config,
+                &Command::ReloadConfig,
+                true,
+                &loaded.config,
+                &model.devices,
+                &intent,
+            );
+        }
+        #[cfg(any(test, feature = "routing-shadow"))]
+        if !self.routing_query_context_eq(&loaded.config, &model, self.host_network.as_ref()) {
+            self.advance_routing_query_revision();
+        }
         let intent_changed = intent != self.intent;
         self.prune_runtime(&model);
         self.intent = intent;
         self.model = model;
         self.state_warnings = warnings;
         self.config = loaded;
+        self.revalidate_runtime_binding();
         if intent_changed {
             self.debounce.mark_dirty(self.clock.now());
         }
@@ -2266,8 +2769,20 @@ fn command_field(cmd: &Command, refused: &str) -> (String, Option<String>) {
             Some(latency.0.to_string()),
         ),
         Command::SetDeviceChannels { device, rx, tx, .. } => (
-            format!("device.{}.{refused}", device.0),
-            Some(if refused == "rx_channels" { rx } else { tx }.to_string()),
+            format!(
+                "device.{}.{}",
+                device.0,
+                if refused == "subscriptions" {
+                    "rx_channels"
+                } else {
+                    refused
+                }
+            ),
+            match refused {
+                "rx_channels" | "subscriptions" => Some(rx.to_string()),
+                "tx_channels" => Some(tx.to_string()),
+                _ => None,
+            },
         ),
         _ => (refused.into(), None),
     };
@@ -2344,5 +2859,85 @@ impl Confirm {
                 impact: Box::new(impact.clone()),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod query_revision_tests {
+    use super::*;
+    #[test]
+    fn exhausted_query_context_stays_unavailable_across_network_and_reload() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "tessera-query-revision-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let config = directory.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let (mut engine, _) = StateEngine::start(
+            crate::Environment::new("query-revision-test"),
+            Paths::new(
+                crate::ConfigPaths::new(config, directory.join("conf.d")),
+                directory.join("state.toml"),
+            ),
+            Arc::new(crate::ManualClock::new()),
+        )
+        .unwrap();
+        engine.routing_query_revision = Some(u64::MAX);
+        engine.report_network_status(NetworkStatus::new(
+            None,
+            tessera_control_types::PrimarySource::Automatic,
+        ));
+        assert_eq!(engine.routing_query_revision(), None);
+        engine
+            .apply_confirmed(Origin::Internal, Command::ReloadConfig)
+            .unwrap();
+        assert_eq!(engine.routing_query_revision(), None);
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[test]
+    fn a_notice_shows_with_the_warnings_until_it_expires_and_replaces_its_field() {
+        let directory = std::env::temp_dir().join(format!("tessera-notice-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = directory.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let clock = Arc::new(crate::ManualClock::new());
+        let (mut engine, _) = StateEngine::start(
+            crate::Environment::new("notice-test"),
+            Paths::new(
+                crate::ConfigPaths::new(config, directory.join("conf.d")),
+                directory.join("state.toml"),
+            ),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        let shown = |e: &StateEngine| {
+            e.warnings()
+                .iter()
+                .filter(|i| i.path == "identify")
+                .map(|i| i.message.clone())
+                .collect::<Vec<_>>()
+        };
+        engine.report_notice("identify", "first".into(), Duration::from_secs(10));
+        engine.report_notice("identify", "second".into(), Duration::from_secs(10));
+        assert_eq!(shown(&engine), ["second"]);
+        clock.advance(Duration::from_secs(11));
+        assert!(shown(&engine).is_empty());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

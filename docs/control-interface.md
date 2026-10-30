@@ -36,7 +36,7 @@ configuration files are the other input: a reload is itself a command
 
 ## Stability
 
-`tessera-control-types` (`crates/tessera-control-types`, version 0.3.0) is the
+`tessera-control-types` (`crates/tessera-control-types`, version 0.5.0) is the
 typed public integration contract. Its rules:
 
 - Changes are **additive**. Most enums and structs are `#[non_exhaustive]`
@@ -180,6 +180,11 @@ The shapes above are the `tessera-control-types` `Request` and `Response` envelo
 | `set_clock_priority` | `priority` (0 to 255, lower wins) | `clock set-priority` |
 | `set_primary_interface` | `interface` (a name, or `null` to clear) | `network primary` |
 | `reload_config` | none | `config reload` |
+| `clear_configuration` | `device`, `keep_network` (default `false`); every value set at run time for the device returns to the configuration (name, labels, subscriptions, rate, encoding, latency, clock role and priority, its controller flows, and the primary interface selection unless `keep_network`); refused unless `[control] allow_factory_reset = true` | none (network controllers' factory reset and clear configuration) |
+| `lock_access` | `device`, `pin` (exactly four digits); refused if already locked | `access lock` |
+| `unlock_access` | `device`, `pin`; a wrong PIN is `incorrect_pin`; after five, unlocking from that kind of client pauses for 60 s | `access unlock` |
+| `reset_access_lock` | `device`; unlock without the PIN, only from a local administrator on the control socket (the portal and network controllers get `permission_denied`) | `access reset` |
+| `route_receiver` | `expectation` (from a receiver page), `change` (`connect`, `replace` or `disconnect`, with source references from the routing inventory); one receiver change, checked again and never retried | `routing execute` |
 
 `device` is the device key (`[[device]] id`), not its name. Examples:
 
@@ -192,11 +197,13 @@ The shapes above are the `tessera-control-types` `Request` and `Response` envelo
 
 A key listed in `locked` in the configuration is refused with `locked`. A
 value outside its bounds is refused with `invalid` and the field and reason.
-Subscriptions are stored by name and kept while they do not resolve. The
-daemon itself has no flow control: a subscription is `in_progress` until a
-static `[[flow]]` or a controller flow carries its rx channel, then `receiving`
-or `no_media` according to the media that arrives (see Status below and
-[interoperability.md](interoperability.md)).
+Subscriptions are stored by name and kept while they do not resolve. Without
+the native device role the daemon has no flow control: a subscription is
+`in_progress` until a static `[[flow]]` or a controller flow carries its rx
+channel, then `receiving` or `no_media` according to the media that arrives.
+With the native device role (`--native-device`) the daemon requests a flow for
+each subscription itself (see Status below and
+[interoperability.md](interoperability.md#native-device-role)).
 
 There is no command for host flows or bridges: they are configuration, and
 `reload_config` applies them. The flows a controller sets up are the exception:
@@ -241,6 +248,8 @@ response per event, all with the subscription request's `id`:
 | `protocol_flows_changed` | `flows` (effective controller IDs), `origin` |
 | `locked_value_refused` | `field` (full path), `origin`, `attempted` (small value or `null`) |
 | `runtime_value_changed` | `field` (full path), `origin`; runtime intent queued for `state.toml` |
+| `access_lock_changed` | `device`, `locked`, `origin`; carries no PIN |
+| `receiver_operation_changed` | `result`: progress of a `route_receiver` operation (no audio assertion) |
 
 `origin` is `{"cli":{"uid":N}}`, `"config"`, `"internal"`,
 `{"protocol":{"peer":"..."}}` or `{"api":{"principal":"..."}}`. The compatibility
@@ -255,25 +264,37 @@ grants permission or exempts other commands from confirmation.
 origin: `tesseractl flows set|clear`, a host, or the Controller compatibility
 runtime through its adapter. The set survives a restart of the daemon, and the
 compatibility runtime restarts with the daemon (`PartOf=`). The runtime knows no
-flows when it starts and reports an empty set; that report is not an instruction
-to remove flows someone else stored, so the adapter applies it by this rule:
+flows when it starts and reports an empty set. The adapter attempts to filter
+that startup report using a recorded run ID:
 
-* The controller owns the flows it has submitted **in its current run** (one systemd
-  invocation of `tessera-controller@.service`, identified by `INVOCATION_ID`; the
-  adapter keeps the run that last applied a report in
-  `/var/lib/tessera-controller/flows-run`).
+* The adapter reads `INVOCATION_ID`, defaulting to `""` when absent, and keeps
+  the ID of its last applied report in `/var/lib/tessera-controller/flows-run`.
+  This is intended to identify a systemd invocation of
+  `tessera-controller@.service`; forwarding that ID from the real runtime to
+  its adapter child remains unverified after a non-empty controller report.
 * A report that names flows is applied: it replaces the set as a whole, like any
   `set_protocol_flows`.
-* An empty report is applied only from a run that has already applied a report: the
-  controller then removes what it set. An empty report from a run that has applied
-  none (the one at start) is answered with success and ignored: the stored set, and
-  its running flows, stay as they are.
+* An empty report is applied only when the received ID equals the recorded ID.
+  It clears the current controller set, including flows another writer may
+  have stored since the earlier report. A missing or different recorded ID
+  makes the adapter answer success without changing that set.
 * Explicit commands are never filtered: `tesseractl flows clear` and a
   `set_protocol_flows` from another origin always apply, and a host's
   `[control] locked = ["flows"]` still refuses every one of them.
 
-So `tesseractl flows set FILE` followed by `systemctl restart tesserad` leaves the
-flows stored and running with the controller runtime enabled.
+Startup filtering preserves a set across restart only when the received ID
+differs from the previous marker, or no marker exists. If both invocations
+receive the empty fallback and the marker is already `""`, their empty reports
+are indistinguishable. A runtime-only restart (`Restart=on-failure`) has the
+same ownership limitation.
+
+Even with distinct IDs, a later valid non-empty controller report replaces the
+whole set and can omit unrelated flows restored after restart or written by
+CLI, host or the generic portal command API. A failed marker write also does
+not fail an applied report; a later empty report is ignored if the old marker
+does not match. Activating the flows lock separately clears stored controller
+intent, and unlocking does not restore it. These are limits of the current
+adapter/state contract, not changes made by the saved-intent picker.
 
 ```json
 {"v":1,"id":5,"result":{"ok":{"event":{"clock_settings_changed":{"role":"leader","priority":64,"origin":{"cli":{"uid":1000}}}}}}}
@@ -317,7 +338,7 @@ configuration`) and exits with 1, or with 4 for `permission_denied`.
 | Field | Content |
 |-------|---------|
 | `version` | daemon version |
-| `devices` | `DeviceStatus` per device: `key`, `name`, `sample_rate`, `encoding`, `latency`, `rx_channels` and `tx_channels` (`channel`, `label`), `subscriptions`, `locked` |
+| `devices` | `DeviceStatus` per device: `key`, `name`, `sample_rate`, `encoding`, `latency`, `rx_channels` and `tx_channels` (`channel`, `label`), `subscriptions`, `locked`, `access_locked` (`true` while the device access lock is set, absent when open), and `formats` (absent from older daemons): `sample_rates` and `encodings`, the values the device can be set to now (exactly what `set_sample_rate` and `set_encoding` accept, the current value included, ascending; a network controller is offered the same lists), and `sample_rate_pin` / `encoding_pin`, null while another value is accepted, else why not: `"configuration"` (`locked`), `{"bridge":{"name":N,"sample_rate":HZ}}` (an enabled `[[bridge]]` pins the rate) or `"unsupported"` |
 | `clocks` | `ClockStatus` per interface: `interface`, `state` (`free_running`, `listening`, `acquiring`, `locked`, `holdover`, `leader`), `timestamping` (`hardware`/`software`), `offset_ns`, `rate_ppb`, `grandmaster`, `epoch`, `runner_starts`, `commands_applied`, `commands_rejected` |
 | `clock_settings` | `role`, `priority`, `locked` (may be absent from older daemons) |
 | `network` | `NetworkStatus`: `primary`, `source` (`locked`, `selected`, `configured`, `automatic`, `fallback`), `selected`, `locked`, `allow_wireless`, `interfaces` (`name`, `mac`, `ipv4`, `carrier`, `wireless`, `is_virtual`, `usable`, `reason`); may be absent |
@@ -332,7 +353,7 @@ configuration`) and exits with 1, or with 4 for `permission_denied`.
 | `in_progress` | **yes**: a stored subscription whose rx channel no `[[flow]]` carries, or whose flow has not yet received a packet (first 5 s after the flow started) |
 | `receiving` | **yes**: a rx `[[flow]]` of the device carries the channel and its packets are arriving (the flow's packet count grew at one of the last two one-second samples) |
 | `no_media` | **yes**: the flow carries the channel but its packets stopped (shown about 2 to 3 s after the last packet), or none arrived in the 5 s after the flow started |
-| `unresolved`, `{"flow_refused":{"code":N}}`, `{"rate_mismatch":{"ours":R,"theirs":R}}`, `{"encoding_mismatch":{...}}` | no: reserved for the flow control `tesserad` does not implement yet; nothing produces them |
+| `unresolved`, `{"flow_refused":{"code":N}}`, `{"rate_mismatch":{"ours":R,"theirs":R}}`, `{"encoding_mismatch":{...}}` | only with the native device role: the transmitter or its channel was not found in discovery (`unresolved`), the transmitter refused the flow request with that code, or it runs another rate or encoding; without the role nothing produces them |
 
 The state comes from the media layer, not from the subscription's names: once a
 second the daemon reads the packet counter of every rx flow (the same counters
@@ -345,9 +366,10 @@ a removed one returns its channels to `in_progress`. Static flows do not say whe
 their media comes from, so `receiving` means that the channel is receiving media, not that the
 media comes from the `tx_channel` and `tx_device` named in the subscription.
 
-`effective_latency` is `null` today. `tesserad` does not implement the vendor
-control plane itself; the packaged Controller compatibility runtime submits the
-flows a controller sets up ([interoperability.md](interoperability.md)).
+`effective_latency` is `null` today. Without the native device role `tesserad`
+does not implement the vendor control plane itself; the packaged Controller
+compatibility runtime submits the flows a controller sets up
+([interoperability.md](interoperability.md)).
 
 ---
 

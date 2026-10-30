@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 
-use crate::model::{BrowseEvent, ServiceId, ServiceInstance, ServiceKind};
+use crate::model::{BrowseEvent, ServiceId, ServiceInstance, ServiceKind, ServiceObservation};
 use crate::txt::TxtRecord;
 
 /// Opaque identifier of one place an instance was seen.
@@ -23,6 +23,7 @@ pub(crate) type SourceKey = String;
 /// What one source knows about an instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceView {
+    pub interface: Option<String>,
     pub host: String,
     pub port: u16,
     pub addresses: BTreeSet<IpAddr>,
@@ -33,6 +34,7 @@ pub(crate) struct SourceView {
 struct Entry {
     id: ServiceId,
     sources: BTreeMap<SourceKey, SourceView>,
+    incarnations: BTreeMap<SourceKey, u64>,
     published: Option<ServiceInstance>,
 }
 
@@ -61,6 +63,9 @@ pub(crate) struct BrowseCache {
     entries: HashMap<(ServiceKind, String), Entry>,
     per_kind: HashMap<ServiceKind, usize>,
     dropped: u64,
+    next_incarnation: u64,
+    rejected: BTreeSet<(ServiceKind, String, SourceKey)>,
+    rejection_overflow: bool,
 }
 
 fn key(id: &ServiceId) -> (ServiceKind, String) {
@@ -75,12 +80,27 @@ impl BrowseCache {
             entries: HashMap::new(),
             per_kind: HashMap::new(),
             dropped: 0,
+            next_incarnation: 0,
+            rejected: BTreeSet::new(),
+            rejection_overflow: false,
         }
     }
 
     /// Instances that were refused because of the cap.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    pub(crate) fn reconciled(&self) -> bool {
+        self.rejected.is_empty() && !self.rejection_overflow
+    }
+
+    /// A fresh backend generation re-enumerates every source before Ready.
+    /// Keep historical diagnostics and incarnation numbering, but discard
+    /// rejection bookkeeping belonging to the previous enumeration.
+    pub(crate) fn begin_reconciliation(&mut self) {
+        self.rejected.clear();
+        self.rejection_overflow = false;
     }
 
     /// Currently published instances, sorted.
@@ -92,6 +112,28 @@ impl BrowseCache {
             .collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
+    }
+
+    pub(crate) fn observations(&self) -> Vec<ServiceObservation> {
+        let mut rows = Vec::new();
+        for entry in self.entries.values() {
+            for (source, view) in &entry.sources {
+                rows.push(ServiceObservation {
+                    source: source.clone(),
+                    incarnation: entry.incarnations[source],
+                    interface: view.interface.clone(),
+                    service: ServiceInstance {
+                        id: entry.id.clone(),
+                        host: view.host.clone(),
+                        port: view.port,
+                        addresses: view.addresses.iter().copied().collect(),
+                        txt: view.txt.clone(),
+                    },
+                });
+            }
+        }
+        rows.sort_by(|a, b| (&a.service.id, &a.source).cmp(&(&b.service.id, &b.source)));
+        rows
     }
 
     /// `source` reports `view` for `id`.
@@ -106,6 +148,15 @@ impl BrowseCache {
             let n = self.per_kind.entry(id.kind).or_insert(0);
             if *n >= self.max_per_kind {
                 self.dropped += 1;
+                let rejected = (k.0, k.1, source);
+                if self.rejected.contains(&rejected)
+                    || self.rejected.len()
+                        < self.max_per_kind.saturating_mul(ServiceKind::ALL.len())
+                {
+                    self.rejected.insert(rejected);
+                } else {
+                    self.rejection_overflow = true;
+                }
                 return None;
             }
             *n += 1;
@@ -114,20 +165,29 @@ impl BrowseCache {
                 Entry {
                     id,
                     sources: BTreeMap::new(),
+                    incarnations: BTreeMap::new(),
                     published: None,
                 },
             );
         }
+        self.rejected.remove(&(k.0, k.1.clone(), source.clone()));
         let e = self.entries.get_mut(&k)?;
+        let changed = e.sources.get(&source) != Some(&view);
+        if !e.sources.contains_key(&source) {
+            self.next_incarnation += 1;
+            e.incarnations.insert(source.clone(), self.next_incarnation);
+        }
         e.sources.insert(source, view);
-        Self::publish(e)
+        Self::publish(e, changed)
     }
 
     /// `source` no longer sees `id`.
     pub(crate) fn on_removed(&mut self, id: &ServiceId, source: &str) -> Option<BrowseEvent> {
         let k = key(id);
+        self.rejected.remove(&(k.0, k.1.clone(), source.to_owned()));
         let e = self.entries.get_mut(&k)?;
-        e.sources.remove(source);
+        let changed = e.sources.remove(source).is_some();
+        e.incarnations.remove(source);
         if e.sources.is_empty() {
             let e = self.entries.remove(&k)?;
             if let Some(n) = self.per_kind.get_mut(&e.id.kind) {
@@ -135,17 +195,17 @@ impl BrowseCache {
             }
             return e.published.map(|_| BrowseEvent::Disappeared(e.id));
         }
-        Self::publish(e)
+        Self::publish(e, changed)
     }
 
-    fn publish(e: &mut Entry) -> Option<BrowseEvent> {
+    fn publish(e: &mut Entry, source_changed: bool) -> Option<BrowseEvent> {
         let merged = e.merged()?;
         match &e.published {
             None => {
                 e.published = Some(merged.clone());
                 Some(BrowseEvent::Appeared(merged))
             }
-            Some(prev) if *prev != merged => {
+            Some(prev) if *prev != merged || source_changed => {
                 e.published = Some(merged.clone());
                 Some(BrowseEvent::Updated(merged))
             }
@@ -166,11 +226,99 @@ mod tests {
 
     fn view(port: u16, last: u8) -> SourceView {
         SourceView {
+            interface: Some("eth0".into()),
             host: "h.local.".into(),
             port,
             addresses: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))].into(),
             txt: TxtRecord::new(),
         }
+    }
+
+    #[test]
+    fn repeated_refusal_at_capacity_does_not_saturate_failure_tracking() {
+        let mut cache = BrowseCache::new(1);
+        cache.on_resolved(id("admitted"), "s".into(), view(1, 1));
+        for n in 0..ServiceKind::ALL.len() {
+            cache.on_resolved(id(&format!("refused-{n}")), "s".into(), view(1, 1));
+        }
+        cache.on_resolved(id("refused-0"), "s".into(), view(1, 1));
+        for n in 0..ServiceKind::ALL.len() {
+            cache.on_removed(&id(&format!("refused-{n}")), "s");
+        }
+        assert!(cache.reconciled());
+    }
+
+    #[test]
+    fn fresh_backend_enumeration_recovers_saturated_rejection_tracking() {
+        let mut cache = BrowseCache::new(1);
+        cache.on_resolved(id("admitted"), "s".into(), view(1, 1));
+        // Fill the bounded set simultaneously to exercise real saturation.
+        for n in 0..=ServiceKind::ALL.len() {
+            cache.on_resolved(id(&format!("refused-{n}")), "s".into(), view(1, 1));
+        }
+        for n in 0..=ServiceKind::ALL.len() {
+            cache.on_removed(&id(&format!("refused-{n}")), "s");
+        }
+        assert!(!cache.reconciled());
+        let old = cache.observations();
+        let dropped = cache.dropped();
+        cache.begin_reconciliation();
+        assert!(cache.reconciled());
+        assert_eq!(cache.observations(), old);
+        assert_eq!(cache.dropped(), dropped);
+    }
+
+    #[test]
+    fn current_cap_loss_recovers_when_the_refused_source_disappears() {
+        let mut cache = BrowseCache::new(1);
+        cache.on_resolved(id("a"), "s".into(), view(1, 1));
+        cache.on_resolved(id("b"), "s".into(), view(1, 1));
+        assert!(!cache.reconciled());
+        cache.on_removed(&id("b"), "s");
+        assert!(cache.reconciled());
+        assert_eq!(
+            cache.dropped(),
+            1,
+            "diagnostics retain the historical refusal"
+        );
+    }
+
+    #[test]
+    fn source_incarnation_survives_refresh_but_not_identical_reappearance() {
+        let mut cache = BrowseCache::new(10);
+        cache.on_resolved(id("a"), "s".into(), view(1, 1));
+        let first = cache.observations();
+        cache.on_resolved(id("a"), "s".into(), view(1, 1));
+        assert_eq!(cache.observations(), first);
+        cache.on_removed(&id("a"), "s");
+        cache.on_resolved(id("a"), "s".into(), view(1, 1));
+        let next = cache.observations();
+        assert_eq!(next[0].service, first[0].service);
+        assert_ne!(next[0].incarnation, first[0].incarnation);
+    }
+
+    #[test]
+    fn non_primary_source_changes_are_visible_without_changing_merged_txt() {
+        let mut cache = BrowseCache::new(10);
+        cache.on_resolved(id("a"), "first".into(), view(1, 1));
+        let mut second = view(2, 1);
+        second.interface = Some("eth1".into());
+        cache.on_resolved(id("a"), "second".into(), second.clone());
+        let before = cache.current();
+        second.txt.push("process", "9").unwrap();
+        assert!(matches!(
+            cache.on_resolved(id("a"), "second".into(), second.clone()),
+            Some(BrowseEvent::Updated(_))
+        ));
+        assert_eq!(cache.current(), before);
+        let rows = cache.observations();
+        assert_eq!(rows[1].interface.as_deref(), Some("eth1"));
+        assert_eq!(rows[1].service.txt.get_str("process"), Some("9"));
+        assert_eq!(cache.on_resolved(id("a"), "second".into(), second), None);
+        assert!(matches!(
+            cache.on_removed(&id("a"), "second"),
+            Some(BrowseEvent::Updated(_))
+        ));
     }
 
     #[test]

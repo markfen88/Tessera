@@ -98,6 +98,12 @@ to `tessera`; existing passwords are preserved. Dependencies
 are derived from their Debian Depends, plus `avahi-daemon` and `alsa-utils`;
 Trixie's systemd and init-system-helpers are platform prerequisites.
 
+The installer does not configure UFW or firewalld. An existing host firewall
+can therefore block discovery, Controller requests, negotiated media or PTP
+after a successful install. The network helper's interface guards do not add
+allow rules to another firewall. Check the audio interface and permitted peer
+network using the [firewall troubleshooting guidance](troubleshooting.md).
+
 ## Profiles and options
 
 `tessera-bundle install [--profile speaker|ndimon|none] [--admin-user USER]..

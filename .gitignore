@@ -2,3 +2,4 @@
 /dist-release/
 *.log
 .env
+/crates/tessera-web/node_modules/

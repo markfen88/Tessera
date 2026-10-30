@@ -152,8 +152,8 @@ struct FlowEntry {
     id: String,
     device: String,
     direction: Direction,
-    /// rx: the device channels the flow carries, 1-based (as subscriptions
-    /// number them); empty for tx.
+    /// The device channels the flow carries in wire order, 1-based (as
+    /// subscriptions number them); 0 for a position no channel takes.
     channels: Vec<u16>,
     /// Registration number: a flow rebuilt under the same id is a new one.
     serial: u64,
@@ -196,7 +196,8 @@ fn us(ns: u64) -> u64 {
 
 impl MediaStats {
     /// Register an rx flow. `channels` are the device channels it carries,
-    /// 0-based as in the flow plan.
+    /// 0-based as in the flow plan (`plan::UNUSED` for a position no channel
+    /// takes).
     pub fn add_rx(
         &self,
         id: &str,
@@ -205,9 +206,14 @@ impl MediaStats {
         m: Arc<RxMetrics>,
         c: Arc<RxFlowCounters>,
     ) {
+        // Kept in wire order (unused positions as 0): peaks are per position.
         let channels = channels
             .iter()
-            .filter_map(|c| u16::try_from(c.checked_add(1)?).ok())
+            .map(|c| {
+                c.checked_add(1)
+                    .and_then(|c| u16::try_from(c).ok())
+                    .unwrap_or(0)
+            })
             .collect();
         let serial = self.next_serial.fetch_add(1, Relaxed);
         self.flows
@@ -227,8 +233,25 @@ impl MediaStats {
             });
     }
 
-    /// Register a tx flow.
-    pub fn add_tx(&self, id: &str, device: &str, m: Arc<TxMetrics>, send_failures: Arc<Counter>) {
+    /// Register a tx flow. `channels` are the device channels in wire order,
+    /// 0-based as in the flow plan (`plan::UNUSED` for a silent position).
+    pub fn add_tx(
+        &self,
+        id: &str,
+        device: &str,
+        channels: &[u32],
+        m: Arc<TxMetrics>,
+        send_failures: Arc<Counter>,
+    ) {
+        // Kept in wire order (silent positions as 0): peaks are per position.
+        let channels = channels
+            .iter()
+            .map(|c| {
+                c.checked_add(1)
+                    .and_then(|c| u16::try_from(c).ok())
+                    .unwrap_or(0)
+            })
+            .collect();
         self.flows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -236,7 +259,7 @@ impl MediaStats {
                 id: id.to_owned(),
                 device: device.to_owned(),
                 direction: Direction::Tx,
-                channels: Vec::new(),
+                channels,
                 serial: self.next_serial.fetch_add(1, Relaxed),
                 started: Instant::now(),
                 rx: None,
@@ -258,11 +281,85 @@ impl MediaStats {
                 Some(RxActivity {
                     serial: e.serial,
                     device: e.device.clone(),
-                    channels: e.channels.clone(),
+                    channels: e.channels.iter().copied().filter(|c| *c != 0).collect(),
                     packets: e.rx.as_ref()?.packets.get(),
                     started: e.started,
                 })
             })
+            .collect()
+    }
+
+    /// Datagrams the rx flow `id` has accepted so far, if it runs.
+    #[must_use]
+    pub fn rx_packets(&self, id: &str) -> Option<u64> {
+        self.flows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| Some(e.rx.as_ref()?.packets.get()))
+    }
+
+    /// Per rx flow id, the largest packet lateness since the previous call,
+    /// in nanoseconds. Taking resets it: the device-info heartbeat is the
+    /// one reader (`conmon.md` §6, section 0x8003).
+    #[must_use]
+    pub fn take_rx_lateness(&self) -> Vec<(String, u64)> {
+        self.flows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(|e| Some((e.id.clone(), e.rx.as_ref()?.take_max_lateness_ns())))
+            .collect()
+    }
+
+    /// Per device and direction, each channel's peak (absolute left-justified
+    /// sample) since the previous call, the largest over the flows carrying
+    /// it. Taking resets the flows' peaks: the heartbeat is the one reader.
+    #[must_use]
+    pub fn take_peaks(&self) -> Vec<(String, Direction, u16, u64)> {
+        let mut out: Vec<(String, Direction, u16, u64)> = Vec::new();
+        let flows = self.flows.lock().unwrap_or_else(PoisonError::into_inner);
+        for e in flows.iter() {
+            let peaks: Vec<u64> = match (&e.rx, &e.tx) {
+                (Some(m), _) => m.take_peaks().collect(),
+                (_, Some(m)) => m.take_peaks().collect(),
+                _ => continue,
+            };
+            for (ch, peak) in e.channels.iter().zip(peaks).filter(|(ch, _)| **ch != 0) {
+                match out
+                    .iter_mut()
+                    .find(|(d, dir, c, _)| *d == e.device && *dir == e.direction && c == ch)
+                {
+                    Some(slot) => slot.3 = slot.3.max(peak),
+                    None => out.push((e.device.clone(), e.direction, *ch, peak)),
+                }
+            }
+        }
+        out
+    }
+
+    /// Per tx flow id, the monotonic time (ns) its receiver was last heard,
+    /// 0 if never (`tessera_media::TxMetrics::last_keepalive_ns`).
+    #[must_use]
+    pub fn tx_keepalives(&self) -> Vec<(String, u64)> {
+        self.flows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(|e| Some((e.id.clone(), e.tx.as_ref()?.last_keepalive_ns.get())))
+            .collect()
+    }
+
+    /// Per rx flow id, packets that arrived after their playout deadline since
+    /// the flow was created (`metering.md` §2.2).
+    #[must_use]
+    pub fn rx_late_packets(&self) -> Vec<(String, u64)> {
+        self.flows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(|e| Some((e.id.clone(), e.rx.as_ref()?.late_packets.get())))
             .collect()
     }
 
@@ -344,6 +441,7 @@ mod tests {
         s.add_tx(
             "t",
             "main",
+            &[0],
             Arc::new(TxMetrics::default()),
             Arc::new(Counter::new()),
         );
@@ -359,5 +457,35 @@ mod tests {
         assert!(s.rx_activity().is_empty());
         s.add_rx("a", "main", &[0], m, Arc::default());
         assert_ne!(s.rx_activity()[0].serial, v[0].serial);
+    }
+
+    #[test]
+    fn unused_positions_carry_no_channel_and_keep_peaks_in_place() {
+        // A multicast listener taking position 2 of 3 into device channel 4.
+        let s = MediaStats::default();
+        let m = RxMetrics {
+            peaks: (0..3).map(|_| Counter::default()).collect(),
+            ..RxMetrics::default()
+        };
+        m.peaks[0].record_max(9);
+        m.peaks[1].record_max(5);
+        let m = Arc::new(m);
+        let unused = crate::media::plan::UNUSED;
+        s.add_rx(
+            "g",
+            "main",
+            &[unused, 3, unused],
+            Arc::clone(&m),
+            Arc::default(),
+        );
+        assert_eq!(s.rx_activity()[0].channels, vec![4]);
+        assert_eq!(
+            s.take_peaks(),
+            vec![("main".to_owned(), Direction::Rx, 4, 5)]
+        );
+        assert_eq!(s.rx_packets("g"), Some(0));
+        m.packets.add(3);
+        assert_eq!(s.rx_packets("g"), Some(3));
+        assert_eq!(s.rx_packets("missing"), None);
     }
 }

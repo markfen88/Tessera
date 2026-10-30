@@ -4,14 +4,14 @@ members = ["crates/*", "xtask"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.87"
 license = "MPL-2.0"
 repository = "https://github.com/markfen88/Tessera"
 
 [workspace.dependencies]
-tessera-control-types = { path = "crates/tessera-control-types", version = "0.3.0" }
+tessera-control-types = { path = "crates/tessera-control-types", version = "0.5.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

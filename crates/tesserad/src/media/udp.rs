@@ -2,9 +2,11 @@
 //! message arrays that are allocated once (ADR 0004).
 //!
 //! This is where `tesserad`'s media `unsafe` lives: the two batched socket
-//! calls, walking the control messages of a received datagram, and one
-//! `setsockopt`. Each block says why it is sound. Sockets themselves are
-//! created with `std::net::UdpSocket` and configured with `nix`.
+//! calls, walking the control messages of a received datagram, and two
+//! `setsockopt` calls (multicast send interface, group membership). Each
+//! block says why it is sound. Sockets themselves are created with
+//! `std::net::UdpSocket` (or `nix`, for a group listener that must set
+//! `SO_REUSEADDR` before it binds) and configured with `nix`.
 //!
 //! * [`RxSock`] receives up to `batch` datagrams per call into one
 //!   pre-allocated buffer, with the sender address and the kernel's receive
@@ -112,6 +114,37 @@ impl RxSock {
     ) -> io::Result<Self> {
         let sock = UdpSocket::bind(local)?;
         bind_to_device(&sock, iface)?;
+        Self::from_socket(sock, rcvbuf, batch, cap)
+    }
+
+    /// Listen on a multicast group (`flows-media.md` §5): bind the group
+    /// address and port with `SO_REUSEADDR`, so that every listener of the
+    /// group gets its own socket and each receives every datagram, restrict
+    /// the socket to `iface` and join the group there (`ifindex`). The
+    /// membership ends when the last descriptor of the socket is closed.
+    ///
+    /// # Errors
+    /// Socket creation, bind, join or configuration failures.
+    pub fn join(
+        group: SocketAddrV4,
+        iface: &str,
+        ifindex: u32,
+        rcvbuf: usize,
+        batch: usize,
+        cap: usize,
+    ) -> io::Result<Self> {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrIn, bind, socket};
+        let fd = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        let sock = UdpSocket::from(fd);
+        setsockopt(&sock, sockopt::ReuseAddr, &true)?;
+        bind_to_device(&sock, iface)?;
+        bind(sock.as_raw_fd(), &SockaddrIn::from(group))?;
+        join_group(&sock, *group.ip(), ifindex)?;
         Self::from_socket(sock, rcvbuf, batch, cap)
     }
 
@@ -365,6 +398,20 @@ impl std::fmt::Debug for TxSock {
 }
 
 impl TxSock {
+    /// Read up to `max` pending datagrams without blocking and report each
+    /// sender: receivers send their keepalives to the source port of the
+    /// media (`control-flows.md` §7.4). Contents are ignored.
+    pub fn drain(&self, max: usize, mut seen: impl FnMut(SocketAddrV4)) {
+        let mut buf = [0u8; 64];
+        for _ in 0..max {
+            match self.sock.recv_from(&mut buf) {
+                Ok((_, std::net::SocketAddr::V4(from))) => seen(from),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
     /// A socket bound to `local` (any port) that marks its packets with
     /// `dscp` and sends multicast out of the interface that owns `local`.
     /// `batch` datagrams of up to `cap` bytes can be queued per flush.
@@ -534,6 +581,36 @@ fn bind_to_device(sock: &UdpSocket, iface: &str) -> io::Result<()> {
     })
 }
 
+/// Join `group` on the interface with index `ifindex` (`IP_ADD_MEMBERSHIP`
+/// with an `ip_mreqn`: the interface by index, not by an address it may
+/// lose).
+fn join_group(sock: &UdpSocket, group: Ipv4Addr, ifindex: u32) -> io::Result<()> {
+    let req = libc::ip_mreqn {
+        imr_multiaddr: libc::in_addr {
+            s_addr: u32::from(group).to_be(),
+        },
+        imr_address: libc::in_addr { s_addr: 0 },
+        imr_ifindex: i32::try_from(ifindex)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface index"))?,
+    };
+    // SAFETY: `req` outlives the call and its size is passed; the descriptor
+    // is open.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_ADD_MEMBERSHIP,
+            (&raw const req).cast(),
+            size_of::<libc::ip_mreqn>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn set_multicast_if(sock: &UdpSocket, local: Ipv4Addr) -> io::Result<()> {
     let addr = libc::in_addr {
         s_addr: u32::from(local).to_be(),
@@ -622,6 +699,55 @@ mod tests {
         }
         assert!(rx.datagram(5).is_none());
         assert_eq!(rx.recv().unwrap(), 0, "nothing more queued");
+    }
+
+    #[test]
+    fn every_listener_of_a_multicast_group_receives_every_datagram() {
+        let lo = nix::net::if_::if_nametoindex("lo").unwrap();
+        let group = Ipv4Addr::new(239, 255, 77, 1);
+        let mut a = RxSock::join(SocketAddrV4::new(group, 0), "lo", lo, 1 << 16, 8, 64).unwrap();
+        let port = a.local_port().unwrap();
+        // A second listener binds the same group and port.
+        let at = SocketAddrV4::new(group, port);
+        let mut b = RxSock::join(at, "lo", lo, 1 << 16, 8, 64).unwrap();
+        // A unicast socket on the interface address does not see the group.
+        let mut other = RxSock::bind(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            "lo",
+            1 << 16,
+            8,
+            64,
+        )
+        .unwrap();
+        let ctr = Arc::new(Counter::new());
+        let mut tx = TxSock::open(Ipv4Addr::LOCALHOST, "lo", 46, 1 << 16, 8, 64).unwrap();
+        tx.slot(0).unwrap()[..2].copy_from_slice(&[7, 8]);
+        tx.queue(0, 2, at, &ctr);
+        assert_eq!(tx.flush(1).sent, 1);
+        for rx in [&mut a, &mut b] {
+            assert!(wait_for(rx, 1) >= 1, "each listener receives the datagram");
+            let d = rx.datagram(0).unwrap();
+            assert_eq!(d.data, &[7, 8]);
+            assert_eq!(d.src.map(|s| *s.ip()), Some(Ipv4Addr::LOCALHOST));
+        }
+        assert_eq!(other.recv().unwrap(), 0);
+        // Leaving (closing) one listener does not end the other's membership.
+        drop(a);
+        tx.slot(0).unwrap()[..2].copy_from_slice(&[9, 9]);
+        tx.queue(0, 2, at, &ctr);
+        assert_eq!(tx.flush(1).sent, 1);
+        let t = Instant::now();
+        let got = loop {
+            let n = b.recv().unwrap();
+            if (0..n).any(|i| b.datagram(i).is_some_and(|d| d.data == [9, 9])) {
+                break true;
+            }
+            if t.elapsed() > Duration::from_secs(2) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(got, "the remaining listener still receives the group");
     }
 
     #[test]

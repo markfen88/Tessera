@@ -26,33 +26,32 @@ pub const EVENT_PORT: u16 = 319;
 /// UDP general port. spec:3, std Annex D -- `likely`.
 pub const GENERAL_PORT: u16 = 320;
 
-/// DSCP for event messages. `docs/lab.md` quotes vendor QoS guidance (CS7 =
-/// 56) "to be verified"; the spec says the reference sets none -- `guess`.
+/// DSCP for event messages (Sync, Delay_Req): CS7, as the hardware leader
+/// marks its Syncs and software followers their Delay_Reqs. spec:5.4 item 5
+/// -- `confirmed`.
 pub const DSCP_EVENT: u8 = 56;
-/// DSCP for general messages (CS1 = 8, `docs/lab.md`) -- `guess`.
-pub const DSCP_GENERAL: u8 = 8;
-
-/// syncInterval field value written in Delay_Req (log2 s). The reference's
-/// author notes "looks like Dante does it this way" -- spec:2.3 -- `guess`.
-pub const DELAY_REQ_SYNC_INTERVAL_FIELD: i8 = 0x7F;
+/// DSCP for general messages (Follow_Up, Delay_Resp): EF, as the hardware
+/// leader marks them; CS1 is listed as reserved. spec:5.4 item 5 --
+/// `confirmed`.
+pub const DSCP_GENERAL: u8 = 46;
 
 /// Stratum a slave-only node advertises in its own fields. spec:2.3 -- `likely`
 /// (255 = slave-only, std Table 7).
 pub const FOLLOWER_STRATUM: u8 = 255;
-/// Stratum a leader-capable node advertises. 1588-2002 uses 4 for a clock
-/// that is not a primary or secondary reference; Dante's values are UNKNOWN
-/// (P1-Q3). Chosen so that, by the standard ordering, any stratum 1..=3
-/// device wins over us -- `guess`.
-pub const LEADER_STRATUM: u8 = 4;
+/// Stratum a leader-capable node advertises while not preferred. The only
+/// hardware leader value seen is 0x29; ours must be numerically greater (we
+/// lose elections to real hardware, ADR 0005) and not 0xFF (follower only).
+/// spec:5.4 item 2 -- PROVISIONAL until capture C2, no meaning in its bits.
+pub const LEADER_STRATUM: u8 = 0x2A;
 /// Clock identifier of a free-running clock. std Table 7 "DFLT" -- `likely`.
 pub const IDENTIFIER_DFLT: [u8; 4] = *b"DFLT";
 /// Default clock variance (1588-2002 scaled log variance). Recollection of
 /// the value used by public PTPv1 implementations -- `guess`.
 pub const DEFAULT_VARIANCE: i16 = -4000;
 
-/// Sync interval, log2 seconds (0 = 1 s). std §7.5 Table 18 -- `guess`
-/// (spec:4 notes the previous draft's 2 s was unverified).
-pub const SYNC_INTERVAL_LOG2: i8 = 0;
+/// Sync interval, log2 seconds (-2 = 250 ms, four Syncs per second), as the
+/// only leader seen. spec:5.4 item 3 -- `confirmed` for that leader.
+pub const SYNC_INTERVAL_LOG2: i8 = -2;
 /// Missed sync intervals before the parent is declared lost. The standard's
 /// PTP_SYNC_RECEIPT_TIMEOUT is 2 (spec:4, `guess`); 3 is used so that one
 /// lost Sync (a gap of two intervals plus jitter) does not drop the parent.

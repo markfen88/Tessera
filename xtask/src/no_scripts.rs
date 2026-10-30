@@ -95,8 +95,12 @@ fn shell_shebang(line: &[u8]) -> bool {
 }
 
 fn script_extension(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension == "sh" || extension == "py")
+    path.extension().is_some_and(|extension| {
+        extension == "sh"
+            || extension == "py"
+            || (matches!(extension.to_str(), Some("js" | "cjs" | "mjs"))
+                && path != Path::new("crates/tessera-web/assets/generated/live.js"))
+    })
 }
 
 pub(crate) fn check(root: &Path) -> Result<()> {
@@ -126,7 +130,9 @@ pub(crate) fn check(root: &Path) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        let mut is_script = script_extension(&path);
+        // This exact generated asset is checked against its TypeScript source
+        // by web-assets --check. Other JavaScript files are authored source.
+        let mut is_script = script_extension(Path::new(name));
         if !is_script && metadata.is_file() {
             let file = File::open(&path)?;
             let mut reader = BufReader::new(file.take(4096));
@@ -186,6 +192,13 @@ mod tests {
     fn extensions_apply_even_without_an_executable_bit_or_shebang() {
         assert!(script_extension(Path::new("packaging/build.sh")));
         assert!(script_extension(Path::new("tools/helper.py")));
+        assert!(script_extension(Path::new("assets/handwritten.js")));
+        assert!(script_extension(Path::new("tests/handwritten.cjs")));
+        assert!(script_extension(Path::new("tools/handwritten.mjs")));
+        assert!(!script_extension(Path::new(
+            "crates/tessera-web/assets/generated/live.js"
+        )));
+        assert!(!script_extension(Path::new("assets/live.ts")));
         assert!(!script_extension(Path::new("docs/shell.md")));
         assert!(!script_extension(Path::new("src/main.rs")));
     }

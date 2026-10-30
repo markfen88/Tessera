@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-clock"
 description = "PTPv1 follower/leader, servo, media clock, SW/HW timestamping"
 version.workspace = true
@@ -9,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+autotests = false
+autoexamples = false
+autobenches = false
 
 [lints]
 workspace = true
@@ -22,16 +22,15 @@ std = []
 # publisher). `unsafe` lives only in `platform` (ADR 0002).
 linux = ["std", "dep:tessera-audio-ipc", "dep:socket2", "dep:nix", "dep:libc", "dep:rtrb"]
 
-[lib]
-test = false
-bench = false
-doctest = false
-
 [dependencies]
 # Read-only dependency: only the clock-overlay writer is used (publisher adapter).
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.3.0", optional = true }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.5.0", optional = true }
 socket2 = { version = "0.6", optional = true, features = ["all"] }
 nix = { version = "0.31", optional = true, default-features = false, features = ["socket", "net", "poll", "event", "time", "signal", "sched", "uio"] }
 libc = { version = "0.2", optional = true }
 rtrb = { version = "0.4", optional = true }
 
+[lib]
+test = false
+bench = false
+doctest = false

@@ -215,3 +215,114 @@ fn check_dates_at(source: &Path, epoch: i64) -> Result<()> {
         utc_text(epoch)
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::files::TempDir;
+
+    #[test]
+    fn snapshot_history_retains_older_news_without_inventing_a_final_release() {
+        let dir = TempDir::new("tessera-changelog-history").unwrap();
+        let path = dir.path().join("NEWS");
+        let original = "tessera (0.2.1-1) unstable; urgency=medium\n\n  Final notes.\n\n -- tessera maintainers <tessera@invalid>  Thu, 22 Oct 2026 12:00:00 +0000\n\ntessera (0.2.0-1) unstable; urgency=medium\n\n  Previous notes.\n";
+        fs::write(&path, original).unwrap();
+        let preview = changelog_history(
+            &path,
+            "tessera",
+            "0.2.1-1~gabcdef0",
+            "Maintainer <contact@example.org>",
+        )
+        .unwrap();
+        assert!(!preview.contains("0.2.1-1"));
+        assert!(preview.contains("0.2.0-1"));
+        let later = changelog_history(
+            &path,
+            "tessera",
+            "0.2.1-2",
+            "Maintainer <contact@example.org>",
+        )
+        .unwrap();
+        assert!(later.contains("0.2.1-1") && later.contains("0.2.0-1"));
+        assert!(later.contains("Maintainer <contact@example.org>"));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn changelog_trailer_dates_are_read_in_utc() {
+        for (date, epoch) in [
+            ("Mon, 26 Oct 2026 00:00:00 +0000", 1_792_972_800),
+            ("Mon, 26 Oct 2026 12:00:00 +0000", 1_793_016_000),
+            ("26 Oct 2026 14:00:00 +0200", 1_793_016_000),
+            ("Mon, 26 Oct 2026 07:00 -0500", 1_793_016_000),
+            ("Thu, 01 Jan 1970 00:00:00 +0000", 0),
+            ("Tue, 29 Feb 2000 23:59:59 +0000", 951_868_799),
+        ] {
+            assert_eq!(rfc2822_epoch(date), Some(epoch), "{date}");
+        }
+        for bad in [
+            "",
+            "Mon, 26 Foo 2026 00:00:00 +0000",
+            "Mon, 26 Oct 2026 00:00:00",
+            "Mon, 26 Oct 2026 00:00:00 UTC",
+            "Mon, 32 Oct 2026 00:00:00 +0000",
+            "Mon, x Oct 2026 00:00:00 +0000",
+        ] {
+            assert_eq!(rfc2822_epoch(bad), None, "{bad:?}");
+        }
+        assert_eq!(utc_text(1_792_986_360), "2026-10-26 03:46:00 UTC");
+        for days in [-1, 0, 59, 11_016, 20_752, 100_000] {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), days);
+        }
+    }
+
+    #[test]
+    fn a_news_entry_dated_after_the_build_is_named_with_the_way_out() {
+        let dir = TempDir::new("tessera-news-dates").unwrap();
+        let path = dir.path().join("NEWS.Debian");
+        let news = "tessera (0.3.0-1) unstable; urgency=medium\n\n  Notes.\n\n -- tessera maintainers <tessera@invalid>  Mon, 26 Oct 2026 12:00:00 +0000\n\ntessera (0.2.2-1) unstable; urgency=medium\n\n -- tessera maintainers <tessera@invalid>  Fri, 23 Oct 2026 12:00:00 +0000\n";
+        fs::write(&path, news).unwrap();
+        // A commit at 03:46 UTC on 26 October, before the entry's 12:00.
+        let message = check_dates_at(&path, 1_792_986_360)
+            .unwrap_err()
+            .to_string();
+        for part in [
+            "0.3.0-1 (Mon, 26 Oct 2026 12:00:00 +0000)",
+            "2026-10-26 03:46:00 UTC",
+            "SOURCE_DATE_EPOCH",
+            "latest-changelog-entry-without-new-date",
+            "no later than the release commit",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        assert!(!message.contains("0.2.2-1"), "{message}");
+        // At the entry's time, or after it, nothing is wrong.
+        check_dates_at(&path, 1_793_016_000).unwrap();
+        check_dates_at(&path, 1_793_016_001).unwrap();
+        // The shipped entry is dated at the start of the release day, which
+        // the history from 26 October 2026 on is always later than.
+        let shipped = include_str!("../../packaging/NEWS.Debian");
+        let late: Vec<_> = entries_dated_after(shipped, "tessera", 1_792_972_800)
+            .into_iter()
+            .map(|(version, _)| version)
+            .collect();
+        assert!(!late.iter().any(|version| version == "0.3.0-1"), "{late:?}");
+    }
+
+    #[test]
+    fn header_parser_accepts_release_versions_and_rejects_bad_headers() {
+        for version in ["0.2.1-1", "0.2.0~beta-1", "1:0.2.1-1"] {
+            let text = format!("tessera ({version}) unstable; urgency=medium\n");
+            assert_eq!(entry_version(&text, "tessera").unwrap(), version);
+        }
+        for text in [
+            "",
+            "other (1.0) unstable",
+            "tessera () unstable",
+            "tessera (1.0)",
+        ] {
+            assert!(entry_version(text, "tessera").is_err(), "{text:?}");
+        }
+    }
+}

@@ -11,6 +11,7 @@ The keys are one table in `schema.rs`. The [schema reference](#schema-reference)
 | `/etc/tessera/config.toml` | the package (a conffile) | the **reference**: every key commented out at its default, each with what it does and why, its unit, range, apply class and restart scope. Nothing in it is active; keep it as shipped. `tesserad --print-default-config` prints the reference of the installed version; a copy is installed as `/usr/share/doc/tessera/examples/config.toml`, which is absent on images that strip `/usr/share/doc` |
 | `/etc/tessera/config.d/*.toml` | you, other packages | **your configuration**: drop-ins applied in lexical order; tables merge, scalars and arrays replace, `[[device]]` entries merge by `id` (see "Drop-ins"). Copy the lines you want from the reference into a file here and change them |
 | `/var/lib/tessera/state.toml` | `tesserad` | current values changed at run time with `tesseractl`, the web portal or a network controller (the packaged Controller compatibility runtime), including the controller flow set; do not edit while running |
+| `/var/lib/tessera/access-lock.toml` | `tesserad` | the [device access lock](#device-access-lock): which devices are locked and a hash of each PIN; mode 0600; never edit |
 
 An empty configuration is valid: the defaults give one device named after the host, 2 receive and 2 transmit channels, 48 kHz. Unknown keys are errors, so a daemon older than a key refuses a file that uses it. How the package treats the conffile on an upgrade: [the user guide](user-guide.md#8-upgrade-and-rollback).
 
@@ -32,7 +33,7 @@ Runtime commands (protocol / CLI / web) are validated against bounds and locks, 
 **`locked`.** A key listed in a device's `locked` (`name`, `sample_rate`, `encoding`, `latency`, `rx_channels`, `tx_channels`, `rx_channel_labels`,
 `tx_channel_labels`), in `[control] locked` (`flows`), in `[clock] locked` (`role`, `priority`) or in `[network] locked` (`primary`) is pinned by the configuration (unless the command line overrides it, step 1): `state.toml` (step 3)
 is skipped for it, the value from the files (`config.d` over `config.toml` over the default) is the one in effect, and a command that would change it
-(`tesseractl`, the web portal, a network controller) is refused with a `Locked` error naming the key. Removing a key from `locked` makes it
+(`tesseractl`, the web portal, a network controller) is refused with a `Locked` error naming the key. A locked sample rate or encoding is offered to a network controller as its only value. Removing a key from `locked` makes it
 changeable again; a state value that was stored before is then ignored until something changes the key. A `locked` entry protects a key from run-time commands only,
 not from a later drop-in (see "Locks and drop-ins").
 
@@ -91,7 +92,13 @@ install as `/etc/tessera/config.toml`.
 Command-line only: `--config-dir` (where the files are, so it cannot be one of their keys), `--state-dir` and `--runtime-dir` (explicit
 locations for this process, for a separate instance; the configured ones are `[daemon] state_dir` and `runtime_dir`; with
 `--state-dir` the configured `state_dir` is not used by this process, so a reload that changes it is accepted, and it is listed as a
-restart key although a restart with the same `--state-dir` would not use it either), `--print-default-config`, `--help`, `--version`.
+restart key although a restart with the same `--state-dir` would not use it either), `--print-default-config`, `--help`, `--version`,
+and the native device role: `--native-device` (serve the device role in the daemon instead of the compatibility runtime),
+`--native-vendor` (the vendor field of its device-information messages, default `tessera`; use the `--vendor` value of
+`/usr/lib/tessera/controller.args`) and `--native-identify-secs` (how long a controller's identify request is shown, default 10, at
+least 1). They are a deployment choice made together with disabling `tessera-controller@main`, so they are set in a drop-in for
+`tesserad.service` (`Environment=TESSERA_NATIVE_DEVICE=true`, `TESSERA_NATIVE_VENDOR=...`, `TESSERA_NATIVE_IDENTIFY_SECS=...`), not in
+these files; see [the native device role](interoperability.md#native-device-role).
 
 `--socket-group` and `[control] socket_group`: a group given either way that cannot be applied is an error at start (before this release only
 the option existed; the file key is new and just as strict). Unset, the sockets get the group `tessera` if it exists, else the daemon's
@@ -210,6 +217,7 @@ mlock = true                       # mlockall after start-up; a refusal is repor
 [discovery]
 mdns = "auto"                      # auto | avahi | builtin | off
 advertise_devices = true           # advertise devices with mDNS; the packaged Controller runtime serves the advertised ports
+browse_devices = false             # opt-in read-only catalogue; no routing commands
 
 [backends]
 enabled = ["pipewire", "alsa"]     # clients meant to attach; today only "empty = no audio.sock" (with `[audio] socket = "auto"`) is enforced
@@ -254,6 +262,51 @@ peer = "192.0.2.2"                 # tx: destination (required); rx: the one sen
 port = 5004                        # tx: destination port; rx: local UDP port to listen on
 ```
 
+## Receiver routing
+
+Use **Routing** in the portal ([web-portal.md](web-portal.md#routing)) or
+`tesseractl routing` ([cli.md](cli.md#routing)) for Connect, Replace and
+Disconnect. The matrix places TX devices/channels down the left and RX
+devices/channels across the top. Expand or collapse devices, filter either axis,
+then click a crosspoint to review the change. Default channel labels display as
+numbers; custom labels are kept. The receiver-first list is available on narrow
+screens and through **List**. Receiving indicates local packet activity, not
+verified source audio. Channel spaces and mixed case are valid; device names
+follow the separate device-name rules. Discovery browsing
+(`[discovery] browse_devices = true`) must be on for the matrix to list devices.
+
+Who carries out a change depends on the receiver. A host with the
+[native device role](interoperability.md#native-device-role) stores the selection
+as a subscription and its daemon requests the flow; one source channel may feed
+several of its inputs. A host on the compatibility runtime has the runtime carry
+it out; there a source channel feeds only one input of that receiver, and plain
+`subscribe`/`unsubscribe` of its first device are refused while the runtime is
+registered ("saved-intent writes to the active local receiver require a receiver
+operation"), so they cannot bypass these checks. Another device's receiver is
+written over that device's control protocol, and that device applies its own
+locks; only receivers whose inputs fit on one page can be routed that way.
+
+The host that sends the change must qualify every source on another host in
+`[control] routing_sources = ["0123456789abcdef"]` (the source's 16-digit device
+ID; the Routing page shows it in the device's column title). The host's own
+transmitter needs no entry; the default is an empty list. Both old and new source
+hosts must qualify for replacement; removal also checks the old source.
+Qualification is operator policy, not authentication of discovery or automatic
+proof of the remote host's current readiness. The source must run the same
+sample rate and encoding as this host's first device.
+
+Both `flows` and `subscriptions` control locks block execution (`subscriptions`
+refuses the change before anything is sent; `flows` keeps the carrier from being
+installed), and so does the [device access lock](#device-access-lock). Saved or
+configured carriers retain their protection. An uncertain operation blocks more
+writes, including after restart, until explicit inspection and reconciliation;
+there is no retry or route reassertion. Receiver-confirmed names do not prove
+media or audible source selection. On a host with the compatibility runtime,
+restored carrier ownership currently needs explicit maintenance after a
+daemon/runtime restart; this must not be treated as unattended production
+restart recovery. The newer receiver protocol variants of current vendor devices
+are not supported.
+
 ## Validation (all errors reported together, with key paths)
 
 - Channel counts 0..=65535 (16-bit on the wire; no other fixed limit). A device with 0 receive and 0 transmit channels is an error (the message says the device has no channels); one direction at 0 is fine.
@@ -262,14 +315,28 @@ port = 5004                        # tx: destination port; rx: local UDP port to
 - `latency_us` within `latency_bounds_us`; the minimum bound at least 1 and not above the maximum. A latency below the platform timing
   floor (1000 us on x86, 2000 us on ARM) is an error, or only a warning when the device sets `allow_unsafe_latency = true` (a
   per-device key, not global).
-- Device names and labels: at most 31 UTF-8 bytes, with control characters refused.
+- Existing/configured device names and labels retain the wire safety checks:
+  nonempty, at most 31 UTF-8 bytes, no control characters. Names outside the
+  interoperability character rules below produce a warning and remain unchanged.
+- New device renames: 1–31 ASCII letters, digits or hyphens, without a leading
+  or trailing hyphen. Case is preserved; comparisons ignore case. Names must be
+  unique on the network (local collision checks cannot guarantee remote uniqueness).
+- New RX/TX label edits: 1–31 ASCII characters, with spaces and mixed case
+  allowed; `=`, `.` and `@` are refused. Labels must be unique within their
+  direction, ignoring case, including defaults. Reset is refused if the
+  restored configured/default label would duplicate another channel. Numeric
+  labels, `RX 1`, `TX 1` and `Analog L` are all valid (naming decision: ADR
+  0008, amendment of 2026-10-28).
+  Renaming a live device or transmitter label can break subscriptions; existing
+  names and saved source selections are never automatically rewritten.
 - Interface names must exist (warning at load, error at start); wireless refused unless allowed.
 - Unique `device.id`s.
 - `[[bridge]]`: see "Hardware-card bridges" below (unique names, an existing device, a channel range inside the device that no other
   enabled bridge of that device and direction uses, a card used once per direction, the device's rate, usable sizes and loop tuning). A
   `tesserad` built without the `alsa-bridge` feature refuses any `[[bridge]]` entry, also a disabled one.
-- `[[flow]]`: unique ids (letters, digits, `_`, `-`), an existing device, channels within the device's channel count in that direction and not
-  repeated, a non-zero port, a `peer` for tx flows, `frames_per_packet` of at least 1, no two rx flows on one port. Whether a packet of
+- `[[flow]]`: unique ids (letters, digits, `_`, `-`), an existing device, channels within the device's channel count in that direction,
+  a non-zero port, a `peer` for tx flows, `frames_per_packet` of at least 1, no two rx flows on one port. RX destination channels cannot
+  repeat. TX source channels may repeat in wire order, so one source can feed several receiver slots in the same carrier. Whether a packet of
   `frames_per_packet` frames fits `[network] mtu_payload` depends on the packet format and the channel count; the daemon checks it when it
   builds the flow (a flow that cannot be built is reported in the log and retried, the others run).
 
@@ -393,6 +460,39 @@ tx_device = "stagebox-a"
 
 Subscriptions are kept by name even when they do not currently resolve.
 
+## Device access lock
+
+`tesseractl access lock` and the portal's Lock button freeze a device behind a four-digit PIN (what the commands refuse
+and allow: [`tesseractl access`](cli.md#access)). It is run-time state, not configuration: there is no key for it, a
+reload does not change it, and it is not the `locked` lists of this page, which pin single keys to the files.
+
+The daemon keeps it in its own file beside `state.toml`, `access-lock.toml` (in `[daemon] state_dir`, or the
+`--state-dir` of the process), written before a change takes effect and replaced atomically:
+
+```toml
+# Device access lock of tesserad. Written by the
+# daemon; do not edit. Keep this file mode 0600.
+version = 1
+
+[device.main]
+verifier = "$argon2id$v=19$m=19456,t=2,p=1$...$..."
+```
+
+* **What protects the PIN is the file mode, not the hash.** The file is mode 0600, owned by the daemon's user;
+  `state.toml` (0640, group-readable) never holds anything of the lock. Each locked device has a salted Argon2id hash
+  of its PIN (19 MiB, 2 passes; a few tens of milliseconds of the state thread per lock or unlock). With only 10 000
+  possible PINs, anyone who can read the file can find the PIN by trying them all: the hash only keeps the digits out
+  of casual reading (a backup listing, a support bundle). Treat the file like a password file. The PIN itself is never
+  written, logged, shown in a status, event or reply, or kept by the portal.
+* **Not cleared by a reset.** A factory reset or clear configuration (`ClearConfiguration`) is refused while the
+  device is locked and never touches this file. Removing the device from the configuration keeps its lock for when
+  it comes back. The wrong-PIN count (five per device and kind of client, then 60 s) is kept in memory only.
+* **Unreadable file.** If the daemon cannot read or understand the file at start, it keeps every configured device
+  locked, with no PIN that opens it, and says so in the status warnings; `tesseractl access reset` (root or the admin
+  group) unlocks each device and rewrites the file. A file others can read is made 0600 at start.
+* **Recovery.** A forgotten PIN: `sudo tesseractl access reset`. Deleting the file while the daemon is stopped unlocks
+  every device too.
+
 ## Static flows (PROVISIONAL)
 
 **Provisional static flow configuration; automatic vendor flow control is unavailable.** A hand-written `[[flow]]` opens a receive
@@ -405,19 +505,23 @@ Host flows belong to configuration files. Controller flows are a separate set in
 `state.toml`, replaced atomically by `set_protocol_flows`; both use the flow rules
 below. Across the effective set there can be only **one flow per peer, port and
 direction**, even across devices or explicit interfaces. RX port and channel
-exclusivity also apply. Opposite directions may share a peer and port.
+exclusivity also apply. Opposite directions may share a peer and port. RX flows
+that listen on one multicast group (the group as `local_address`) are the
+exception: each socket bound to the group receives every datagram, so they may
+share the group's port and sender (one flow per input), but still not a device
+channel.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `id` | required | Name of the flow (letters, digits, `_`, `-`); appears in metrics and logs, never on the wire. |
 | `direction` | required | `rx` (network to device) or `tx` (device to network). |
 | `device` | required | `id` of the device the flow belongs to. Rate, bit depth and latency come from the device and follow its changes. |
-| `channels` | all channels of the device in that direction | Device channels (1-based) in wire order. The i-th entry is the i-th channel of the packet. |
-| `peer` | none | `tx`: destination address (required; unicast, or a multicast group: the send interface is the flow's interface). `rx`: the **only sender accepted**: datagrams from any other address are dropped and counted (`engine.rx_filtered`), so another host on the segment cannot inject audio. An rx flow needs `peer` or `any_source = true`. The address must be a usable unicast address (not `0.0.0.0`, not broadcast, not multicast): receiving from a multicast group is **not supported yet**. |
+| `channels` | all channels of the device in that direction | Device channels (1-based) in wire order. The i-th entry is the i-th channel of the packet. In an rx flow on a multicast group, `0` marks a position that no device channel takes (the group carries what its transmitter chose); in a tx flow, `0` is a position sent as silence, as a receiver may request (`control-flows.md` 1), and at least one entry must not be `0`. |
+| `peer` | none | `tx`: destination address (required; unicast, or a multicast group: the send interface is the flow's interface). `rx`: the **only sender accepted**: datagrams from any other address are dropped and counted (`engine.rx_filtered`), so another host on the segment cannot inject audio. An rx flow needs `peer` or `any_source = true`. The address must be a usable unicast address (not `0.0.0.0`, not broadcast, not multicast): to receive a multicast group, set the group as `local_address` and the transmitter's own address here. |
 | `any_source` | `false` | `rx`: accept datagrams from any address (an explicit opt-in; contradicts `peer`). |
 | `port` | required | `tx`: destination UDP port. `rx`: local UDP port to listen on. |
 | `interface` | first of `[network] interfaces` (or the default wired interface) | The interface; its first IPv4 address is bound, and the flow's sockets are restricted to it with `SO_BINDTODEVICE` (unprivileged on Linux 5.7 and later; a flow whose socket cannot be restricted does not start). A wireless interface is refused unless `allow_wireless`. |
-| `local_address` | the interface's address | Override of the bound address. |
+| `local_address` | the interface's address | Override of the bound address. `rx`: a multicast group address binds the group and joins it on the flow's interface (multicast reception, `flows-media.md` 5); such a flow sends no keepalives. Only an rx flow may name a group here. |
 | `format` | `"reference"` | Packet format; `reference` is the only one until the real format exists. |
 | `frames_per_packet` | `tx`: 32 at 48 kHz (a 667 us packet, rounded to frames, reduced to fit the MTU) | Frames per packet. Bounded by `floor((mtu_payload - 9) / (channels * bytes per sample))`. A hardware receiver asks for a frame count in its flow request; `tesserad` does not negotiate it, so set this to what the receiver asks for. Automatic negotiation is unavailable. |
 | `send_offset_us` | 0 | `tx`: extra delay after a packet's last frame before it is sent (`tx_send_offset`). |
@@ -444,7 +548,7 @@ How a flow behaves:
   `rx_keepalive_timeout_ms` (default 10000) without media they stop, and they start again with the next packet; `0` keeps them going as
   long as the flow exists. `rx_keepalive_payload` is `empty` (default: a zero-length datagram, as a hardware receiver sends) or `1337`
   (the two bytes `13 37`, an alternative form, provisional). These three are `[defaults.flow]` keys, and a `[[flow]]` can override each. Counted per flow as `keepalives_sent` and `keepalive_failures` (`tesseractl
-  metrics --json`). Multicast reception is not supported yet; multicast flows need no keepalives.
+  metrics --json`). An rx flow on a multicast group sends none: multicast flows need no keepalives.
 * A change of the device's rate, encoding, latency or channel count rebuilds the device's flows and detaches its audio clients, which re-attach
   with the new ring geometry.
 * `SIGHUP` (or `tesseractl config reload`) applies added, changed and removed flows without touching the others and without detaching clients.
@@ -492,6 +596,15 @@ lock clears stored controller intent to an explicit empty set; unlocking never
 restores old flows. A later drop-in can add a lock but cannot remove an earlier
 one. Clock and primary-interface locks retain their existing precedence.
 
+`subscriptions` refuses runtime `Subscribe` and `Unsubscribe` intent changes
+from every command origin, including confirmed requests, with
+`locked { field: "subscriptions" }`. Existing legacy subscription intent
+remains stored. Runtime RX-count reductions are also refused because they
+delete subscription intent; administrator configuration reload remains allowed.
+This lock leaves compatibility-runtime flow reports subject
+to the separate `flows` lock. Upgrade the daemon before adding the new key;
+older versions reject unknown lock names.
+
 `locked_value_refused` reports the full field path, the attempted origin and a
 small attempted value where useful. `runtime_value_changed` reports every changed
 runtime intent field and origin, including clears. These events follow the
@@ -507,7 +620,7 @@ For one transition release the loader still accepts a reserved
 is treated as controller fallback and cannot replace host flow entries. As soon
 as `state.toml` contains `protocol_flows`, even `protocol_flows = []`, that set wins
 and the old file is ignored with a warning (including stale invalid contents).
-**Support for the file is removed in 0.4.0.** (0.3.0 still reads it.) Ordinary host flow drop-ins retain
+**The file is still read in 0.5.0 and remains deprecated; its removal is deferred.** Ordinary host flow drop-ins retain
 the existing whole-list replacement semantics; include their complete host set.
 If stored controller intent becomes invalid after a host edit, it is kept but
 inactive with a warning; no conflicting flow runs.
@@ -533,7 +646,7 @@ a configuration that has any `[[bridge]]` entry, at start and at reload, with an
 | `direction` | `playback` | `playback` or `capture`; the older `rx` / `tx` mean the same. |
 | `first_channel` | `1` | First device channel (1-based); card channel 1 carries it. |
 | `channels` | the rest of the device's channels | Channel count, which is also the card's. The older form, a list such as `[3, 4]`, is accepted if it is one ascending run. |
-| `sample_rate` | the device's | Must equal the device's rate: the resampler's nominal ratio is 1, it compensates drift, not rate differences. Left out, the bridge follows the device (a rate change restarts it). Set, it pins the rate: `tesseractl set-rate` to another rate is refused while the bridge is enabled, and a reload that pins (or re-enables a bridge pinning) a rate other than the device's *effective* rate (including one set at run time) is refused. |
+| `sample_rate` | the device's | Must equal the device's rate: the resampler's nominal ratio is 1, it compensates drift, not rate differences. Left out, the bridge follows the device (a rate change restarts it). Set, it pins the rate: `tesseractl set-rate` to another rate is refused while the bridge is enabled, and a reload that pins (or re-enables a bridge pinning) a rate other than the device's *effective* rate (including one set at run time) is refused. A network controller is then offered this rate alone (as not changeable), and the portal and `tesseractl status` name the bridge that fixes it. |
 | `period_frames` | 10 ms at the device rate | Frames per card period (the card may round it). |
 | `buffer_frames` | 4 periods | Card buffer, at least two periods. The bridge keeps all but one period queued (3 of 4 periods by default: 30 ms of card latency at 10 ms periods), so the playback path adds about that to the device latency. |
 | `resampler` | `auto` | `off`, `linear`, `cubic`, `sinc-fast`, `sinc-hq` or `auto` (= `[backends] resampler`, whose `auto` is `cubic` on ARM and `sinc-fast` elsewhere). `off` disables drift compensation: the position error is then removed by re-anchoring, an audible slip. |
@@ -643,12 +756,17 @@ What is applied live (reload, `tesseractl`, the portal) and what needs a restart
 | `[engine]` (`workers`, `tick_us`, `rt_priority`, `ptp_rt_priority`, `cpu_affinity`, `mlock`, the batch and buffer sizes) | Takes effect at the next service start: a reload logs each changed key by name and the status shows it until then. `ptp_rt_priority` and the PTP CPU are read at start too (a PTP runner restarted for an interface change keeps the values the daemon started with). |
 
 * **Priority mapping (PROVISIONAL, confidence: guess).** PTPv1 has no priority field. `tessera-clock` compares dataset members in the order
-  preferred, stratum, identifier, variance, ...; a leader-capable port advertises `[clock] priority` (lower wins, default 128) as: *preferred* for
-  priority below 64; *stratum* 4 up to priority 128 and one worse per further 32 (255 gives 7; never 1-3, which could outrank hardware); and
-  *variance* around the reference default (-4000, 16 per step) for the fine ordering. The default priority advertises exactly what an unconfigured
-  leader-capable port does (stratum 4, not preferred, variance -4000). A lower priority never loses on any criterion. A follower advertises
-  slave-only (stratum 255) whatever the priority, so a priority change on a follower sends nothing. A node promoted live from follower keeps its
-  current timeline: no jump to TAI and no epoch change, unlike a first start as a leader.
+  preferred, stratum, identifier, variance, ...; between two preferred clocks only the lower MAC decides.
+  A leader-capable port advertises `[clock] priority` (lower wins, default 128) as: *preferred* (Preferred Leader) for priority below 64, with
+  the stratum and variance of the default priority, so that turning Preferred Leader on or off changes only the preferred flag; otherwise
+  *stratum* 0x2A up to priority 128 and one worse per further 32 (255 gives 0x2D; never 0x29 or lower, so that hardware leaders keep precedence,
+  and never 255), and *variance* around the reference default (-4000, 16 per step) for the fine ordering. The default priority advertises exactly
+  what an unconfigured leader-capable port does (stratum 0x2A, not preferred, variance -4000). A lower priority never loses on any criterion.
+  A follower advertises slave-only (stratum 255) whatever the priority, so a priority change on a follower sends nothing. A node promoted live
+  from follower keeps its current timeline: no jump to TAI and no epoch change, unlike a first start as a leader.
+* **Another Preferred Leader while this device leads.** Role `auto` follows a preferred clock that wins the election; role `leader` never
+  yields. While either leads and hears another clock that advertises itself as preferred, both may be sending Sync: the daemon logs a
+  warning once per such clock and episode, and `tesseractl status` shows a warning (`clock.<interface>`) for as long as it is heard.
 * **Primary interface.** In order: with `[network] locked = ["primary"]` the configured or automatic choice, and runtime selection is refused;
   else a runtime selection (`tesseractl network primary <name>`) if its interface exists, has an IPv4 address and is not Wi-Fi (unless
   `allow_wireless`); else the first entry of `[network] interfaces`; else automatically the first wired, non-virtual interface (by name) with
@@ -731,6 +849,7 @@ daemon itself.
 | `set_sample_rate`, `set_encoding`, `set_latency` | device | the device's flows are rebuilt and its audio clients detached (new ring geometry) |
 | `set_device_channels` | device | as above; channels beyond the new counts and their subscriptions are removed |
 | `set_primary_interface` | device (every device) | PTP restarts on the new interface and every flow moves |
+| `clear_configuration` | device (every device when the primary interface selection goes) | rate, encoding and latency return to the configuration; subscriptions and controller flows go |
 | `reload_config` | computed from the changed files | device for geometry, interfaces, `[[flow]]`/`[[bridge]]` entries, MTU, Wi-Fi permission or a removed device; changed `restart` keys are listed, not gated |
 
 **Runtime channel counts.** `set_device_channels` changes a device's RX and TX channel counts and stores them in `state.toml`. A device
@@ -787,7 +906,9 @@ The local control socket (`control.sock`) used by tesseractl and the web portal:
 
 | Key | Type | Default | Unit | Range | Apply | Restart scope | What and why |
 |---|---|---|---|---|---|---|---|
-| `locked` | array | `[]` |  | flows | reload | none | Host-owned runtime domains. flows refuses controller flow commands and uses only host-configured flows. |
+| `routing_sources` | array | `[]` |  | qualified native wire identities (16 hexadecimal digits) | reload | none | Operator-qualified native source hosts for the initial local receiver operation class. Empty disables execution. Qualify report preservation on every affected host before adding an identity; discovery is not authentication. Changes invalidate managed runtime binding and require a controlled runtime restart. |
+| `locked` | array | `[]` |  | flows, subscriptions | reload | none | Host-owned runtime domains. flows refuses controller flow commands and uses only host-configured flows. subscriptions refuses runtime subscription intent changes; existing legacy intent remains stored. |
+| `allow_factory_reset` | boolean | `false` |  | true\|false | reload | none | Accept a factory reset or clear configuration (a network controller's, or the clear_configuration command): the device's name, labels, subscriptions, sample rate, encoding, latency, clock role and priority, its controller and manual multicast flows and, unless network settings are kept, the primary interface selection go back to these files, and the native device role restarts. Off by default because it removes routes on a live system. |
 | `max_frame_bytes` | integer | `1048576` | bytes | 65536..=4294967295 | reload | none | Largest request or response on the control socket. Clients learn it from the status. Raise it if a status with very many devices or channels is refused as too large. |
 | `max_connections` | integer | `256` |  | >= 1 | reload | none | Most simultaneous control connections (all users). |
 | `max_connections_per_uid` | integer | `16` |  | >= 1 | reload | none | Most control connections one user may hold, so one user cannot use up the slots. |
@@ -871,6 +992,7 @@ mDNS advertisement of the logical devices.
 | `enabled` | boolean | `true` |  | true\|false | restart | daemon | Discovery at all. false advertises nothing whatever advertise_devices says (--no-discovery). Read at start only. |
 | `mdns` | string | `"auto"` |  | auto\|avahi\|builtin\|off | reload | none | mDNS implementation: auto uses Avahi if it is on the bus, else the built-in responder. |
 | `advertise_devices` | boolean | `true` |  | true\|false | reload | none | Advertise the logical devices. Enabled by default with the packaged Controller compatibility runtime. |
+| `browse_devices` | boolean | `false` |  | true\|false | reload | none | Browse permitted interfaces for the read-only routing catalogue. Does not send routing commands. |
 
 #### `[backends]`
 

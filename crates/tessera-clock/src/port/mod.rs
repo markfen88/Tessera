@@ -20,7 +20,7 @@ mod leader;
 use crate::action::{Action, ActionSink, Channel, PortEvent};
 use crate::bmc::{ClockDataset, ForeignMaster, ForeignMasters, QualifyParams};
 use crate::command::PortCommand;
-use crate::config::{PortConfig, Role, SubdomainPolicy};
+use crate::config::{LocalClock, PortConfig, Role, SubdomainPolicy};
 use crate::media_clock::{ClockState, MediaClock, MediaClockSnapshot, gm_identity_from_uuid};
 use crate::servo::Servo;
 use crate::time::{LocalNs, MediaNs, interval_ns};
@@ -454,6 +454,40 @@ impl<const N: usize> Port<N> {
         self.foreign.len()
     }
 
+    /// While this port leads: the grandmaster of a qualified foreign clock
+    /// that advertises itself as preferred and was heard within its
+    /// qualification window (spec:5.4 item 1; [`PortEvent::PreferredRival`]
+    /// reports it once). `None` otherwise.
+    #[must_use]
+    pub fn preferred_rival(&self) -> Option<[u8; 6]> {
+        if self.state != PortState::Master {
+            return None;
+        }
+        self.foreign
+            .iter()
+            .find(|r| Self::is_preferred_rival(r, &self.cfg.identity.uuid))
+            .map(|r| r.dataset.uuid)
+    }
+
+    /// The clock attributes this port advertises: the configured ones, except
+    /// that role follower always advertises stratum 255 and never preferred
+    /// (spec:5.4: "role follower never sends Sync and advertises stratum
+    /// 0xFF"; device-settings.md §2.3: never preferred and follower-only at
+    /// once), whatever a command set.
+    #[must_use]
+    pub fn advertised_local(&self) -> LocalClock {
+        let l = self.cfg.local;
+        if self.cfg.role == Role::Follower {
+            LocalClock {
+                preferred: false,
+                stratum: crate::provisional::FOLLOWER_STRATUM,
+                ..l
+            }
+        } else {
+            l
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     pub(crate) fn sync_interval_ns(&self) -> u64 {
@@ -493,7 +527,7 @@ impl<const N: usize> Port<N> {
     }
 
     pub(crate) fn own_dataset(&self) -> ClockDataset {
-        let l = &self.cfg.local;
+        let l = &self.advertised_local();
         ClockDataset {
             preferred: l.preferred,
             stratum: l.stratum,
@@ -576,14 +610,15 @@ impl<const N: usize> Port<N> {
             min_spacing_ns: self.effective_interval_ns(body.sync_interval) / 2,
         };
         let protect = self.parent.map(|p| p.source);
-        if self
+        let Some(rec) = self
             .foreign
             .update(now, &params, protect.as_ref(), header, body)
-            .is_none()
-        {
-            return; // duplicate or table failure
-        }
+            .copied()
+        else {
+            return; // duplicate, stale or table failure
+        };
         self.run_bmc(now, sink);
+        self.note_preferred_rival(&rec, sink);
         let from_parent = self
             .parent
             .is_some_and(|p| p.source.same_port(&header.source));
@@ -608,7 +643,10 @@ impl<const N: usize> Port<N> {
 
     // -------------------------------------------------------------------- BMC
 
-    /// Re-evaluates the best master and the resulting state.
+    /// Re-evaluates the best master and the resulting state. Role leader is
+    /// forced and never yields (spec:5.4: item 1's yielding applies to role
+    /// auto only; a preferred clock it hears is reported, see
+    /// `note_preferred_rival`).
     pub(crate) fn run_bmc<S: ActionSink + ?Sized>(&mut self, now: LocalNs, sink: &mut S) {
         if self.state == PortState::Initializing || self.cfg.role == Role::Leader {
             return;
@@ -747,6 +785,32 @@ impl<const N: usize> Port<N> {
         }
         sink.action(Action::Event(PortEvent::ParentLost));
         self.dirty = true;
+        // Re-elect at once among the clocks still qualified (spec:5.1 item
+        // 5) instead of at the next periodic comparison.
+        self.run_bmc(now, sink);
+    }
+
+    /// spec:5.4 item 1 (Tessera policy): while this port leads, in role auto
+    /// or leader, a qualified foreign clock that advertises itself as
+    /// preferred is a second leader (a preferred hardware leader that ranks
+    /// stratum before MAC keeps sending Sync; a forced leader never yields to
+    /// it). Reported once per sender per episode: the episode ends when that
+    /// sender falls silent for a qualification window or when this port
+    /// starts to lead again. In role auto a clock this port yields to is not
+    /// reported (it no longer leads after `run_bmc`).
+    fn note_preferred_rival<S: ActionSink + ?Sized>(&mut self, rec: &ForeignMaster, sink: &mut S) {
+        if self.state == PortState::Master
+            && Self::is_preferred_rival(rec, &self.cfg.identity.uuid)
+            && self.foreign.mark_rival_reported(&rec.sender)
+        {
+            sink.action(Action::Event(PortEvent::PreferredRival {
+                gm_uuid: rec.dataset.uuid,
+            }));
+        }
+    }
+
+    fn is_preferred_rival(rec: &ForeignMaster, own_uuid: &[u8; 6]) -> bool {
+        rec.qualified && rec.dataset.preferred && rec.dataset.uuid != *own_uuid
     }
 
     // ----------------------------------------------------------- publication

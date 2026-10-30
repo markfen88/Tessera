@@ -21,6 +21,7 @@
 //! cache (one per interface) could deliver their events in a different order
 //! than they changed the state.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -28,10 +29,13 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::cache::BrowseCache;
-use crate::model::{BrowseEvent, ServiceInstance};
+use crate::model::{BrowseEvent, ServiceInstance, ServiceObservation};
 
 #[derive(Debug, Default)]
 struct Counters {
+    revision: AtomicU64,
+    reconciliation_generation: Mutex<Option<u64>>,
+    sessions: Mutex<BTreeMap<usize, Option<u64>>>,
     /// The most recent resolution failure.
     last_failure: Mutex<Option<String>>,
     /// Events that could not be delivered because the channel was full.
@@ -97,11 +101,13 @@ impl BrowseShared {
     /// Counts an instance that a backend refused to track (cap reached).
     pub(crate) fn note_refused(&self) {
         self.counters.refused.fetch_add(1, Ordering::Relaxed);
+        self.counters.revision.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts a failed resolution.
+    /// Counts a failed resolution or session-recovery diagnostic.
     pub(crate) fn note_failure(&self, error: &str) {
         self.counters.failures.fetch_add(1, Ordering::Relaxed);
+        self.counters.revision.fetch_add(1, Ordering::Relaxed);
         *self
             .counters
             .last_failure
@@ -114,8 +120,37 @@ impl BrowseShared {
     /// gone (the task should stop).
     pub(crate) fn update(&self, f: impl FnOnce(&mut BrowseCache) -> Option<BrowseEvent>) -> bool {
         let mut c = lock_cache(&self.cache);
+        let before = (c.dropped(), c.reconciled());
         let ev = f(&mut c);
+        if ev.is_some() || before != (c.dropped(), c.reconciled()) {
+            self.counters.revision.fetch_add(1, Ordering::Relaxed);
+        }
         self.push(ev)
+    }
+
+    pub(crate) fn session(&self, slot: usize, generation: Option<u64>) {
+        let mut sessions = self
+            .counters
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sessions.get(&slot) != Some(&generation) {
+            sessions.insert(slot, generation);
+            self.counters.revision.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn begin_reconciliation(&self, generation: u64) {
+        let mut current = self
+            .counters
+            .reconciliation_generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current != Some(generation) {
+            lock_cache(&self.cache).begin_reconciliation();
+            *current = Some(generation);
+            self.counters.revision.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Delivers `ev` without waiting. Returns false once the receiving
@@ -164,6 +199,19 @@ impl BrowseShared {
 }
 
 impl BrowseView {
+    pub(crate) fn revision(&self) -> u64 {
+        self.counters.revision.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reconciled(&self, generation: u64) -> bool {
+        self.counters
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .all(|ready| *ready == Some(generation))
+            && lock_cache(&self.cache).reconciled()
+    }
     /// Instances ignored: over the per-kind cap or refused by a backend.
     pub(crate) fn ignored(&self) -> u64 {
         lock_cache(&self.cache).dropped() + self.counters.refused.load(Ordering::Relaxed)
@@ -174,12 +222,12 @@ impl BrowseView {
         self.counters.lost.load(Ordering::Relaxed)
     }
 
-    /// Failed resolutions (Avahi resolver creation).
+    /// Failed resolutions and recovery from saturated bookkeeping or retired-path reuse.
     pub(crate) fn failures(&self) -> u64 {
         self.counters.failures.load(Ordering::Relaxed)
     }
 
-    /// The most recent resolution failure, if any.
+    /// The most recent resolution or session-recovery diagnostic, if any.
     pub(crate) fn last_failure(&self) -> Option<String> {
         self.counters
             .last_failure
@@ -200,6 +248,10 @@ impl BrowseView {
     /// Everything currently known.
     pub(crate) fn snapshot(&self) -> Vec<ServiceInstance> {
         lock_cache(&self.cache).current()
+    }
+
+    pub(crate) fn observations(&self) -> Vec<ServiceObservation> {
+        lock_cache(&self.cache).observations()
     }
 }
 
@@ -326,6 +378,7 @@ mod tests {
 
     fn view_of(port: u16) -> SourceView {
         SourceView {
+            interface: None,
             host: "h.".into(),
             port,
             addresses: BTreeSet::new(),
@@ -335,6 +388,43 @@ mod tests {
 
     /// Several tasks feeding one cache deliver events in the order the state
     /// changed: replaying what arrives reproduces the cache.
+    #[test]
+    fn backend_generation_reconciles_overflow_once_without_clearing_new_refusals() {
+        let (shared, view, _rx) = BrowseShared::new(1, 4);
+        shared.begin_reconciliation(1);
+        shared.session(0, Some(1));
+        let accepted = ServiceId::new(ServiceKind::Arc, "accepted");
+        shared.update(|cache| cache.on_resolved(accepted, "s".into(), view_of(1)));
+        for n in 0..=ServiceKind::ALL.len() {
+            let id = ServiceId::new(ServiceKind::Arc, format!("refused-{n}"));
+            shared.update(|cache| cache.on_resolved(id, "s".into(), view_of(1)));
+        }
+        for n in 0..=ServiceKind::ALL.len() {
+            let id = ServiceId::new(ServiceKind::Arc, format!("refused-{n}"));
+            shared.update(|cache| cache.on_removed(&id, "s"));
+        }
+        assert!(!view.reconciled(1));
+        let ignored = view.ignored();
+        shared.session(0, None);
+        shared.begin_reconciliation(2);
+        assert!(!view.reconciled(2), "fresh enumeration must finish first");
+        shared.session(0, Some(2));
+        assert!(view.reconciled(2));
+        assert_eq!(view.ignored(), ignored);
+        shared.update(|cache| {
+            cache.on_resolved(
+                ServiceId::new(ServiceKind::Arc, "new-refusal"),
+                "s".into(),
+                view_of(1),
+            )
+        });
+        shared.begin_reconciliation(2);
+        assert!(
+            !view.reconciled(2),
+            "another task in the same generation cannot erase current refusals"
+        );
+    }
+
     #[test]
     fn concurrent_updates_are_delivered_in_state_order() {
         for _ in 0..50 {

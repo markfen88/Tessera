@@ -468,6 +468,16 @@ fn start(
         audio_listener,
         notifier: Arc::clone(notifier),
         devices: cfg.devices.len(),
+        native: opts.native_device.then(|| {
+            let mut settings = crate::native::Settings::new(&opts.native_vendor);
+            settings.identify_for = Duration::from_secs(opts.native_identify_secs.max(1));
+            match opts.native_lab_capabilities {
+                Some(word) => settings
+                    .lab(word)
+                    .with_lock_listener(opts.native_lab_lock_listener),
+                None => settings,
+            }
+        }),
     };
     let done = rt.block_on(serve(parts, log));
     drop(rt);
@@ -502,6 +512,8 @@ struct Parts {
     audio_listener: Option<std::os::unix::net::UnixListener>,
     notifier: Arc<Notifier>,
     devices: usize,
+    /// The daemon-owned device role (`--native-device`).
+    native: Option<crate::native::Settings>,
 }
 
 struct Done {
@@ -684,8 +696,21 @@ async fn serve(p: Parts, log: &LogControl) -> Result<Done, String> {
         shutdown.clone(),
     ));
 
+    // The device role, when this daemon serves it instead of a runtime.
+    if let Some(settings) = p.native.clone() {
+        tracker.spawn(crate::native::run(
+            p.handle.clone(),
+            Arc::clone(p.media_handle.stats()),
+            settings,
+            p.bus.clone(),
+            shutdown.clone(),
+        ));
+    }
+
     let limiter = PeerLimiter::new(tun.rate);
     let control_ctx = Arc::new(ControlCtx {
+        #[cfg(all(test, feature = "routing-shadow"))]
+        fixture_roles: None,
         engine: p.handle.clone(),
         bus: p.bus.clone(),
         limiter: Mutex::new(limiter),
@@ -772,6 +797,11 @@ async fn serve(p: Parts, log: &LogControl) -> Result<Done, String> {
                 }
             }
             _ = term.recv() => { tracing::info!("SIGTERM: shutting down"); break; }
+            () = crate::native::restart_requested() => {
+                tracing::warn!("a controller requested a reboot: restarting the daemon");
+                code = 1;
+                break;
+            }
             _ = int.recv() => { tracing::info!("SIGINT: shutting down"); break; }
             () = p.fatal.cancelled() => {
                 tracing::error!("the state thread died; exiting so that the service manager restarts the daemon");

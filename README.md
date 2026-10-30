@@ -1,4 +1,14 @@
-# Tessera 0.3.0
+# Tessera 0.5.0
+
+Tessera 0.5.0 adds an opt-in native device role to the daemon (`--native-device`):
+`tesserad` itself answers a network controller, negotiates receive flows from the
+saved subscriptions and serves transmit flows, in place of the packaged
+compatibility runtime on that host. The portal's **Routing** page connects,
+replaces and disconnects inputs from either host, one transmit channel can feed
+several inputs, and a device can be locked behind a PIN. Hosts that do not
+enable the role keep the packaged compatibility runtime as their controller
+interface. See [the 0.5.0 changelog](CHANGELOG.md) for what works and what does
+not yet.
 
 Tessera is an experimental, open audio-over-IP stack for Linux, written in Rust
 and licensed under MPL-2.0. It provides a PTPv1 media clock, UDP audio flows,
@@ -7,7 +17,9 @@ local audio backends, a command-line client and a web control portal.
 The project targets interoperability with Dante® media networks. It is not
 vendor-certified. Packages include and enable the existing Controller
 compatibility runtime alongside the daemon; device advertisement is on by
-default. The web portal lists core services and initially accepts password
+default. The native device role replaces that runtime only on a host where an
+administrator enables it ([how](docs/interoperability.md#native-device-role)).
+The web portal lists core services and initially accepts password
 `tessera` on fresh installs, preserving existing passwords on upgrades.
 Matching static flows remain available. External hardware audio content,
 sustained clock stability and automatic routing interoperability are not
@@ -136,8 +148,10 @@ latency_us = 10000
 ```
 
 Add static `[[flow]]` entries matching the peer's direction, channels, encoding,
-rate, port and packet geometry. No flow is negotiated automatically. Configure
-sound-card bridges only in a build with `alsa-bridge`.
+rate, port and packet geometry. Without the native device role no flow is
+negotiated automatically; with it, saved subscriptions are requested from the
+transmitters they name. Configure sound-card bridges only in a build with
+`alsa-bridge`.
 
 ```sh
 tesseractl config check
@@ -236,7 +250,7 @@ SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge TESSERA_DEB_REVISION=1 cargo xtask
 ```
 
 Build on the target OS/architecture. `TESSERA_DEB_REVISION` makes the package
-revision explicit in source archives. Version `0.3.0` is packaged as `0.3.0-*`. To create an
+revision explicit in source archives. Version `0.5.0` is packaged as `0.5.0-*`. To create an
 add-on bundle, use `cargo xtask build-bundle`, or its explicit Ubuntu opt-in.
 The tree contains no shell or Python scripts: packaging, bundle and test entry
 points are `cargo xtask` tasks. See [build/package options](docs/bundle.md#building).
@@ -258,8 +272,13 @@ dependent-package removal.
 
 ## Known limitations
 
-The Controller compatibility runtime serves the first logical device only.
-Additional logical devices’ offset control ports are not yet supported.
+The Controller compatibility runtime and the native device role serve the first
+logical device only. Additional logical devices’ offset control ports are not yet
+supported. With the native device role, a vendor controller can see the device
+access lock but not set it, the newer flow-list queries of current controllers
+are not answered (some tools refuse some operations because of that), and
+interface statistics are not reported; see
+[interoperability](docs/interoperability.md). Nothing in this release is certified.
 AES67, JACK, Bluetooth latency calibration, ARC/eARC capture and automatic lip-sync
 are not implemented.
 Static flow and packet settings remain provisional for external hardware.

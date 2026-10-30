@@ -485,6 +485,7 @@ pub fn render_status(s: &Status) -> String {
             "RX".into(),
             "TX".into(),
             "LOCKED".into(),
+            "ACCESS".into(),
         ]];
         for d in &s.devices {
             rows.push(vec![
@@ -496,10 +497,16 @@ pub fn render_status(s: &Status) -> String {
                 d.rx_channels.len().to_string(),
                 d.tx_channels.len().to_string(),
                 dash_if_empty(&d.locked),
+                access(d.access_locked).into(),
             ]);
         }
         out.push('\n');
         out.push_str(&table(&rows));
+        for d in &s.devices {
+            for line in format_pins(d) {
+                let _ = writeln!(out, "{}: {line}", d.key.0);
+            }
+        }
     }
     let subs = subscription_rows(&s.devices);
     if subs.len() > 1 {
@@ -536,14 +543,27 @@ pub fn render_status(s: &Status) -> String {
 pub fn render_device(d: &DeviceStatus) -> String {
     let d = &cleaned(d);
     let mut out = format!(
-        "{} ({})\n  rate {} Hz, {} bit, latency {} us, locked: {}\n",
+        "{} ({})\n  rate {} Hz, {} bit, latency {} us, locked: {}, access: {}\n",
         d.key.0,
         d.name,
         d.sample_rate.0,
         d.encoding.0,
         d.latency.0,
-        dash_if_empty(&d.locked)
+        dash_if_empty(&d.locked),
+        access(d.access_locked)
     );
+    if let Some(f) = &d.formats {
+        let join = |v: Vec<String>| v.join(", ");
+        let _ = writeln!(
+            out,
+            "  can be set to: {} Hz; {} bit",
+            join(f.sample_rates.iter().map(ToString::to_string).collect()),
+            join(f.encodings.iter().map(ToString::to_string).collect())
+        );
+    }
+    for line in format_pins(d) {
+        let _ = writeln!(out, "  {line}");
+    }
     for (title, list) in [
         ("RX channels", &d.rx_channels),
         ("TX channels", &d.tx_channels),
@@ -561,6 +581,32 @@ pub fn render_device(d: &DeviceStatus) -> String {
         }
     }
     out
+}
+
+/// Why the device's sample rate or encoding cannot change now, one line
+/// each (`device-settings.md` §3.3 item 10): the bridge that pins it, or the
+/// configuration lock.
+fn format_pins(d: &DeviceStatus) -> Vec<String> {
+    let Some(f) = &d.formats else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if let Some(pin) = &f.sample_rate_pin {
+        lines.push(format!(
+            "sample rate fixed at {} Hz: {pin}",
+            d.sample_rate.0
+        ));
+    }
+    if let Some(pin) = &f.encoding_pin {
+        lines.push(format!("encoding fixed at {} bit: {pin}", d.encoding.0));
+    }
+    lines
+}
+
+/// The device access lock in a status: `locked` or `open` (not the
+/// configuration's `LOCKED` keys).
+fn access(locked: bool) -> &'static str {
+    if locked { "locked" } else { "open" }
 }
 
 fn origin(o: &Origin) -> String {
@@ -720,6 +766,16 @@ pub fn render_event(e: &Event) -> String {
         } => format!(
             "{}: channel counts now rx {rx_channels}, tx {tx_channels} ({})",
             device.0,
+            origin(o)
+        ),
+        Event::AccessLockChanged {
+            device,
+            locked,
+            origin: o,
+        } => format!(
+            "{}: access lock {} ({})",
+            device.0,
+            if *locked { "set" } else { "removed" },
             origin(o)
         ),
         other => format!("{other:?}"),
@@ -946,5 +1002,45 @@ mod tests {
         };
         let line = render_event(&escaped);
         assert!(!line.contains('\n') && !line.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_fixed_rate_or_encoding_says_why() {
+        use tessera_control_types::{FormatOptions, SettingPin};
+        // `device-settings.md` §3.3 item 10.
+        let mut s = status();
+        s.devices[0].formats = Some(Box::new(
+            FormatOptions::new(vec![48_000], vec![16, 24, 32]).with_sample_rate_pin(Some(
+                SettingPin::Bridge {
+                    name: "speaker\u{1b}[2J".into(),
+                    sample_rate: 48_000,
+                },
+            )),
+        ));
+        let t = render_status(&s);
+        assert!(
+            t.contains("main: sample rate fixed at 48000 Hz: bridge `speaker"),
+            "{t}"
+        );
+        assert!(!t.contains('\u{1b}'), "escape sequences are neutralised");
+        assert!(!t.contains("encoding fixed"), "{t}");
+        let d = render_device(&s.devices[0]);
+        assert!(
+            d.contains("  can be set to: 48000 Hz; 16, 24, 32 bit\n"),
+            "{d}"
+        );
+        assert!(d.contains("  sample rate fixed at 48000 Hz: bridge"), "{d}");
+        s.devices[0].formats = Some(Box::new(
+            FormatOptions::new(vec![44_100, 48_000], vec![24])
+                .with_encoding_pin(Some(SettingPin::Configuration)),
+        ));
+        let d = render_device(&s.devices[0]);
+        assert!(
+            d.contains("  encoding fixed at 24 bit: locked by the configuration"),
+            "{d}"
+        );
+        // A daemon that does not report the options: nothing extra.
+        s.devices[0].formats = None;
+        assert!(!render_device(&s.devices[0]).contains("can be set to"));
     }
 }

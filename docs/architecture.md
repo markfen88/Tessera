@@ -8,11 +8,11 @@ applications attach to it through local sockets.
 
 | Component | Identity | Responsibility |
 |---|---|---|
-| `tesserad` | system service, `tessera` user | Logical devices, PTP, static media flows, runtime state, control/audio sockets and optional hardware bridges |
+| `tesserad` | system service, `tessera` user | Logical devices, PTP, static media flows, runtime state, control/audio sockets, optional hardware bridges and, when enabled, the native device role (control ports and flow negotiation of the first logical device, in place of `tessera-controller@main`) |
 | `tesseractl` | operator | Typed commands and queries over `control.sock` |
 | `tessera-web` | system service, `tessera-web` user | Authenticated pages/API; daemon control client; standalone network-helper client |
 | `tessera-network` | separate privileged helper | Supported OS networking, firewall isolation, transaction journal and recovery |
-| `tessera-controller@main` | system service, `tessera` user, `PartOf` the daemon | Controller compatibility runtime: serves the first logical device's base control ports and submits controller flows to the daemon as a typed command |
+| `tessera-controller@main` | system service, `tessera` user, `PartOf` the daemon | Controller compatibility runtime (the default): serves the first logical device's base control ports and submits controller flows to the daemon as a typed command; stopped and disabled on a host that uses the native device role |
 | `tessera-pw` | desktop user service | PipeWire source/sink nodes using the audio and control sockets |
 | `pcm.tessera` | inside an ALSA application | Capture/playback using shared-memory audio rings |
 | `camilladsp`, `camillagui` | system services, `camilla` user (`tessera-dsp`) | A speaker's equaliser stage: reads `pcm.tessera`, plays to the sound card; the GUI edits its configurations ([dsp.md](dsp.md)) |
@@ -75,6 +75,8 @@ Static UDP flows explicitly define peer, direction, device/channel mapping and
 packet settings. Receive buffering is indexed by media time. Transmit scheduling
 uses the configured packet geometry and offsets. Receiver keepalives maintain
 already established peer flows; they do not negotiate new vendor subscriptions.
+With the native device role the daemon negotiates flows itself: it requests one
+receive flow per subscribed input and serves the flows other receivers request.
 See [compatibility limits](interoperability.md).
 
 Local clients receive shared-memory rings, a read-only clock overlay and a wake

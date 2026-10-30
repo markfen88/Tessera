@@ -8,12 +8,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use tessera_control_types::{ClockRole, DeviceKey};
+use tessera_control_types::{ClockRole, DeviceKey, PREFERRED_LEADER_BELOW};
 
 use crate::config::{
     ClockLock, Config, ControlLock, DeviceConfig, DeviceLock, FlowConfig, NetworkLock,
 };
-use crate::env::{Environment, validate_name};
+use crate::env::{Environment, validate_channel_label, validate_device_name, validate_name};
 use crate::error::Issue;
 use crate::persist::{DeviceIntent, StateFile, SubscriptionIntent};
 
@@ -243,6 +243,15 @@ fn resolve_labels(
                 ),
             );
         } else {
+            if let Err(e) = validate_channel_label(v, env.max_name_bytes) {
+                warn(
+                    w,
+                    format!("{path}.{k}"),
+                    format!(
+                        "persisted label {e}; retained unchanged for existing subscriptions; external controllers may refuse routing"
+                    ),
+                );
+            }
             out.insert(n, v.clone());
         }
     }
@@ -306,6 +315,15 @@ fn reconcile_device(
                 ),
             );
         } else {
+            if let Err(e) = validate_device_name(n, env.max_name_bytes) {
+                warn(
+                    w,
+                    format!("{p}.name"),
+                    format!(
+                        "persisted name {e}; retained unchanged for existing subscriptions; external controllers may refuse routing"
+                    ),
+                );
+            }
             name.clone_from(n);
         }
     }
@@ -584,6 +602,34 @@ pub fn reconcile(
     } else if let Some(p) = intent.clock.priority {
         priority = p;
     }
+    // Preferred leader and follower-only exclude each other, also when the
+    // combination comes from configuration and stored state together
+    // (device-settings.md §2.3). Follower-only wins: a stored preferred
+    // priority is dropped, a configured one is not used.
+    if role == ClockRole::Follower && priority < PREFERRED_LEADER_BELOW {
+        if intent.clock.priority.take().is_some() {
+            warn(
+                &mut warnings,
+                "state.clock.priority".to_owned(),
+                format!(
+                    "{priority} makes a preferred leader, which a follower-only device \
+                     cannot be; ignored"
+                ),
+            );
+            priority = config.clock.priority;
+        }
+        if priority < PREFERRED_LEADER_BELOW {
+            warn(
+                &mut warnings,
+                "clock.priority".to_owned(),
+                format!(
+                    "{priority} makes a preferred leader, which a follower-only device \
+                     cannot be; the default priority is used"
+                ),
+            );
+            priority = crate::config::ClockConfig::default().priority;
+        }
+    }
 
     // Network (ADR 0012). A stored selection that is not a valid interface
     // name is kept but inactive; whether the interface exists is the
@@ -617,15 +663,7 @@ pub fn reconcile(
 
     // Runtime geometry may differ from configuration defaults. Validate the
     // entire controller set against those effective counts before exposing it.
-    for dc in &mut combined.devices {
-        if let Some(d) = devices.iter().find(|d| d.key.0 == dc.id) {
-            dc.rx_channels = d.rx_channels;
-            dc.tx_channels = d.tx_channels;
-            dc.sample_rate = d.sample_rate;
-            dc.encoding = d.encoding;
-            dc.latency_us = d.latency_us;
-        }
-    }
+    combined = crate::flows::effective_validation_config(&combined, &devices);
     let problems: Vec<Issue> = crate::validate::validate(&combined, env)
         .into_iter()
         .filter(|i| i.is_error() && i.path.starts_with("flow["))

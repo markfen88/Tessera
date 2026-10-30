@@ -10,8 +10,10 @@
 //! write the answer. There is no outbound queue, so a client that does not read
 //! its answers can only stall its own task, and the write is bounded by a
 //! timeout after which the connection is dropped. Other clients are never
-//! affected: nothing is shared except the engine's bounded request queue,
-//! the admission table and the per-uid rate limiter (short critical sections).
+//! stalled by that socket. Shared work is bounded: the engine's request queue,
+//! admission table, per-uid rate limiter and receiver-read permits. Receiver
+//! queries allow one read per uid, two ordinary reads and one reserved admin
+//! slot. Full read limits return RateLimited without queueing.
 //!
 //! * **Identification.** `SO_PEERCRED` and `SO_PEERGROUPS` at accept
 //!   ([`crate::peer`]). Reading is open to every peer that can open the
@@ -55,7 +57,10 @@
 //! * **Who may do what** (ADR 0010). Queries, `SubscribeEvents` and dry runs
 //!   are reading: open to every peer that can connect (a dry run changes
 //!   nothing and shows no more than `Status` does). Commands, confirmed or
-//!   not, need uid 0 or the admin group.
+//!   not, need uid 0 or the admin group. They run as `Origin::Cli { uid }`,
+//!   except the device access lock commands of the portal's account, which
+//!   run as `Origin::Api` so that the state refuses it a reset without the
+//!   PIN (`device-lock.md` §9.1 L2).
 //! * **Size.** Requests and responses are capped by `[control]
 //!   max_frame_bytes` (read when the connection opens). A reply that would
 //!   exceed it is replaced by `ResponseTooLarge { size, limit, key }`, and
@@ -138,6 +143,8 @@ impl Default for ControlConfig {
 /// Everything the connection tasks share.
 #[derive(Debug)]
 pub struct ControlCtx {
+    #[cfg(all(test, feature = "routing-shadow"))]
+    pub(crate) fixture_roles: Option<Arc<crate::platform::connector::launch::RoleTable>>,
     /// The state engine.
     pub engine: EngineHandle,
     /// The event bus (subscribers read it directly).
@@ -218,10 +225,10 @@ fn invalid(field: &str, reason: impl AsRef<str>) -> CommandError {
 /// `ResponseTooLarge` error for the same request id (a few hundred bytes,
 /// always under the schema's 64 KiB floor of `max_frame_bytes`), so the
 /// client learns the size and the key to raise, and the connection goes on.
-fn encode_response(resp: &Response, max: usize) -> Result<Vec<u8>, String> {
+fn encode_response_classified(resp: &Response, max: usize) -> Result<(Vec<u8>, bool), String> {
     let json = serde_json::to_vec(resp).map_err(|e| e.to_string())?;
     match encode_frame(&json, max) {
-        Ok(b) => Ok(b),
+        Ok(b) => Ok((b, true)),
         Err(FrameError::TooLarge { len, .. }) => {
             let e = error_response(
                 resp.id,
@@ -235,15 +242,33 @@ fn encode_response(resp: &Response, max: usize) -> Result<Vec<u8>, String> {
             // No cap for this one frame: it is a few hundred bytes (the key
             // is a constant, the sizes are numbers), far below the 64 KiB
             // floor of `max_frame_bytes`.
-            encode_frame(&j, usize::MAX).map_err(|e| e.to_string())
+            encode_frame(&j, usize::MAX)
+                .map(|b| (b, false))
+                .map_err(|e| e.to_string())
         }
     }
+}
+
+#[cfg(test)]
+fn encode_response(resp: &Response, max: usize) -> Result<Vec<u8>, String> {
+    encode_response_classified(resp, max).map(|(bytes, _)| bytes)
 }
 
 /// Serialise and send one response. Returns `false` if the connection must
 /// be closed (write failed or timed out).
 async fn send(wr: &mut OwnedWriteHalf, resp: &Response, max: usize, timeout: Duration) -> bool {
-    let bytes = match encode_response(resp, max) {
+    send_observed(wr, resp, max, timeout).await.0
+}
+
+// The second flag says that the actual frame contained the original reply,
+// rather than ResponseTooLarge or a serialization-error fallback.
+async fn send_observed(
+    wr: &mut OwnedWriteHalf,
+    resp: &Response,
+    max: usize,
+    timeout: Duration,
+) -> (bool, bool) {
+    let (bytes, original) = match encode_response_classified(resp, max) {
         Ok(b) => b,
         Err(reason) => {
             let fallback = error_response(
@@ -256,21 +281,31 @@ async fn send(wr: &mut OwnedWriteHalf, resp: &Response, max: usize, timeout: Dur
                 .ok()
                 .and_then(|j| encode_frame(&j, usize::MAX).ok())
             {
-                Some(b) => b,
-                None => return false,
+                Some(b) => (b, false),
+                None => return (false, false),
             }
         }
     };
-    matches!(
+    let written = matches!(
         tokio::time::timeout(timeout, wr.write_all(&bytes)).await,
         Ok(Ok(()))
-    )
+    );
+    (written, original)
 }
 
 enum Read {
     Frame(Vec<u8>),
-    Closed,
+    Eof,
+    Closed(ReadFailure),
     TooLarge(FrameError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadFailure {
+    PartialEof,
+    Error,
+    Timeout,
+    Shutdown,
 }
 
 /// Read until one whole frame is available.
@@ -311,9 +346,12 @@ async fn read_frame(
             }
         };
         let n = tokio::select! {
-            () = shutdown.cancelled() => return Read::Closed,
+            () = shutdown.cancelled() => return Read::Closed(ReadFailure::Shutdown),
             r = read => match r {
-                Ok(0) | Err(_) => return Read::Closed,
+                Ok(0) if !dec.is_partial() => return Read::Eof,
+                Ok(0) => return Read::Closed(ReadFailure::PartialEof),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Read::Closed(ReadFailure::Timeout),
+                Err(_) => return Read::Closed(ReadFailure::Error),
                 Ok(n) => n,
             },
         };
@@ -323,7 +361,7 @@ async fn read_frame(
     }
 }
 
-async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
+pub(crate) async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
     let cred = match stream.peer_cred() {
         Ok(c) => c,
         Err(e) => {
@@ -342,6 +380,20 @@ async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
         groups,
     };
     let uid = cred.uid;
+    // Finite socket-connector evidence, not a runtime registration or authority
+    // grant. Unsupported kernels retain existing admin authorization. A later
+    // runtime admission path must require this evidence and a registered launch.
+    let connector = crate::platform::ConnectedProcess::capture(stream.as_fd())
+        .and_then(|process| {
+            process.matches_credentials(&cred)?;
+            process.matches_socket(stream.as_fd())?;
+            Ok(process)
+        })
+        .inspect_err(|error| {
+            tracing::debug!(uid, "control: connector lifetime unverified: {error}")
+        })
+        .ok()
+        .map(Arc::new);
     let access_now = |ctx: &ControlCtx| classify(&cred, ctx.admin_gid());
 
     let _permit = match ctx.admission.admit(uid, access_now(&ctx).can_mutate()) {
@@ -362,7 +414,14 @@ async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
     inc(&ctx.counters.control_connections);
     inc(&ctx.counters.control_connections_total);
     let _gauge = GaugeGuard(&ctx.counters.control_connections);
-    tracing::debug!(uid, gid = cred.gid, pid = ?cred.pid, access = ?access_now(&ctx), "control: connection");
+    #[cfg(feature = "routing-shadow")]
+    let mut query_session = crate::engine_thread::query_probe::Session::new(
+        ctx.engine.clone(),
+        crate::engine_thread::ProtocolEvidence::new(connector.clone(), cred.clone()),
+    );
+    tracing::debug!(uid, gid = cred.gid, pid = ?cred.pid,
+        connector = ?connector.as_ref().map(|process| process.key()),
+        access = ?access_now(&ctx), "control: connection");
 
     let (mut rd, mut wr) = stream.into_split();
     // The limits in effect when the connection opened (a reload applies to
@@ -385,7 +444,30 @@ async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
         .await
         {
             Read::Frame(f) => f,
-            Read::Closed => return,
+            Read::Eof => {
+                #[cfg(feature = "routing-shadow")]
+                {
+                    query_session.finish_facts().await;
+                    query_session
+                        .terminated(crate::engine_thread::query_probe::Termination::CleanEof);
+                }
+                return;
+            }
+            Read::Closed(reason) => {
+                #[cfg(feature = "routing-shadow")]
+                {
+                    use crate::engine_thread::query_probe::Termination;
+                    query_session.terminated(match reason {
+                        ReadFailure::PartialEof => Termination::PartialEof,
+                        ReadFailure::Error => Termination::ReadError,
+                        ReadFailure::Timeout => Termination::Timeout,
+                        ReadFailure::Shutdown => Termination::Shutdown,
+                    });
+                }
+                #[cfg(not(feature = "routing-shadow"))]
+                let _ = reason;
+                return;
+            }
             Read::TooLarge(e) => {
                 inc(&ctx.counters.requests_invalid);
                 ctx.peerlog.note(uid, "oversized frame", "closing");
@@ -399,6 +481,8 @@ async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
                 return;
             }
         };
+        #[cfg(feature = "routing-shadow")]
+        let query_tag = query_session.frame();
         inc(&ctx.counters.requests_total);
         if let Err(wait) = ctx.take_token(uid) {
             inc(&ctx.counters.requests_rate_limited);
@@ -457,41 +541,332 @@ async fn handle_connection(stream: UnixStream, ctx: Arc<ControlCtx>) {
             continue;
         }
         let id = req.id;
-        let reply = match req.body {
-            RequestBody::SubscribeEvents => {
-                stream_events(rd, wr, dec, id, uid, &ctx, &cfg).await;
-                return;
+        #[cfg(feature = "routing-shadow")]
+        {
+            let candidate = matches!(
+                &req.body,
+                RequestBody::Query(Query::Status)
+                    | RequestBody::ProtocolCommand {
+                        command: Command::SetProtocolFlows { .. },
+                        ..
+                    }
+                    | RequestBody::ConfirmedCommand {
+                        command: Command::Subscribe { .. } | Command::Unsubscribe { .. },
+                        ..
+                    }
+            );
+            if candidate && query_tag.as_ref().is_some_and(|tag| tag.is_first()) {
+                query_session.start_facts(
+                    #[cfg(test)]
+                    ctx.fixture_roles.clone(),
+                );
             }
-            RequestBody::Query(q) => run_query(&ctx, q, max).await,
-            RequestBody::ProtocolCommand { peer, command, .. } => {
-                run_protocol_command(&ctx, uid, access_now(&ctx), peer, command).await
+            if matches!(
+                &req.body,
+                RequestBody::ProtocolCommand { .. } | RequestBody::ConfirmedCommand { .. }
+            ) {
+                query_session.finish_facts().await;
             }
-            RequestBody::Command(c) => {
-                run_command(&ctx, uid, access_now(&ctx), c, Confirm::No).await
+        }
+        #[cfg(feature = "routing-shadow")]
+        let observed_actor_message = matches!(
+            &req.body,
+            RequestBody::Query(_)
+                | RequestBody::ProtocolCommand { .. }
+                | RequestBody::Command(_)
+                | RequestBody::ConfirmedCommand { .. }
+        );
+        // A connector can exit while its inherited/transferred socket remains
+        // usable. General admin commands keep their existing rights; whole-set
+        // flow writes additionally require a live, classified host connector.
+        // Runtime-specific admission must separately reject unavailable lifetimes
+        // and prove the allowed descriptor/launcher topology.
+        let connector_live = connector
+            .as_ref()
+            .is_some_and(|process| process.still_live().is_ok());
+        tracing::trace!(
+            uid,
+            connector_live,
+            "control: request connector observation"
+        );
+        let echo = matches!(
+            &req.body,
+            RequestBody::Command(Command::Subscribe { .. } | Command::Unsubscribe { .. })
+                | RequestBody::ConfirmedCommand {
+                    command: Command::Subscribe { .. } | Command::Unsubscribe { .. },
+                    ..
+                }
+        );
+        let runtime_echo = if echo {
+            match connector.as_ref() {
+                Some(process) => process.in_runtime_unit().map_err(|_| {
+                    crate::runtime_host::unavailable("cannot classify saved-name sender")
+                }),
+                None => Err(crate::runtime_host::unavailable(
+                    "saved-name sender identity unavailable",
+                )),
             }
-            RequestBody::ConfirmedCommand {
-                command, expect, ..
-            } => {
-                let confirm = expect.map_or(Confirm::Blind, Confirm::Expecting);
-                run_command(&ctx, uid, access_now(&ctx), command, confirm).await
+        } else {
+            Ok(false)
+        };
+        let reply = if let Err(error) = runtime_echo {
+            Err(error)
+        } else if runtime_echo == Ok(true) {
+            if !access_now(&ctx).can_mutate() {
+                Err(CommandError::PermissionDenied)
+            } else {
+                let result = match crate::runtime_host::Evidence::collect(connector.clone()).await {
+                    Ok(evidence) => ctx.engine.runtime_echo(evidence).await.map(|_| Reply::Done),
+                    Err(error) => Err(error),
+                };
+                if result.is_ok() {
+                    reconcile_runtime(&ctx);
+                }
+                result
             }
-            _ => Err(CommandError::Unsupported {
-                what: "request".into(),
-            }),
+        } else {
+            match req.body {
+                RequestBody::RuntimeStart {
+                    device,
+                    network,
+                    wire_device_id,
+                } => {
+                    if !access_now(&ctx).can_mutate() {
+                        Err(CommandError::PermissionDenied)
+                    } else {
+                        match crate::runtime_host::Start::prepare(
+                            device,
+                            network,
+                            wire_device_id,
+                            connector.clone(),
+                        )
+                        .await
+                        {
+                            Ok(start) => {
+                                ctx.engine.runtime_start(start).await.map(|()| Reply::Done)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                RequestBody::RuntimeReport { flows } => {
+                    if !access_now(&ctx).can_mutate() {
+                        Err(CommandError::PermissionDenied)
+                    } else {
+                        match crate::runtime_host::Evidence::collect(connector.clone()).await {
+                            Ok(evidence) => {
+                                match ctx.engine.runtime_report(evidence, flows).await {
+                                    Ok(applied) => {
+                                        ctx.effects.on_effects(&applied.effects);
+                                        reconcile_runtime(&ctx);
+                                        Ok(Reply::Done)
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                RequestBody::SubscribeEvents => {
+                    stream_events(rd, wr, dec, id, uid, &ctx, &cfg).await;
+                    return;
+                }
+                RequestBody::RoutingPeer { principal, request } => {
+                    run_routing_peer(&ctx, uid, access_now(&ctx), principal, request, max).await
+                }
+                RequestBody::Query(q) => {
+                    run_query(
+                        &ctx,
+                        q,
+                        max,
+                        uid,
+                        access_now(&ctx),
+                        #[cfg(feature = "routing-shadow")]
+                        query_tag.clone(),
+                    )
+                    .await
+                }
+                RequestBody::ProtocolCommand { peer, command, .. } => {
+                    let evidence = crate::engine_thread::ProtocolEvidence::new(
+                        connector.clone(),
+                        cred.clone(),
+                    );
+                    run_protocol_command(
+                        &ctx,
+                        uid,
+                        access_now(&ctx),
+                        peer,
+                        command,
+                        evidence,
+                        #[cfg(feature = "routing-shadow")]
+                        query_tag.clone(),
+                    )
+                    .await
+                }
+                RequestBody::Command(c) => {
+                    run_command(
+                        &ctx,
+                        uid,
+                        access_now(&ctx),
+                        c,
+                        Confirm::No,
+                        crate::engine_thread::ProtocolEvidence::new(
+                            connector.clone(),
+                            cred.clone(),
+                        ),
+                        #[cfg(feature = "routing-shadow")]
+                        query_tag.clone(),
+                    )
+                    .await
+                }
+                RequestBody::ConfirmedCommand {
+                    command, expect, ..
+                } => {
+                    let confirm = expect.map_or(Confirm::Blind, Confirm::Expecting);
+                    run_command(
+                        &ctx,
+                        uid,
+                        access_now(&ctx),
+                        command,
+                        confirm,
+                        crate::engine_thread::ProtocolEvidence::new(
+                            connector.clone(),
+                            cred.clone(),
+                        ),
+                        #[cfg(feature = "routing-shadow")]
+                        query_tag.clone(),
+                    )
+                    .await
+                }
+                _ => Err(CommandError::Unsupported {
+                    what: "request".into(),
+                }),
+            }
         };
         let resp = Response {
             v: WIRE_VERSION,
             id,
             result: reply,
         };
-        if !send(&mut wr, &resp, max, wto).await {
+        #[cfg(feature = "routing-shadow")]
+        let written = {
+            let (written, original) = send_observed(&mut wr, &resp, max, wto).await;
+            if observed_actor_message {
+                if let Some(tag) = query_tag {
+                    query_session.sent(tag, written && original && resp.result.is_ok());
+                }
+            }
+            written
+        };
+        #[cfg(not(feature = "routing-shadow"))]
+        let written = send(&mut wr, &resp, max, wto).await;
+        if !written {
+            #[cfg(feature = "routing-shadow")]
+            query_session.terminated(crate::engine_thread::query_probe::Termination::WriteFailed);
             return;
         }
     }
 }
 
+fn routing_gateway_allowed(
+    uid: u32,
+    gateway: Option<u32>,
+    access: Access,
+    principal: &str,
+) -> bool {
+    access.can_mutate()
+        && (uid == 0 || gateway == Some(uid))
+        && !principal.is_empty()
+        && principal.len() <= 64
+        && principal
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+async fn run_routing_peer(
+    ctx: &ControlCtx,
+    uid: u32,
+    access: Access,
+    name: String,
+    request: tessera_control_types::RoutingPeerRequest,
+    max: usize,
+) -> Result<Reply, CommandError> {
+    use tessera_control_types::RoutingPeerRequest as P;
+    if !routing_gateway_allowed(
+        uid,
+        ctx.settings.borrow().routing_gateway_uid,
+        access,
+        &name,
+    ) {
+        return Err(CommandError::PermissionDenied);
+    }
+    let principal = crate::routing_operation::accounting::Principal {
+        uid,
+        peer: Some(name.clone()),
+    };
+    tracing::info!(uid, principal = %name, "routing peer request");
+    match request {
+        P::Devices(q) => {
+            ctx.engine
+                .query_bounded(Query::RoutingDevices(q), max)
+                .await
+        }
+        P::Channels(q) => {
+            ctx.engine
+                .query_bounded(Query::RoutingChannels(q), max)
+                .await
+        }
+        P::Receiver(q) => ctx.engine.receiver_read_as(q, max, principal, access).await,
+        P::Operation { operation } => {
+            ctx.engine
+                .receiver_operation_status(principal, operation, false)
+                .await
+        }
+        P::Retire { operation } => {
+            ctx.engine
+                .receiver_operation_status(principal, operation, true)
+                .await
+        }
+        P::Route {
+            expectation,
+            change,
+        } => {
+            ctx.engine
+                .receiver_operation_as(principal, expectation, change)
+                .await
+        }
+        _ => Err(CommandError::PermissionDenied),
+    }
+}
+
 /// Answer a query; `max_frame` is this connection's frame limit.
-async fn run_query(ctx: &ControlCtx, q: Query, max_frame: usize) -> Result<Reply, CommandError> {
+async fn run_query(
+    ctx: &ControlCtx,
+    q: Query,
+    max_frame: usize,
+    uid: u32,
+    access: Access,
+    #[cfg(feature = "routing-shadow")] tag: Option<crate::engine_thread::query_probe::Tag>,
+) -> Result<Reply, CommandError> {
+    if matches!(q, Query::InspectRuntimeCarriers) {
+        return ctx
+            .engine
+            .runtime_carrier_recovery(uid, access, None, false)
+            .await;
+    }
+    if let Query::InspectReceiverOperation { operation } = q {
+        return ctx
+            .engine
+            .receiver_recovery(uid, access, operation, None)
+            .await;
+    }
+    if let Query::RoutingReceiver(query) = q {
+        return ctx
+            .engine
+            .receiver_read(query, max_frame, uid, access)
+            .await;
+    }
     if matches!(q, Query::Metrics) {
         // Clock and bridge state come from the engine, the rest is ours.
         return match ctx.engine.query(Query::Status).await? {
@@ -503,7 +878,11 @@ async fn run_query(ctx: &ControlCtx, q: Query, max_frame: usize) -> Result<Reply
             }),
         };
     }
-    match ctx.engine.query(q).await? {
+    #[cfg(feature = "routing-shadow")]
+    let result = ctx.engine.query_observed(q, max_frame, tag).await?;
+    #[cfg(not(feature = "routing-shadow"))]
+    let result = ctx.engine.query_bounded(q, max_frame).await?;
+    match result {
         Reply::Status(mut s) => {
             // Restart-class keys changed since the start: say so wherever
             // the status is read (tesseractl status, the portal).
@@ -552,6 +931,8 @@ async fn run_protocol_command(
     access: Access,
     peer: String,
     command: Command,
+    evidence: crate::engine_thread::ProtocolEvidence,
+    #[cfg(feature = "routing-shadow")] tag: Option<crate::engine_thread::query_probe::Tag>,
 ) -> Result<Reply, CommandError> {
     let origin = protocol_origin(access, peer, &command).inspect_err(|error| {
         if matches!(error, CommandError::PermissionDenied) {
@@ -565,11 +946,29 @@ async fn run_protocol_command(
         kind = command.kind(),
         "control: protocol adapter command"
     );
-    let applied = ctx.engine.apply(origin, command).await?;
+    #[cfg(not(feature = "routing-shadow"))]
+    let applied = ctx
+        .engine
+        .apply_connected(origin, command, Confirm::No, evidence)
+        .await?;
+    #[cfg(feature = "routing-shadow")]
+    let applied = ctx
+        .engine
+        .apply_observed(origin, command, Confirm::No, Some(evidence), tag)
+        .await?;
     if !applied.effects.is_empty() {
         ctx.effects.on_effects(&applied.effects);
     }
     Ok(Reply::Done)
+}
+
+fn reconcile_runtime(ctx: &ControlCtx) {
+    let engine = ctx.engine.clone();
+    tokio::spawn(async move {
+        if engine.reconcile_runtime().await.is_err() {
+            tracing::debug!("runtime: reconciliation unavailable; saved subscriptions retained");
+        }
+    });
 }
 
 async fn run_command(
@@ -578,6 +977,8 @@ async fn run_command(
     access: Access,
     cmd: Command,
     confirm: Confirm,
+    evidence: crate::engine_thread::ProtocolEvidence,
+    #[cfg(feature = "routing-shadow")] tag: Option<crate::engine_thread::query_probe::Tag>,
 ) -> Result<Reply, CommandError> {
     let dry_run = is_dry_run(&cmd);
     if !access.can_mutate() && !dry_run {
@@ -586,7 +987,35 @@ async fn run_command(
             .note(uid, "refused a command from a read-only peer", cmd.kind());
         return Err(CommandError::PermissionDenied);
     }
+    if let Command::ReconcileReceiverOperation { review } = cmd {
+        return ctx
+            .engine
+            .receiver_recovery(uid, access, None, Some(review))
+            .await;
+    }
+    if let Command::ReleaseRuntimeCarriers { review } = cmd {
+        return ctx
+            .engine
+            .runtime_carrier_recovery(uid, access, Some(review), false)
+            .await;
+    }
+    if let Command::GrantRuntimeCarriersToNextRun { review } = cmd {
+        return ctx
+            .engine
+            .runtime_carrier_recovery(uid, access, Some(review), true)
+            .await;
+    }
     let confirmed = confirm != Confirm::No;
+    if let Command::RouteReceiver {
+        expectation,
+        change,
+    } = cmd
+    {
+        return ctx
+            .engine
+            .receiver_operation(uid, expectation, change)
+            .await;
+    }
     if dry_run {
         tracing::debug!(uid, kind = cmd.kind(), "control: dry run");
     } else {
@@ -594,18 +1023,25 @@ async fn run_command(
     }
     // The shape of an empty impact, for the reply below.
     let empty = (dry_run || confirmed).then(|| tessera_state::impact::no_impact(&cmd));
+    let origin = command_origin(uid, ctx.settings.borrow().routing_gateway_uid, &cmd);
+    #[cfg(not(feature = "routing-shadow"))]
     let applied = ctx
         .engine
-        .apply_with(Origin::Cli { uid }, cmd, confirm)
-        .await
-        .inspect_err(|e| {
-            if matches!(e, CommandError::ConfirmationRequired { .. }) {
-                tracing::info!(
-                    uid,
-                    "control: the command needs confirmation; nothing changed"
-                );
-            }
-        })?;
+        .apply_connected(origin, cmd, confirm, evidence)
+        .await;
+    #[cfg(feature = "routing-shadow")]
+    let applied = ctx
+        .engine
+        .apply_observed(origin, cmd, confirm, Some(evidence), tag)
+        .await;
+    let applied = applied.inspect_err(|e| {
+        if matches!(e, CommandError::ConfirmationRequired { .. }) {
+            tracing::info!(
+                uid,
+                "control: the command needs confirmation; nothing changed"
+            );
+        }
+    })?;
     if !applied.effects.is_empty() {
         ctx.effects.on_effects(&applied.effects);
     }
@@ -618,6 +1054,23 @@ async fn run_command(
         (None, Some(e)) => Reply::Impact(e),
         (_, None) => Reply::Done,
     })
+}
+
+/// The origin of a command from `uid`. The portal's account (`portal`) sends
+/// the device access lock commands as `Api`, so the state refuses it a reset
+/// without the PIN (`device-lock.md` §9.1 L2: local administrators only).
+fn command_origin(uid: u32, portal: Option<u32>, cmd: &Command) -> Origin {
+    let access = matches!(
+        cmd,
+        Command::LockAccess { .. } | Command::UnlockAccess { .. } | Command::ResetAccessLock { .. }
+    );
+    if access && uid != 0 && portal == Some(uid) {
+        Origin::Api {
+            principal: "portal".into(),
+        }
+    } else {
+        Origin::Cli { uid }
+    }
 }
 
 fn event_response(id: u64, e: Event) -> Response {
@@ -724,6 +1177,37 @@ mod tests {
     }
 
     #[test]
+    fn routing_gateway_requires_kernel_account_admin_rights_and_a_bounded_principal() {
+        assert!(routing_gateway_allowed(
+            100,
+            Some(100),
+            Access::Admin,
+            "central"
+        ));
+        assert!(routing_gateway_allowed(0, None, Access::Admin, "central"));
+        assert!(!routing_gateway_allowed(
+            101,
+            Some(100),
+            Access::Admin,
+            "central"
+        ));
+        assert!(!routing_gateway_allowed(
+            100,
+            Some(100),
+            Access::ReadOnly,
+            "central"
+        ));
+        for principal in [String::new(), "a".repeat(65), "central\nforged".into()] {
+            assert!(!routing_gateway_allowed(
+                100,
+                Some(100),
+                Access::Admin,
+                &principal
+            ));
+        }
+    }
+
+    #[test]
     fn a_reply_over_the_cap_becomes_response_too_large_for_the_same_id() {
         let big = Response {
             v: WIRE_VERSION,
@@ -750,6 +1234,93 @@ mod tests {
         assert_eq!(decode(&encode_response(&small, max).unwrap()), small);
     }
 
+    #[tokio::test]
+    async fn successful_fallback_write_does_not_count_as_the_intended_reply() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_, mut wr) = server.into_split();
+        for oversized in [false, true] {
+            let response = Response {
+                v: WIRE_VERSION,
+                id: 42,
+                result: Ok(Reply::EffectiveConfig(if oversized {
+                    "x".repeat(100_000)
+                } else {
+                    "small".into()
+                })),
+            };
+            let (written, original) =
+                send_observed(&mut wr, &response, 65536, Duration::from_secs(1)).await;
+            assert!(written);
+            assert_eq!(original, !oversized);
+            let mut header = [0; HEADER_LEN];
+            client.read_exact(&mut header).await.unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut payload).await.unwrap();
+            let received: Response = serde_json::from_slice(&payload).unwrap();
+            if oversized {
+                assert!(matches!(
+                    received.result,
+                    Err(CommandError::ResponseTooLarge { .. })
+                ));
+            } else {
+                assert_eq!(received, response);
+            }
+        }
+        drop(client);
+        // Make write failure independent of peer-close timing and any socket
+        // copies briefly retained by concurrent process fixtures before exec.
+        wr.shutdown().await.unwrap();
+        let response = Response {
+            v: WIRE_VERSION,
+            id: 43,
+            result: Ok(Reply::Done),
+        };
+        assert!(
+            !send_observed(&mut wr, &response, 65536, Duration::from_secs(1))
+                .await
+                .0
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_boundary_half_close_is_distinct_from_partial_eof_timeout_and_shutdown() {
+        for case in 0..5 {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let (mut rd, _) = server.into_split();
+            let shutdown = CancellationToken::new();
+            let mut decoder = FrameDecoder::new(65536);
+            match case {
+                0 => client.shutdown().await.unwrap(),
+                1 => {
+                    client.write_all(&[0, 0]).await.unwrap();
+                    client.shutdown().await.unwrap();
+                }
+                2 => {}
+                3 => shutdown.cancel(),
+                4 => {
+                    client.write_all(&[0, 0]).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = read_frame(
+                &mut rd,
+                &mut decoder,
+                &mut [0; 1024],
+                Duration::from_millis(20),
+                Some(Duration::from_millis(20)),
+                &shutdown,
+            )
+            .await;
+            match case {
+                0 => assert!(matches!(result, Read::Eof)),
+                1 => assert!(matches!(result, Read::Closed(ReadFailure::PartialEof))),
+                2 | 4 => assert!(matches!(result, Read::Closed(ReadFailure::Timeout))),
+                3 => assert!(matches!(result, Read::Closed(ReadFailure::Shutdown))),
+                _ => unreachable!(),
+            }
+        }
+    }
+
     #[test]
     fn only_set_device_channels_with_dry_run_is_a_dry_run() {
         use tessera_control_types::DeviceKey;
@@ -768,6 +1339,34 @@ mod tests {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    #[test]
+    fn the_portal_account_sends_access_lock_commands_as_the_api() {
+        use tessera_control_types::{AccessPin, DeviceKey};
+        let device = || DeviceKey("main".into());
+        let reset = Command::ResetAccessLock { device: device() };
+        let lock = Command::LockAccess {
+            device: device(),
+            pin: AccessPin::new("1234"),
+        };
+        let portal = Origin::Api {
+            principal: "portal".into(),
+        };
+        assert_eq!(command_origin(990, Some(990), &reset), portal);
+        assert_eq!(command_origin(990, Some(990), &lock), portal);
+        // Anyone else, root included, is a local user.
+        assert_eq!(
+            command_origin(1000, Some(990), &reset),
+            Origin::Cli { uid: 1000 }
+        );
+        assert_eq!(command_origin(0, Some(0), &reset), Origin::Cli { uid: 0 });
+        assert_eq!(command_origin(1000, None, &lock), Origin::Cli { uid: 1000 });
+        // Other commands from the portal keep their origin.
+        assert_eq!(
+            command_origin(990, Some(990), &Command::ReloadConfig),
+            Origin::Cli { uid: 990 }
+        );
+    }
 
     #[test]
     fn protocol_metadata_cannot_grant_permission_or_exempt_other_commands() {

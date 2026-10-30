@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-backend-pipewire"
 description = "PipeWire audio backend with drift compensation"
 version.workspace = true
@@ -10,6 +7,9 @@ edition.workspace = true
 rust-version = "1.87"
 license.workspace = true
 repository.workspace = true
+autotests = false
+autoexamples = false
+autobenches = false
 
 [features]
 default = []
@@ -26,16 +26,11 @@ pw = ["dep:pipewire", "dep:zerocopy"]
 # its final counters line (the test asserts zero).
 alloc-check = ["pw"]
 
-[lib]
-test = false
-bench = false
-doctest = false
-
 [dependencies]
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.3.0" }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.5.0" }
 tessera-control-types = { workspace = true }
-tessera-media = { path = "../tessera-media", version = "0.3.0" }
-tessera-resample = { path = "../tessera-resample", version = "0.3.0" }
+tessera-media = { path = "../tessera-media", version = "0.5.0" }
+tessera-resample = { path = "../tessera-resample", version = "0.5.0" }
 serde_json = "1"
 rtrb = "0.4"
 libc = "0.2"
@@ -53,3 +48,8 @@ bench = false
 
 [lints]
 workspace = true
+
+[lib]
+test = false
+bench = false
+doctest = false

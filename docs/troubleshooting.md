@@ -1,5 +1,26 @@
 # Troubleshooting
 
+## NetAudio reports a name contains unsupported characters
+
+If subscription planning reports `name contains unsupported characters`, check
+the transmitter's **device name** as well as its TX channel name. The request
+identifies the destination RX by channel number; an RX display label alone is
+not the source-name pair used to connect.
+
+Audinate's [public naming rules](https://dev.audinate.com/GA/dante-controller/userguide/webhelp/content/device_and_channel_names.htm)
+allow spaces in channel labels such as `TX 2` and `Analog L`. Device names use
+ASCII letters, digits and hyphens, with no leading or trailing hyphen. Thus a
+device named `Studio Laptop` is outside those rules even though a TX label
+`TX 2` is valid. This makes the device name a candidate for the observed
+NetAudio error; it does not isolate which field its planner rejected.
+
+Tessera validates new rename/label commands and warns about existing names.
+It preserves existing spellings and subscriptions. Do not strip spaces from
+channel labels, lowercase everything or automatically rename a running
+transmitter as a workaround: routing uses names as identity. A deliberate
+rename must keep discovery, the compatibility runtime and receiver readback
+consistent, then recheck the intended routes in NetAudio and Dante Controller.
+
 Start with the facts:
 
 ```sh
@@ -16,10 +37,12 @@ and for the PipeWire client: `systemctl --user status tessera-pw` and
 Remember what exists today (see `user-guide.md` and `interoperability.md`):
 the daemon runs the PTP clock, the media engine with static `[[flow]]`
 entries, receiver keepalives, mDNS advertising, the local clients
-and (with `alsa-bridge`) the sound-card bridge. It does not implement the
-vendor's control protocols itself: the separate Controller compatibility
-runtime (`tessera-controller@main`) serves the first device's base control ports
-and hands what a controller sets up to the daemon as typed commands.
+and (with `alsa-bridge`) the sound-card bridge. By default it does not
+implement the vendor's control protocols itself: the separate Controller
+compatibility runtime (`tessera-controller@main`) serves the first device's base
+control ports and hands what a controller sets up to the daemon as typed
+commands. A host with the opt-in native device role (`--native-device`) serves
+them from `tesserad` instead, and the runtime is disabled there.
 
 On a speaker, the sections "Network speaker (CamillaDSP and the portal)" and
 "Add-on bundle" below cover most of what goes wrong.
@@ -216,17 +239,26 @@ The order is the order of dependence.
    224.0.1.129), the UDP port of every `[[flow]]` (media in, keepalives out
    from the same port), and UDP 5353 when advertising. The control protocol
    ports of the interoperable devices are **not final** (the specification
-   still has an open discrepancy about one of them). Until captures settle it,
+   still has an open discrepancy about one of them). Until that is settled,
    do not block UDP between media peers on the audio VLAN; restrict by
-   interface and VLAN rather than by port.
-6. **Subscription stuck "in progress"**: no rx `[[flow]]` carries that rx channel
-   (or the flow started less than 5 s ago). A subscription is stored by name, but
-   `tesserad` does not implement the flow control that would set it up; audio is
-   carried by `[[flow]]` entries (`configuration.md`, "Static flows") or by the flows
-   a controller submitted (`tesseractl flows show`), and the
-   state follows the packets of the flow that carries the channel: "receiving",
-   or "no media" when none arrived for a few seconds (check the sender, the port
-   and `peer`, item 7).
+   interface and VLAN rather than by port. A native receiver
+   (`--native-device`) that takes a channel from a multicast flow listens on
+   its group (239.255.0.0/16, UDP 4321 by default); if a firewall or the
+   switch drops the group, the receiver keeps that input on unicast.
+6. **Subscription stuck "in progress"**: no rx flow carries that rx channel
+   (or the flow started less than 5 s ago). With the native device role
+   (`--native-device`) the daemon requests that flow itself: check that
+   `[discovery] browse_devices = true`, that the transmitter is listed
+   (`tesseractl routing devices`) with the same sample rate and encoding, and
+   the subscription's state in `tesseractl status` (`unresolved`: the
+   transmitter or channel was not found; a refusal code or a rate/encoding
+   mismatch otherwise). A refused request is retried every 5 s. Without the
+   native role, `tesserad` does not implement the flow control that would set
+   it up; audio is carried by `[[flow]]` entries (`configuration.md`, "Static
+   flows") or by the flows a controller submitted (`tesseractl flows show`).
+   Either way the state follows the packets of the flow that carries the
+   channel: "receiving", or "no media" when none arrived for a few seconds
+   (check the sender, the port and `peer`, item 7).
 7. **An rx flow receives nothing**: `tesseractl metrics` shows the flow's
    `PACKETS`. If `engine.rx_filtered` grows, the datagrams come from another
    address than the flow's `peer`. Check the port and the interface
@@ -250,15 +282,27 @@ The order is the order of dependence.
    `--rx-keepalive-payload 1337`. Keepalives are PROVISIONAL (from the
    provisional wire settings). A transmitter that never started sending is a
    different problem: a hardware transmitter starts a flow only on a flow
-   request, which `tesserad` does not send ([interoperability.md](interoperability.md)).
+   request, which `tesserad` sends only with the native device role
+   ([interoperability.md](interoperability.md#native-device-role)).
 
 ## A controller lists the device but shows it greyed out or unreachable
 
 The controller found the device in mDNS (device advertisement is on by default)
 but gets no answer on the control ports the records advertise: ARC (UDP
 4440), CMC (8800) and flow control (4455), each plus 10 per further device.
-`tesserad` does not serve these ports itself. The packaged Controller
-compatibility runtime does, for the first logical device only:
+Either the daemon's native device role or the packaged Controller compatibility
+runtime serves them, for the first logical device only.
+
+With the native device role (`--native-device`):
+
+* `journalctl -u tesserad -b | grep 'native device role'` should show `serving
+  on <address> (<interface>)`. `cannot bind its ports ... is the compatibility
+  runtime still running?` means another process holds them: `sudo systemctl
+  disable --now tessera-controller@main`. `waits for the primary interface`
+  means the daemon has no primary interface with an IPv4 address yet.
+* The role binds again by itself when the primary address changes.
+
+With the compatibility runtime:
 
 * Is it running? `systemctl status tessera-controller@main`. It starts and stops
   with `tesserad` (it is `PartOf` it); a start that fails is retried every 3 s, and
@@ -277,6 +321,56 @@ compatibility runtime does, for the first logical device only:
 A locked PTP clock does not imply vendor-controller compatibility. The static
 flows of Tessera peers or independently configured peers work without any
 controller. See [compatibility limits](interoperability.md).
+
+## A controller cannot change the sample rate or encoding
+
+The device offers a controller exactly the rates and encodings it accepts now,
+the same lists `tesseractl --device main status` prints (`can be set to: ...`)
+and the portal's Device page offers. When only the current value is left, the
+reason is printed under the device table (`main: sample rate fixed at 48000 Hz:
+...`): an enabled `[[bridge]]` that sets `sample_rate` pins the rate (by design:
+its card runs at that rate), and a `locked` key pins its value. The device then
+reports the setting as not changeable, and a controller offers nothing else.
+
+With the native device role (`--native-device`), every rate or encoding write a
+controller sends is logged at info level, applied or not:
+
+```sh
+journalctl -u tesserad -b --no-pager | grep -E '(sample-rate|encoding) write from'
+# ... sample-rate write from 192.0.2.10:51234: flags 0x00000001, value 44100: applied (was 48000)
+# ... sample-rate write from 192.0.2.10:51234: flags 0x00000001, value 96000: refused: invalid sample_rate: bridge ...
+```
+
+No line means the controller sent this device no write. A request the role does
+not implement is logged with its bytes (`native ARC 0x.... from ... answered
+unsupported: ...`, once a minute per request type). After a rate change,
+receivers of this device that run at the old rate stop receiving until they
+change too: that is expected.
+
+Known open issue in 0.5.0: in one setup the vendor's controller could not change
+a native device's sample rate; the cause is still being investigated. If that happens, the log above shows whether the
+write reached the device and what was answered; meanwhile change the rate with
+`tesseractl set-rate` or the portal. Some third-party tools refuse a
+sample-rate change in their own checks because the device does not answer the
+newer flow-list queries; that refusal never reaches the device.
+
+## A change is refused although you are an administrator
+
+* **`device ... is locked against changes (device access lock)`**: the device
+  is locked behind a PIN. `tesseractl status` shows `locked` in the `ACCESS`
+  column. Unlock it with `tesseractl access unlock` or the portal's Device
+  page; a forgotten PIN is reset on the device with `sudo tesseractl access
+  reset` ([cli.md](cli.md#access)). A vendor controller shows the padlock but
+  cannot unlock it.
+* **`rate limited` when unlocking**: five wrong PINs from one kind of client
+  pause unlocking from it for 60 s.
+* **A controller's factory reset or clear configuration does nothing**: both
+  are refused unless `[control] allow_factory_reset = true`
+  ([configuration.md](configuration.md#control)); the refusal is logged and the
+  device keeps its settings. They are also refused while the device is locked.
+* **`... is locked by the configuration`**: a `locked` list of the
+  configuration pins that key or domain (`tesseractl config show --provenance`
+  names the file); that is not the access lock.
 
 ## Network speaker (CamillaDSP and the portal)
 
@@ -338,17 +432,37 @@ the engine's state and names the usual causes in a notice.
 
 ## Controller flows
 
-* **A warning names `90-probe-flows.toml`.** The file is deprecated and still read in
-  0.3.0 while no controller flow set is stored; support ends in 0.4.0. Store the flows
-  with `tesseractl flows set FILE` (or let the Controller runtime submit them), then
-  delete the file.
+* **A warning names `90-probe-flows.toml`.** The file is deprecated and still read
+  while no controller flow set is stored. Intentional host-owned flows can be
+  stored with `tesseractl flows set FILE`. Runtime-produced carriers use the
+  guarded runtime report and recovery paths; importing their bytes does not
+  establish runtime ownership.
 * **`flows is locked by the configuration`.** The host owns the flows
   (`[control] locked = ["flows"]`), as on an NDIMon appliance. Change the host's
   configuration, not the daemon.
-* **A restart of `tesserad` must not lose stored flows.** The Controller runtime
-  restarts with the daemon and reports an empty set at start; the adapter ignores that
-  report until the run has applied one of its own (`control-interface.md`, "Who owns
-  the controller flow set"). `tesseractl flows show` lists what is in force.
+* **A restart of `tesserad` must not discard host-owned flows.** The adapter submits
+  complete reports, including an empty startup report. The daemon protects
+  configured, host-owned and restored carriers from automatic acquisition.
+  Explicit carrier recovery can authorize a reviewed scope for a new run;
+  matching bytes alone cannot. `tesseractl flows show` lists effective content.
+* **`runtime flows require the guarded RuntimeReport request`.** Update the
+  adapter together with the daemon, launcher and CLI. A compatibility-unit
+  process cannot use the intentional whole-set setter, even with administrator
+  group membership or a protocol label. Genuine administrator flow writes stay
+  available. Unavailable sender identity refuses the write.
+* **`runtime integration executables have different or unqualified builds`.**
+  Install the core binaries from one source build and restart the compatibility
+  unit through the normal service procedure. Registration requires matching
+  executable roles, display versions and own-source build IDs. A replacement
+  during a live run also requires new registration. Do not clear state or
+  change carrier ownership to bypass a package mismatch.
+
+`cargo xtask build-deb` supplies the source build ID automatically. For a
+development build on a build target, freeze the sources first and pass the same
+`TESSERA_RUNTIME_BUILD_ID` from `cargo xtask runtime-build-id` to the daemon,
+launcher, adapter and CLI builds. An unlabeled `cargo build` does not qualify
+runtime integration. The ID describes our integration sources; it establishes
+neither compatibility-runtime provenance nor routing or audio acceptance.
 
 ## Packages
 
@@ -403,3 +517,81 @@ uname -a; dpkg -l 'tessera*' ; ethtool -T eth0 2>&1
 
 Check the files for names and addresses you do not want to publish before you
 attach them.
+
+
+## Recovering an uncertain routing operation
+
+In builds that provide routing recovery, open **Routing → Recover uncertain
+operation**. Review every input's current source against the saved source and
+original request. Accept the observed baseline only when those selections are
+what you want. The daemon reads the receiver again before saving; a changed
+selection cancels acceptance. This sends no receiver routing command and does
+not repeat the original request. Its original outcome remains unknown.
+
+The same review is available with `tesseractl routing inspect` and
+`GET /api/v1/routing/operation`. Accept its single-use review with
+`tesseractl routing reconcile --review TOKEN`, or the typed
+`ReconcileReceiverOperation` command through `POST /api/v1/commands`.
+Administrator access is required. Wait for the retired worker/startup quiet
+interval and resolve any routing lock before accepting. A changed receiver
+identity or binding requires explicit migration rather than automatic adoption.
+
+Carrier protection after restart is separate. Accepting selections never clears
+host flow/vacancy protection or assigns restored carriers to a new runtime.
+Do not edit the managed state file or delete unrelated flows to bypass this.
+
+### Reviewing carriers after a runtime restart
+
+In builds that provide carrier recovery, open **Routing → Review restart
+recovery**. The review lists each stored carrier and its recorded runtime
+origin. Only entries recorded as belonging to an earlier authenticated runtime
+are eligible. Unknown origins, host-owned entries, configured flows and
+protected empty slots remain protected. Matching carrier names or bytes cannot
+establish ownership.
+
+**Return eligible carriers to runtime management** changes ownership metadata
+only. It sends no receiver command and changes no stored carrier bytes or saved
+selections. A later complete runtime report may replace or remove those whole
+carriers, so review their details and affected audio before confirming. Release
+does not replay a refused report or make routing ready automatically.
+
+The same inspection is available with `tesseractl routing inspect-carriers`
+and `GET /api/v1/routing/carrier-recovery`. An administrator can accept the
+single-use, 30-second review with `tesseractl routing release-carriers --review
+TOKEN`, or `ReleaseRuntimeCarriers` through `POST /api/v1/commands`. The daemon
+rechecks the runtime, complete reviewed state, locks and retired worker before
+persisting. A changed or expired review requires another inspection. An
+uncertain receiver operation must be reconciled first. A failed save keeps the
+previous protection; retrying requires a fresh review.
+
+### Authorizing the next runtime start
+
+If a startup report was refused, returning recorded carriers to the current
+run cannot produce a fresh report. The recovery page instead offers
+**Authorize the next runtime start to replace these carriers** when the domain
+is eligible. This is a new administrator decision, including carriers whose
+origin is unknown; it does not establish their historical origin.
+
+Review every stored carrier of the first local device, its saved receiver
+selections and the configured carriers before confirming. The authorization
+changes no carrier bytes or receiver selections. It does not clear intentional
+host protection or protected empty slots. Configured first-device carriers,
+locks, uncertainty or an unfinished receiver worker prevent authorization.
+
+The equivalent command is `tesseractl routing grant-next-run --review TOKEN`,
+using the separate `next_run_review` from a fresh `routing inspect-carriers`
+response, or `GrantRuntimeCarriersToNextRun` through `POST /api/v1/commands`.
+Reviews expire after 30 seconds and can be used once. Machine-peer credentials
+cannot grant this permission.
+
+Use the attended service update procedure to restart the runtime; the portal
+does not restart it. Restarting can interrupt audio. Only the next
+authenticated run can consume the authorization, before it executes, and only
+its own accepted complete report establishes routing readiness. Its first report
+may replace or remove the reviewed whole carriers. Other-device content and
+saved receiver selections remain protected.
+
+A daemon restart, host flow write, changed binding or changed saved selections
+invalidates the authorization. A failed save grants no rights. If the new run
+ends without an accepted report, no later run inherits the permission; inspect
+again rather than editing the state file or replaying an old report.

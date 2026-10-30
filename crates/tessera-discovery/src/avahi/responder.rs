@@ -19,7 +19,10 @@ use super::{Cmd, Owner, bus_err, ifindexes, protocol, signal_rule, signal_stream
 use crate::backoff::ConflictLimiter;
 use crate::config::DiscoveryConfig;
 use crate::error::Error;
-use crate::model::{ConflictScope, DeviceServices, ResponderEvent, ServiceId, ServiceSpec};
+use crate::model::{
+    ConflictScope, DeviceServices, PublishedService, ResponderEvent, ServiceId, ServiceInstance,
+    ServiceSpec,
+};
 use crate::provisional::DOMAIN;
 
 /// How often a name is re-chosen before giving up.
@@ -56,6 +59,8 @@ impl Group {
 #[derive(Debug)]
 struct Svc {
     spec: ServiceSpec,
+    /// A failed multi-interface TXT update leaves publication uncertain.
+    txt_uncertain: bool,
     /// Instance name chosen after a collision.
     assigned: Option<String>,
     group: Option<Group>,
@@ -66,6 +71,45 @@ impl Svc {
     fn instance(&self) -> &str {
         self.assigned.as_deref().unwrap_or(&self.spec.instance)
     }
+
+    fn established(&mut self) {
+        self.announced = true;
+    }
+
+    fn publication_failed(&mut self) {
+        self.announced = false;
+    }
+
+    fn begin_txt_update(&mut self) {
+        self.txt_uncertain = true;
+    }
+
+    fn finish_txt_update(&mut self, new: &ServiceSpec) {
+        self.spec = new.clone();
+        self.txt_uncertain = false;
+    }
+
+    fn published(
+        &self,
+        device: &str,
+        host: &str,
+        addresses: &[(i32, IpAddr)],
+    ) -> Option<PublishedService> {
+        if !self.announced || self.txt_uncertain {
+            return None;
+        }
+        let spec = &self.spec;
+        Some(PublishedService {
+            device: device.to_owned(),
+            service: ServiceInstance {
+                id: ServiceId::new(spec.kind, self.instance()),
+                host: host.to_owned(),
+                port: spec.port,
+                addresses: addresses.iter().map(|(_, address)| *address).collect(),
+                txt: spec.txt.clone(),
+            },
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -74,6 +118,9 @@ struct Dev {
     /// Host label chosen after a collision.
     host_assigned: Option<String>,
     addr_group: Option<Group>,
+    /// Only the current address group's Established signal confirms these
+    /// addresses. Service establishment cannot confirm an address group.
+    addresses_confirmed: bool,
     svcs: Vec<Svc>,
     /// Interface indexes the device was published on.
     published_idxs: Vec<i32>,
@@ -87,6 +134,31 @@ impl Dev {
     }
     fn host_name(&self) -> String {
         format!("{}.{}", self.host_label(), DOMAIN.trim_end_matches('.'))
+    }
+
+    fn invalidate_addresses(&mut self) {
+        self.addresses_confirmed = false;
+        self.published_addrs.clear();
+    }
+
+    fn address_group_state(&mut self, state: i32) {
+        self.addresses_confirmed = state == GROUP_ESTABLISHED;
+    }
+
+    fn published(&self, key: &str) -> Vec<PublishedService> {
+        if !self.addresses_confirmed || self.published_addrs.is_empty() {
+            return Vec::new();
+        }
+        self.svcs
+            .iter()
+            .filter_map(|svc| {
+                svc.published(
+                    key,
+                    &format!("{}.", self.host_name()),
+                    &self.published_addrs,
+                )
+            })
+            .collect()
     }
 }
 
@@ -118,6 +190,7 @@ pub(crate) async fn spawn(
     conn: zbus::Connection,
     cfg: Arc<DiscoveryConfig>,
     mut owner_rx: watch::Receiver<Owner>,
+    revision: Arc<AtomicU64>,
 ) -> Result<Spawned, Error> {
     let server = ServerProxy::builder(&conn)
         .cache_properties(zbus::proxy::CacheProperties::No)
@@ -208,6 +281,7 @@ pub(crate) async fn spawn(
         devices: HashMap::new(),
         events: events_tx,
         dropped: Arc::clone(&dropped),
+        revision,
         running: state == SERVER_RUNNING,
         next_generation: 0,
         server_watcher,
@@ -239,8 +313,11 @@ pub(crate) async fn spawn(
                 Ok(()) = owner_rx.changed() => {
                     let o = *owner_rx.borrow_and_update();
                     actor.on_owner(o).await;
+                    actor.revision.fetch_add(1, Ordering::Relaxed);
                 }
-                _ = recheck.tick(), if !interval.is_zero() => actor.recheck().await,
+                _ = recheck.tick(), if !interval.is_zero() => {
+                    actor.recheck().await;
+                },
             }
         }
         actor.free_all().await;
@@ -255,6 +332,7 @@ struct Actor {
     devices: HashMap<String, Dev>,
     events: mpsc::Sender<ResponderEvent>,
     dropped: Arc<AtomicU64>,
+    revision: Arc<AtomicU64>,
     running: bool,
     next_generation: u64,
     /// Forwards the server's state changes; stopped with the actor.
@@ -292,6 +370,10 @@ impl Actor {
     /// Returns false when the actor should stop.
     async fn handle(&mut self, cmd: Cmd) -> bool {
         match cmd {
+            Cmd::Published(reply) => {
+                let _ = reply.send(self.published());
+                return true;
+            }
             Cmd::Register(dev, reply) => {
                 let _ = reply.send(self.register(dev).await);
             }
@@ -313,7 +395,17 @@ impl Actor {
             }
             Cmd::Server(state) => self.on_server_state(state).await,
         }
+        self.revision.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    fn published(&self) -> Vec<PublishedService> {
+        let mut rows = Vec::new();
+        for (key, dev) in &self.devices {
+            rows.extend(dev.published(key));
+        }
+        rows.sort_by(|a, b| (&a.device, &a.service.id).cmp(&(&b.device, &b.service.id)));
+        rows
     }
 
     async fn free_all(&mut self) {
@@ -366,8 +458,9 @@ impl Actor {
         &mut self,
         dev: &DeviceServices,
         host: &str,
-    ) -> Result<Group, PubErr> {
-        let addrs = self.host_addresses(dev);
+    ) -> Result<(Group, Vec<(i32, IpAddr)>), PubErr> {
+        let mut addrs = self.host_addresses(dev);
+        addrs.sort();
         if addrs.is_empty() {
             return Err(PubErr::Other(Error::Backend {
                 backend: crate::config::BackendKind::Avahi,
@@ -383,7 +476,7 @@ impl Actor {
             })
             .await
             .map_err(PubErr::Other)?;
-        for (idx, addr) in addrs {
+        for (idx, addr) in &addrs {
             let proto = if addr.is_ipv4() {
                 PROTO_INET
             } else {
@@ -391,7 +484,7 @@ impl Actor {
             };
             if let Err(e) = g
                 .proxy
-                .add_address(idx, proto, PUBLISH_NO_REVERSE, host, &addr.to_string())
+                .add_address(*idx, proto, PUBLISH_NO_REVERSE, host, &addr.to_string())
                 .await
             {
                 g.free().await;
@@ -402,7 +495,7 @@ impl Actor {
             g.free().await;
             return Err(classify(e));
         }
-        Ok(g)
+        Ok((g, addrs))
     }
 
     async fn publish_service(
@@ -453,6 +546,9 @@ impl Actor {
 
     /// (Re-)publishes one service, renaming it while the name is taken.
     async fn ensure_service(&mut self, device: &str, id: &ServiceId) -> Result<(), Error> {
+        if let Some(svc) = self.svc_mut(device, id) {
+            svc.publication_failed();
+        }
         for _ in 0..MAX_RENAMES {
             let Some((spec, instance, host)) = self.snapshot(device, id) else {
                 return Ok(()); // withdrawn meanwhile
@@ -462,6 +558,7 @@ impl Actor {
                     if let Some(svc) = self.svc_mut(device, id) {
                         svc.group = Some(g);
                         svc.announced = false;
+                        svc.txt_uncertain = false;
                     } else {
                         g.free().await;
                     }
@@ -535,15 +632,16 @@ impl Actor {
 
     /// Publishes the address group, renaming the host while it is taken.
     async fn ensure_addresses(&mut self, device: &str) -> Result<(), Error> {
+        if let Some(dev) = self.devices.get_mut(device) {
+            dev.invalidate_addresses();
+        }
         for _ in 0..MAX_RENAMES {
             let Some(dev) = self.devices.get(device) else {
                 return Ok(());
             };
             let (spec, host) = (dev.spec.clone(), dev.host_name());
             match self.publish_addresses(&spec, &host).await {
-                Ok(g) => {
-                    let mut addrs = self.host_addresses(&spec);
-                    addrs.sort();
+                Ok((g, addrs)) => {
                     if let Some(dev) = self.devices.get_mut(device) {
                         dev.published_addrs = addrs;
                         dev.addr_group = Some(g);
@@ -611,10 +709,12 @@ impl Actor {
         let Some(dev) = self.devices.get_mut(device) else {
             return;
         };
+        dev.invalidate_addresses();
         let mut groups: Vec<Group> = dev.addr_group.take().into_iter().collect();
         for s in &mut dev.svcs {
             groups.extend(s.group.take());
             s.announced = false;
+            s.txt_uncertain = false;
         }
         for g in groups {
             g.free().await;
@@ -638,6 +738,7 @@ impl Actor {
                 assigned: None,
                 group: None,
                 announced: false,
+                txt_uncertain: false,
             })
             .collect();
         self.devices.insert(
@@ -646,6 +747,7 @@ impl Actor {
                 spec,
                 host_assigned: None,
                 addr_group: None,
+                addresses_confirmed: false,
                 svcs,
                 published_idxs: Vec::new(),
                 published_addrs: Vec::new(),
@@ -731,6 +833,7 @@ impl Actor {
                             assigned: None,
                             group: None,
                             announced: false,
+                            txt_uncertain: false,
                         });
                     }
                     if self.running {
@@ -744,7 +847,10 @@ impl Actor {
                     if same_port {
                         self.update_txt(&key, &id, s).await?;
                     } else {
-                        let old = self.svc_mut(&key, &id).and_then(|v| v.group.take());
+                        let old = self.svc_mut(&key, &id).and_then(|v| {
+                            v.publication_failed();
+                            v.group.take()
+                        });
                         if let Some(g) = old {
                             g.free().await;
                         }
@@ -777,7 +883,9 @@ impl Actor {
         let Some(svc) = self.svc_mut(device, id) else {
             return Ok(());
         };
-        svc.spec = new.clone();
+        // A multi-interface update can partially succeed. Until every call
+        // succeeds, introspection must not claim either TXT view is current.
+        svc.begin_txt_update();
         let instance = svc.instance().to_owned();
         if let Some(g) = &svc.group {
             for idx in idxs {
@@ -786,6 +894,11 @@ impl Actor {
                     .await
                     .map_err(bus_err)?;
             }
+            svc.finish_txt_update(new);
+        } else {
+            // No group exists yet; the next publication uses this intent.
+            svc.spec = new.clone();
+            svc.txt_uncertain = false;
         }
         Ok(())
     }
@@ -806,7 +919,7 @@ impl Actor {
                 }
                 match state {
                     GROUP_ESTABLISHED if !svc.announced => {
-                        svc.announced = true;
+                        svc.established();
                         let ev = ResponderEvent::Announced {
                             device: tag.device.clone(),
                             id: id.clone(),
@@ -815,6 +928,7 @@ impl Actor {
                         self.emit(ev);
                     }
                     GROUP_COLLISION => {
+                        svc.publication_failed();
                         let old = svc.group.take();
                         if let Some(g) = old {
                             g.free().await;
@@ -827,13 +941,17 @@ impl Actor {
                             self.fail(&tag.device, e);
                         }
                     }
-                    GROUP_FAILURE => self.fail(
-                        &tag.device,
-                        Error::Backend {
-                            backend: crate::config::BackendKind::Avahi,
-                            message: format!("entry group for {id} failed"),
-                        },
-                    ),
+                    GROUP_FAILURE => {
+                        svc.publication_failed();
+                        self.fail(
+                            &tag.device,
+                            Error::Backend {
+                                backend: crate::config::BackendKind::Avahi,
+                                message: format!("entry group for {id} failed"),
+                            },
+                        );
+                    }
+                    _ if state != GROUP_ESTABLISHED => svc.publication_failed(),
                     _ => {}
                 }
             }
@@ -841,6 +959,7 @@ impl Actor {
                 if dev.addr_group.as_ref().map(|g| g.generation) != Some(tag.generation) {
                     return;
                 }
+                dev.address_group_state(state);
                 if state == GROUP_COLLISION {
                     // The host name is taken: new host label, publish everything again.
                     self.unpublish_device(&tag.device).await;
@@ -852,6 +971,9 @@ impl Actor {
                         self.fail(&tag.device, e);
                     }
                 } else if state == GROUP_FAILURE {
+                    for svc in &mut dev.svcs {
+                        svc.publication_failed();
+                    }
                     self.fail(
                         &tag.device,
                         Error::Backend {
@@ -876,10 +998,12 @@ impl Actor {
     /// gone, or the objects are stale).
     fn forget_device(&mut self, device: &str) {
         if let Some(dev) = self.devices.get_mut(device) {
+            dev.invalidate_addresses();
             dev.addr_group = None;
             for s in &mut dev.svcs {
                 s.group = None;
                 s.announced = false;
+                s.txt_uncertain = false;
             }
         }
     }
@@ -993,7 +1117,10 @@ impl Actor {
                 if now == dev.published_addrs {
                     continue;
                 }
-                let old = self.devices.get_mut(&k).and_then(|d| d.addr_group.take());
+                let old = self.devices.get_mut(&k).and_then(|d| {
+                    d.invalidate_addresses();
+                    d.addr_group.take()
+                });
                 if let Some(g) = old {
                     g.free().await;
                 }
@@ -1001,6 +1128,7 @@ impl Actor {
             } else {
                 continue;
             };
+            self.revision.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = result {
                 self.fail(&k, e);
             }
@@ -1065,4 +1193,106 @@ fn local_addresses(cfg: &DiscoveryConfig) -> Vec<(i32, IpAddr)> {
         out.push((idx, ip));
     }
     out
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::{ServiceKind, TxtRecord};
+
+    #[test]
+    fn service_establishment_cannot_confirm_replaced_or_failed_addresses() {
+        let spec = ServiceSpec {
+            kind: ServiceKind::Arc,
+            instance: "stage".into(),
+            port: 4440,
+            txt: TxtRecord::new(),
+        };
+        let mut dev = Dev {
+            spec: DeviceServices {
+                device: "main".into(),
+                hostname: "stage".into(),
+                addresses: vec![],
+                services: vec![spec.clone()],
+            },
+            host_assigned: None,
+            addr_group: None,
+            addresses_confirmed: false,
+            svcs: vec![Svc {
+                spec,
+                assigned: None,
+                group: None,
+                announced: false,
+                txt_uncertain: false,
+            }],
+            published_idxs: vec![2],
+            published_addrs: vec![(2, "10.0.0.1".parse().unwrap())],
+        };
+        dev.svcs[0].established();
+        assert!(dev.published("main").is_empty());
+        dev.address_group_state(GROUP_ESTABLISHED);
+        assert_eq!(dev.published("main").len(), 1);
+        dev.address_group_state(GROUP_FAILURE);
+        dev.svcs[0].publication_failed();
+        dev.svcs[0].established();
+        assert!(dev.published("main").is_empty());
+
+        // Removing the old address group invalidates introspection before a
+        // replacement is attempted. A failed replacement retains no old IP.
+        dev.invalidate_addresses();
+        dev.svcs[0].established();
+        assert!(dev.published("main").is_empty());
+        dev.published_addrs = vec![(2, "10.0.0.2".parse().unwrap())];
+        assert!(dev.published("main").is_empty());
+        dev.address_group_state(GROUP_ESTABLISHED);
+        assert_eq!(
+            dev.published("main")[0].service.addresses,
+            vec!["10.0.0.2".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn introspection_requires_confirmed_publication_and_complete_txt_update() {
+        let old = ServiceSpec {
+            kind: ServiceKind::Arc,
+            instance: "stage".into(),
+            port: 4440,
+            txt: TxtRecord::new().with("version", "old").unwrap(),
+        };
+        let mut svc = Svc {
+            spec: old.clone(),
+            assigned: None,
+            group: None,
+            announced: false,
+            txt_uncertain: false,
+        };
+        assert!(svc.published("main", "stage.local.", &[]).is_none());
+        svc.established();
+        assert_eq!(
+            svc.published("main", "stage.local.", &[])
+                .unwrap()
+                .service
+                .txt,
+            old.txt
+        );
+        svc.publication_failed();
+        assert!(svc.published("main", "stage.local.", &[]).is_none());
+        svc.established();
+        svc.begin_txt_update();
+        // A failed or partial update must neither replace the confirmed spec
+        // nor be made authoritative by a late Established signal.
+        svc.established();
+        assert_eq!(svc.spec, old);
+        assert!(svc.published("main", "stage.local.", &[]).is_none());
+        let mut new = old;
+        new.txt = TxtRecord::new().with("version", "new").unwrap();
+        svc.finish_txt_update(&new);
+        assert_eq!(
+            svc.published("main", "stage.local.", &[])
+                .unwrap()
+                .service
+                .txt,
+            new.txt
+        );
+    }
 }

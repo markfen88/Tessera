@@ -174,9 +174,11 @@ pub fn derive_with(
         }
     }
     // Advertise by default; honour configuration/runtime opt-outs and skip loopback.
-    let off =
-        opts.no_discovery || !cfg.discovery.advertise_devices || netif::only_loopback(&ifaces);
+    let off = opts.no_discovery
+        || (!cfg.discovery.advertise_devices && !cfg.discovery.browse_devices)
+        || netif::only_loopback(&ifaces);
     let discovery = DiscoveryPlan {
+        browse: cfg.discovery.browse_devices,
         mode: if off {
             MdnsMode::Off
         } else {
@@ -188,7 +190,8 @@ pub fn derive_with(
             .devices
             .iter()
             .enumerate()
-            .map(|(i, d)| DeviceAdvert::of(d, i))
+            .filter(|_| cfg.discovery.advertise_devices)
+            .map(|(i, d)| DeviceAdvert::of(d, i).with_bundles(&rp.model.flows))
             .collect(),
     };
     let geometry = rp
@@ -385,7 +388,9 @@ pub async fn run(rt: Runtime, first: oneshot::Sender<()>) {
     let mut st = Applied::default();
     let mut first = Some(first);
     let mut watched: Vec<String> = Vec::new();
-    loop {
+    let mut browse_tick = tokio::time::interval(Duration::from_millis(500));
+    browse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    'reconcile: loop {
         match rt.engine.runtime_plan().await {
             Ok(rp) => {
                 let d = derive(&rp, rt.opts);
@@ -397,6 +402,12 @@ pub async fn run(rt: Runtime, first: oneshot::Sender<()>) {
                 tokio::select! {
                     () = rt.shutdown.cancelled() => break,
                     () = disco.sync(&d.discovery) => {}
+                }
+                if let Some(snapshot) = disco.inventory_snapshot().await {
+                    crate::native::observe_discovery(&snapshot);
+                    if !rt.engine.report_discovery(snapshot) {
+                        disco.retry_inventory();
+                    }
                 }
             }
             Err(e) => {
@@ -426,14 +437,26 @@ pub async fn run(rt: Runtime, first: oneshot::Sender<()>) {
                 }
             }
         };
-        tokio::select! {
-            () = rt.shutdown.cancelled() => break,
-            () = wake => {
-                // Coalesce a burst of events into one pass.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                while sub.recv_async_now_or_empty() {}
+        tokio::pin!(wake, iface_changed);
+        loop {
+            tokio::select! {
+                () = rt.shutdown.cancelled() => break 'reconcile,
+                () = &mut wake => {
+                    // Coalesce a burst of events into one pass.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    while sub.recv_async_now_or_empty() {}
+                    break;
+                }
+                () = &mut iface_changed => break,
+                _ = browse_tick.tick(), if disco.browsing() => {
+                    if let Some(snapshot) = disco.inventory_snapshot().await {
+                        crate::native::observe_discovery(&snapshot);
+                        if !rt.engine.report_discovery(snapshot) {
+                            disco.retry_inventory();
+                        }
+                    }
+                }
             }
-            () = iface_changed => {}
         }
     }
     let _ = tokio::time::timeout(Duration::from_secs(3), disco.shutdown()).await;
@@ -539,13 +562,24 @@ mod tests {
     fn devices_are_advertised_by_default_and_can_be_disabled() {
         let mut r = rp();
         assert!(r.config.discovery.advertise_devices);
+        assert!(!r.config.discovery.browse_devices);
         let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
         assert_eq!(d.discovery.mode, MdnsMode::Auto, "on by default");
         assert_eq!(d.discovery.devices.len(), 1);
         r.config.discovery.advertise_devices = false;
         let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
+        assert_eq!(
+            d.discovery.mode,
+            MdnsMode::Off,
+            "existing non-advertising hosts remain off"
+        );
+        r.config.discovery.browse_devices = true;
+        let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
+        assert_eq!(d.discovery.mode, MdnsMode::Auto, "browsing stays enabled");
+        assert!(d.discovery.devices.is_empty());
+        r.config.discovery.browse_devices = false;
+        let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
         assert_eq!(d.discovery.mode, MdnsMode::Off);
-        assert_eq!(d.discovery.devices.len(), 1);
         r.config.discovery.advertise_devices = true;
         let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
         assert_eq!(d.discovery.mode, MdnsMode::Auto);

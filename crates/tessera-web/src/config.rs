@@ -28,6 +28,8 @@ pub struct WebConfig {
     pub daemon_timeout: Duration,
     /// `[appliance]`: the Speaker landing page and its service switches.
     pub appliance: ApplianceConfig,
+    /// Authenticated receiver-host routing.
+    pub routing: crate::routing_peers::config::Config,
 }
 
 impl Default for WebConfig {
@@ -40,6 +42,7 @@ impl Default for WebConfig {
             session_idle: Duration::from_secs(8 * 3600),
             daemon_timeout: Duration::from_secs(5),
             appliance: ApplianceConfig::default(),
+            routing: Default::default(),
         }
     }
 }
@@ -560,6 +563,7 @@ struct File {
     session_idle_secs: Option<u64>,
     daemon_timeout_secs: Option<u64>,
     appliance: Option<ApplianceFile>,
+    routing: Option<crate::routing_peers::config::Config>,
     // Validate the helper's policy here; only tessera-network enforces it.
     #[serde(rename = "network")]
     _network: Option<tessera_state::network_profiles::NetworkPolicy>,
@@ -582,12 +586,15 @@ impl WebConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
         let f: File = toml::from_str(text).map_err(|e| e.to_string())?;
         let d = Self::default();
+        let routing = f.routing.unwrap_or_default();
+        routing.validate()?;
         let secs = |v: Option<u64>, dflt: Duration, what: &str| match v {
             Some(0) => Err(format!("`{what}` must be at least 1")),
             Some(n) => Ok(Duration::from_secs(n)),
             None => Ok(dflt),
         };
         Ok(Self {
+            routing,
             listen: f.listen.unwrap_or(d.listen),
             control_socket: f.control_socket.unwrap_or(d.control_socket),
             password_file: f.password_file.unwrap_or(d.password_file),

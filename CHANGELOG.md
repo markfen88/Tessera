@@ -1,5 +1,198 @@
 # Tessera changelog
 
+## 0.5.0
+
+Tessera 0.5.0 lets `tesserad` serve the device role itself. A host that enables
+the **native device role** (`--native-device`, opt-in) answers network
+controllers, requests the flows of its saved subscriptions and serves flows to
+other receivers, in place of the packaged Controller compatibility runtime.
+Hosts that do not enable it keep the runtime, as before. The portal can now
+route receivers, and a device can be locked behind a PIN. Tessera is
+interoperable with Dante® in the areas listed here; it is not certified, and the
+limits below are part of this release.
+
+### Native device role (opt-in)
+
+- `tesserad --native-device` (`TESSERA_NATIVE_DEVICE=true` in a service
+  drop-in) serves the first logical device's control, flow-control and
+  device-information ports (UDP 4440, 4455, 8700 and 8800). Stop and disable
+  `tessera-controller@main` on that host first: both bind those ports
+  exclusively. `--native-vendor` sets the vendor field of the device-information
+  messages; use the `--vendor` value of `/usr/lib/tessera/controller.args`.
+  How to switch and how to go back:
+  [interoperability](docs/interoperability.md#native-device-role).
+- A controller's change (subscriptions, device and channel names, sample rate,
+  encoding, device latency) enters the daemon as the same typed command the CLI
+  and the portal send. Saved subscriptions remain the only route store, and
+  every lock applies.
+- Receiving: one flow per receive input, so a change on one input never
+  interrupts another. A changed input is requested on a fresh port and the old
+  flow is stopped only after the new one is installed (make before break). A
+  refused or unanswered request is retried after 5 s; a flow without media is
+  requested again. Receive ports are UDP 14336 to 14589.
+- Transmitting: the daemon answers flow requests, updates and stops. One
+  transmit channel can feed several inputs, each as an independent session. A
+  receiver that restarts retires its older sessions; a unicast session whose
+  receiver was heard and then stayed silent for 10 s is released, and one that
+  was never heard from is released 30 s after its last request. A receiver may
+  ask for an empty channel position (channel 0); it is sent as silence. Static
+  transmit flows and `set_protocol_flows` accept channel 0 the same way (at
+  least one real channel per flow).
+- Manual multicast flows: a controller can create a transmit multicast flow (1
+  to 8 channels, a group in 239.255.0.0/16, UDP 4321) and delete it. The flow is
+  advertised, listed and restored at start. A deleted flow keeps sending,
+  unadvertised, for 8 s so that its receivers move to unicast before it stops.
+- Multicast receive: a native receiver takes a channel from an advertised
+  multicast flow of the same rate and encoding, moving from unicast make before
+  break, and falls back to unicast first when the flow is withdrawn or delivers
+  nothing for 6 s (a silent group is not tried again for that input for 30 s).
+  The firewall must pass UDP 4321 to the group; otherwise the input stays on
+  unicast.
+- Device latency can be read and set from a controller; the configured latency
+  is reported.
+- Latency monitoring: a heartbeat every second carries each receive flow's
+  largest lateness and late-packet count, and a second message the per-channel
+  signal peaks.
+- Identify: a controller's identify request shows a notice on the portal's
+  status page and in `tesseractl status` for `--native-identify-secs` seconds
+  (default 10).
+- Reboot from a controller restarts the daemon, not the host.
+- Factory reset and clear configuration from a controller are applied only with
+  `[control] allow_factory_reset = true` (see Settings).
+- Interface statistics are not answered, and network-configuration writes from a
+  controller are refused.
+
+### Routing
+
+- The portal's **Routing** page shows a matrix (transmit channels down the left,
+  receive inputs across the top) and a list. A crosspoint opens a review; the
+  confirmed change (Connect, Replace or Disconnect) goes through the daemon,
+  which checks the selection and the locks again before it sends one command.
+- Routing works from the receiver's own portal and from another Tessera host's
+  portal; the receiving device applies its own locks, and a locked receiver is
+  shown read-only with the reason. A source on another host must be qualified
+  in `[control] routing_sources` on the host that sends the change; the host's
+  own transmitter needs no qualification. Discovery browsing
+  (`[discovery] browse_devices = true`) must be on.
+- With the native device role, one transmit channel can feed several inputs of
+  the same receiver, each with its own flow. A receiver still on the
+  compatibility runtime takes one source channel on only one of its inputs; the
+  matrix disables the other cells.
+- `tesseractl routing` lists devices, channels and receiver selections, executes
+  a reviewed change, and inspects and reconciles an operation whose outcome is
+  unknown.
+- Devices that advertise a manual multicast flow remain available as sources.
+
+### Clock (PTPv1)
+
+These apply to every host, with or without the native device role.
+
+- A leader-capable port advertises stratum 0x2A to 0x2D (by priority) instead
+  of 4, so that hardware leaders keep precedence in the election. A follower
+  advertises stratum 255 and never claims Preferred Leader.
+- Sync every 250 ms (was 1 s). Delay_Req carries the parent's Sync interval.
+  General messages use DSCP 46 (EF, was 8); event messages keep DSCP 56 (CS7).
+- Between two Preferred Leaders only the lower MAC address decides. Turning
+  Preferred Leader on or off changes only the preferred flag.
+- Clock role `follower` and Preferred Leader (priority below 64) exclude each
+  other: the daemon refuses the combination from any source. At start, the
+  follower role wins and a stored or configured preferred priority is dropped
+  with a warning.
+- While this device leads and hears another Preferred Leader, it logs a warning
+  once per clock and `tesseractl status` shows a `clock.<interface>` warning
+  while that clock is heard. Role `leader` never yields.
+- Stale or repeated Syncs are ignored, and a lost parent starts a new election
+  at once.
+
+### Settings
+
+- Sample rate and encoding: the portal, `tesseractl` and a controller are
+  offered exactly the values the device accepts now (`DeviceStatus.formats`).
+  When only the current value is left, the reason is shown: an enabled
+  `[[bridge]]` that sets `sample_rate`, a `locked` key, or no other supported
+  value. With the native device role every rate or encoding write from a
+  controller is logged with its outcome
+  ([troubleshooting](docs/troubleshooting.md#a-controller-cannot-change-the-sample-rate-or-encoding)).
+- Device access lock: `tesseractl access lock|unlock|reset` and the Lock and
+  Unlock forms of the portal's Device page freeze a device's configuration and
+  routing behind a four-digit PIN, kept as an Argon2id hash in
+  `access-lock.toml`. Changes from the CLI, the portal and network controllers
+  are refused while it is set; reading and running audio continue. A forgotten
+  PIN is reset by a local administrator (`sudo tesseractl access reset`); the
+  portal cannot reset it.
+- `[control] allow_factory_reset` (default `false`) and the
+  `clear_configuration` command return a device's run-time settings (name,
+  labels, subscriptions, rate, encoding, latency, clock role and priority,
+  controller and manual multicast flows and, unless kept, the primary interface)
+  to the configuration files.
+- `--native-identify-secs` sets how long an identify request stays visible.
+
+### API
+
+- `tessera-control-types` 0.5.0 is additive: `AccessPin`, the commands
+  `LockAccess`, `UnlockAccess`, `ResetAccessLock`, `ClearConfiguration` and
+  `RouteReceiver` (with receiver operation inspection and reconciliation), the
+  errors `AccessLocked` and `IncorrectPin`, `DeviceStatus.access_locked`,
+  `DeviceStatus.formats`, `Event::AccessLockChanged` and the routing receiver
+  page. Rust clients that match exhaustively must handle the new variants. The
+  wire envelope stays at version 1.
+- The portal adds `GET /api/v1/routing/receiver`,
+  `GET /api/v1/routing/operation` and `GET /api/v1/routing/carrier-recovery`,
+  and refuses `reset_access_lock` (403).
+
+### Limits
+
+- A controller of the vendor's protocol sees the device access lock but cannot
+  set or clear it; Tessera does not advertise itself as lockable. The
+  compatibility runtime's own control server is not covered by the lock.
+- Whether the vendor's controller shows its latency graph for a native device
+  has not been verified.
+- Why the vendor's controller could not change a native device's sample rate in
+  one setup is still being investigated. Tessera now logs every rate and
+  encoding write it receives, so the log shows whether a write arrived.
+- The newer flow-list queries of current controllers are not answered; some
+  tools refuse some operations because of that (one refuses a sample-rate
+  change in its own checks).
+- Changing Preferred Leader from a controller has not been verified; use
+  `tesseractl clock set-priority` or the portal's Clock page.
+- The native device role and the compatibility runtime serve only the first
+  logical device.
+- A remote receiver is routed only when all its inputs fit on one page.
+- Not certified: external hardware audio content, sustained clock behaviour and
+  controller interoperability.
+- The deprecated `90-probe-flows.toml` fallback is still read; its removal
+  remains deferred.
+
+## 0.4.1 — development checkpoint
+
+This checkpoint retains the existing audio transport. Browser Connect/Replace/
+Disconnect, verified source audio and continuity are unfinished. The device picker
+edits saved subscription intent; it does not establish or remove audio flows.
+Private report admission and process-association diagnostics remain default-off.
+
+- Bounded backend admission, actor and connector diagnostics, with regression
+  coverage and a separate deterministic CI job. No authenticated registration,
+  production admission or native routing dispatcher is enabled.
+- Keep the deprecated `90-probe-flows.toml` compatibility fallback in 0.4.1;
+  its previously announced removal is deferred.
+
+- The Device page offers device/output selectors and review for existing saved
+  subscription intent, with advanced manual entry for offline sources. This
+  does not establish or remove audio flows; existing transport is preserved.
+- Read-only routing inventory through the daemon/API, with paged device and
+  channel records. Local receiver status separates saved intent, effective
+  carrier and packet activity; packet activity does not verify the selected source.
+- Network browsing is opt-in through `discovery.browse_devices` (default
+  `false`). Enabling it may browse permitted interfaces even when advertising
+  is disabled. Existing advertising and routing behavior remains unchanged.
+- Optional `subscriptions` host lock refuses legacy subscription changes and
+  runtime RX reductions that discard intent. Defaults remain unlocked. The new
+  `ControlLock::Subscriptions` variant requires Rust clients with exhaustive
+  matches to update; existing wire fields and envelope version 1 remain intact.
+- Successful HTTP commands retain `ok` and include the typed daemon `reply`.
+- Browser enhancement source migrates to strict TypeScript. Its generated asset
+  is embedded by Rust; appliance builds and runtime require no Node.
+
 ## 0.3.0
 
 Tessera 0.3.0 brings together the CamillaDSP speaker and Speaker control panel

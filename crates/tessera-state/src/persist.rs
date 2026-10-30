@@ -116,6 +116,39 @@ impl NetworkIntent {
     }
 }
 
+/// Provenance of one stored carrier occurrence, assigned only by an admitted
+/// report. Missing invocation means protected/unknown, never content adoption.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeCarrierOrigin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<String>,
+    #[serde(default)]
+    pub protection_revision: u64,
+}
+
+/// Written atomically with `protocol_flows`. Occurrence order is significant.
+/// Ending a runtime freezes this record; loading it grants no live ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCarrierOwnership {
+    pub binding: String,
+    pub origins: Vec<RuntimeCarrierOrigin>,
+}
+
+/// New administrator authority for one subsequent pre-exec runtime start.
+/// This is a reviewed transition, never evidence of historical carrier origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCarrierGrant {
+    pub id: String,
+    pub daemon_epoch: String,
+    pub admin_uid: u32,
+    pub reviewed_runtime: String,
+    pub protection_revision: u64,
+    pub binding: String,
+    pub flows: Vec<FlowSpec>,
+    pub saved: Vec<SubscriptionIntent>,
+    pub occurrences: Vec<u32>,
+}
+
 /// Contents of `state.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateFile {
@@ -126,6 +159,29 @@ pub struct StateFile {
     /// `Some([])` records an explicit clear and never resurrects that file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_flows: Option<Vec<FlowSpec>>,
+    /// Authority-assigned carrier provenance, never reconstructed from bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_carriers: Option<RuntimeCarrierOwnership>,
+    /// Loading this record grants no live ownership. Registration consumes it
+    /// durably, and only that new run's complete report can establish readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_carrier_grant: Option<RuntimeCarrierGrant>,
+    /// Changes even for byte-identical accepted host flow replacements.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub runtime_protection_revision: u64,
+    /// An intentional whole-set write during managed runtime control protects
+    /// vacancies as well as carriers. Restarts must not reopen acquisition.
+    /// Ordinary persistence/debounce semantics apply; no automatic rearm.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub runtime_reports_fenced: bool,
+    /// A receiver mutation may have escaped without a durable confirmed result.
+    /// Never cleared by restart, expiry or a runtime callback.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub receiver_operation_uncertain: bool,
+    /// Operation-specific dispatch fence. The old bool is also written so older
+    /// binaries remain fenced; a legacy true without context remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_operation: Option<tessera_control_types::ReceiverOperationContext>,
     /// `[clock]`.
     #[serde(default, skip_serializing_if = "ClockIntent::is_empty")]
     pub clock: ClockIntent,
@@ -141,12 +197,26 @@ impl Default for StateFile {
     fn default() -> Self {
         Self {
             protocol_flows: None,
+            runtime_carriers: None,
+            runtime_carrier_grant: None,
+            runtime_protection_revision: 0,
+            runtime_reports_fenced: false,
+            receiver_operation_uncertain: false,
+            receiver_operation: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             clock: ClockIntent::default(),
             network: NetworkIntent::default(),
             device: BTreeMap::new(),
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl StateFile {
@@ -442,6 +512,15 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// # Errors
 /// [`StateError::Io`]; the temporary file is removed on failure.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
+    write_atomic_mode(path, contents, 0o640)
+}
+
+/// [`write_atomic`] with file mode `mode` instead of 0640 (the device access
+/// lock's file is 0600).
+///
+/// # Errors
+/// [`StateError::Io`]; the temporary file is removed on failure.
+pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: u32) -> Result<(), StateError> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let dir = match path.parent() {
@@ -465,11 +544,11 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o640)
+            .mode(mode)
             .open(&tmp)
             .map_err(|e| io_err("creating", &tmp, e))?;
         // The creation mode is subject to the umask; make the result exact.
-        f.set_permissions(std::fs::Permissions::from_mode(0o640))
+        f.set_permissions(std::fs::Permissions::from_mode(mode))
             .map_err(|e| io_err("setting permissions on", &tmp, e))?;
         f.write_all(contents)
             .map_err(|e| io_err("writing", &tmp, e))?;
