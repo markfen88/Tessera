@@ -45,6 +45,15 @@ pub enum PortEvent {
         /// The applied correction in ns.
         correction_ns: i64,
     },
+    /// While this node leads, a qualified foreign clock advertises itself as
+    /// preferred: two leaders may be sending Sync (spec:5.4 item 1, Tessera
+    /// policy: warn). Once per sender per episode; see
+    /// [`Port::preferred_rival`](crate::port::Port::preferred_rival) for the
+    /// current condition.
+    PreferredRival {
+        /// The grandmaster that clock advertises.
+        gm_uuid: [u8; 6],
+    },
 }
 
 /// One thing the port wants done.

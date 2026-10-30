@@ -21,11 +21,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use tessera_discovery::advert::{ArcAdvert, ChannelAdvert, CmcAdvert};
+use crate::routing_inventory::{DiscoverySnapshot, OwnAdvertisement};
+use tessera_control_types::{DeviceKey, RoutingDiscoveryState};
+use tessera_discovery::advert::{ArcAdvert, BundleAdvert, ChannelAdvert, CmcAdvert};
 use tessera_discovery::provisional::{DEFAULT_ARC_PORT, DEFAULT_CMC_PORT, DEFAULT_FLOW_PORT};
 use tessera_discovery::{
-    DeviceServices, Discovery, DiscoveryConfig, Error as DiscError, Mode, Responder,
-    ResponderEvent, ServiceKind, ServiceSpec,
+    BrowseReadiness, Browser, DeviceServices, Discovery, DiscoveryConfig, Error as DiscError, Mode,
+    Responder, ResponderEvent, ServiceKind, ServiceSpec,
 };
 use tessera_state::config::MdnsMode;
 use tessera_state::model::DeviceModel;
@@ -54,6 +56,24 @@ pub struct DeviceAdvert {
     pub tx_labels: Vec<String>,
     /// Port offset so that several devices do not advertise one port.
     pub index: u16,
+    /// Manual multicast transmit flows (bundles, spec 3.4).
+    pub bundles: Vec<Bundle>,
+}
+
+/// One manual multicast transmit flow as advertised (`discovery-mdns.md`
+/// §§3.3-3.4): its id, the TX channels it carries in wire order, the group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bundle {
+    /// Flow (bundle) id, chosen by the controller that created it.
+    pub id: u32,
+    /// TX channels carried, in wire order (1-based).
+    pub channels: Vec<u16>,
+    /// Multicast group.
+    pub addr: Ipv4Addr,
+    /// Destination port.
+    pub port: u16,
+    /// Frames per packet.
+    pub fpp: u16,
 }
 
 impl DeviceAdvert {
@@ -69,7 +89,36 @@ impl DeviceAdvert {
             latency_ns: u64::from(d.latency_us) * 1_000,
             tx_labels: (1..=d.tx_channels).map(|c| d.tx_label(c)).collect(),
             index: u16::try_from(index).unwrap_or(u16::MAX),
+            bundles: Vec::new(),
         }
+    }
+
+    /// Add the device's manual multicast flows: the daemon's own multicast
+    /// transmit flows of this device in the effective flow set.
+    #[must_use]
+    pub fn with_bundles(mut self, flows: &[tessera_state::config::FlowConfig]) -> Self {
+        self.bundles = flows
+            .iter()
+            .filter(|f| f.device == self.key && f.direction == tessera_control_types::Direction::Tx)
+            .filter_map(|f| {
+                let id =
+                    f.id.strip_prefix(crate::native::MULTICAST_PREFIX)?
+                        .parse()
+                        .ok()?;
+                let addr = f.peer.filter(Ipv4Addr::is_multicast)?;
+                Some(Bundle {
+                    id,
+                    channels: f.channels.clone(),
+                    addr,
+                    port: f.port,
+                    fpp: f
+                        .frames_per_packet
+                        .and_then(|v| u16::try_from(v).ok())
+                        .unwrap_or(32),
+                })
+            })
+            .collect();
+        self
     }
 }
 
@@ -117,7 +166,8 @@ pub fn services_for(d: &DeviceAdvert) -> Result<DeviceServices, String> {
     let mut used = std::collections::HashSet::new();
     for (i, label) in d.tx_labels.iter().enumerate() {
         let id = u32::try_from(i + 1).unwrap_or(u32::MAX);
-        let factory = format!("TX {id}");
+        // The same factory name ARC 0x2000 reports (`control-arc.md` §4.5).
+        let factory = crate::native::wire::tx_factory_name(u16::try_from(id).unwrap_or(u16::MAX));
         // A renamed channel needs two records (spec 3.3): the factory name
         // flagged `default`, and the friendly name.
         let mut names = vec![(factory.clone(), true)];
@@ -139,6 +189,14 @@ pub fn services_for(d: &DeviceAdvert) -> Result<DeviceServices, String> {
                 latency_ns: d.latency_ns,
                 nchan,
                 default,
+                bundles: d
+                    .bundles
+                    .iter()
+                    .filter_map(|b| {
+                        let pos = b.channels.iter().position(|c| u32::from(*c) == id)?;
+                        Some((b.id, u16::try_from(pos + 1).ok()?))
+                    })
+                    .collect(),
                 ..ChannelAdvert::default()
             };
             services.push(
@@ -146,6 +204,23 @@ pub fn services_for(d: &DeviceAdvert) -> Result<DeviceServices, String> {
                     .map_err(|e| e.to_string())?,
             );
         }
+    }
+    for b in &d.bundles {
+        let bundle = BundleAdvert {
+            id: b.id,
+            nchan: u16::try_from(b.channels.len()).unwrap_or(u16::MAX),
+            latency_ns: d.latency_ns,
+            fpp: b.fpp,
+            rate: d.rate,
+            bits: d.bits,
+            addr: b.addr,
+            port: b.port,
+        };
+        services.push(
+            bundle
+                .service(&host, DEFAULT_FLOW_PORT.saturating_add(off))
+                .map_err(|e| e.to_string())?,
+        );
     }
     Ok(DeviceServices {
         device: d.key.clone(),
@@ -158,6 +233,8 @@ pub fn services_for(d: &DeviceAdvert) -> Result<DeviceServices, String> {
 /// What the manager is asked to keep true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryPlan {
+    /// Browse without changing the advertisement/control path.
+    pub browse: bool,
     /// `[discovery] mdns`.
     pub mode: MdnsMode,
     /// Interfaces to advertise on (empty: the discovery layer's default).
@@ -293,6 +370,9 @@ pub struct DiscoveryManager {
     unserved: HashSet<(String, u16)>,
     failed_at: Option<Instant>,
     last_error: Option<String>,
+    browsing: bool,
+    epoch: u64,
+    last_inventory: Option<(u64, u64, u64, RoutingDiscoveryState)>,
 }
 
 struct Started {
@@ -300,6 +380,8 @@ struct Started {
     responder: Responder,
     mode: MdnsMode,
     interfaces: Vec<String>,
+    browser: Option<Browser>,
+    events: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for DiscoveryManager {
@@ -334,6 +416,7 @@ impl DiscoveryManager {
 
     /// Make the registered devices match `plan`.
     pub async fn sync(&mut self, plan: &DiscoveryPlan) {
+        self.browsing = plan.browse;
         let Some(mode) = mode_of(plan.mode) else {
             self.shutdown().await;
             return;
@@ -358,19 +441,20 @@ impl DiscoveryManager {
             match Discovery::start(cfg).await {
                 Ok(d) => {
                     let responder = d.responder();
-                    if let Some(mut ev) = responder.events() {
+                    let events = responder.events().map(|mut events| {
                         tokio::spawn(async move {
-                            while let Some(e) = ev.recv().await {
-                                match e {
+                            while let Some(event) = events.recv().await {
+                                match event {
                                     ResponderEvent::Conflict { .. }
                                     | ResponderEvent::Failed { .. } => {
-                                        tracing::warn!("discovery: {e}");
+                                        tracing::warn!("discovery: {event}")
                                     }
-                                    _ => tracing::debug!("discovery: {e}"),
+                                    _ => tracing::debug!("discovery: {event}"),
                                 }
                             }
-                        });
-                    }
+                        })
+                    });
+                    self.epoch += 1;
                     tracing::info!("discovery started ({})", d.backend());
                     self.failed_at = None;
                     self.last_error = None;
@@ -379,6 +463,8 @@ impl DiscoveryManager {
                         responder,
                         mode: plan.mode,
                         interfaces: plan.interfaces.clone(),
+                        browser: None,
+                        events,
                     });
                 }
                 Err(e) => {
@@ -451,6 +537,129 @@ impl DiscoveryManager {
             }
         }
         self.check_listeners(&plan.interfaces);
+        if let Some(started) = &mut self.started {
+            if started.browser.as_ref().is_some_and(Browser::is_closed) {
+                started.browser = None;
+                self.epoch += 1;
+            }
+            if !plan.browse {
+                if started.browser.take().is_some() {
+                    self.epoch += 1;
+                }
+            } else if started.browser.is_none() {
+                match started.disco.browse(&[]).await {
+                    Ok(browser) => {
+                        started.browser = Some(browser);
+                        self.epoch += 1;
+                    }
+                    Err(error) => tracing::warn!("discovery browsing cannot start: {error}"),
+                }
+            }
+        }
+    }
+
+    /// On-change full snapshots, debounced by the caller. Draining has a
+    /// fixed work budget; queued events are not an inventory source of truth.
+    pub(crate) async fn inventory_snapshot(&mut self) -> Option<DiscoverySnapshot> {
+        let mut state = if !self.browsing {
+            RoutingDiscoveryState::Disabled
+        } else if self.last_error.is_some() || self.started.is_some() {
+            RoutingDiscoveryState::Failed
+        } else {
+            RoutingDiscoveryState::Disabled
+        };
+        let mut responder_revision = 0;
+        let mut browser_revision = 0;
+        if let Some(started) = &mut self.started {
+            if self.browsing {
+                responder_revision = started.responder.revision();
+                if let Some(browser) = &mut started.browser {
+                    for _ in 0..256 {
+                        if browser.try_recv().is_none() {
+                            break;
+                        }
+                    }
+                    browser_revision = browser.revision();
+                    state = match browser.readiness() {
+                        BrowseReadiness::Ready => RoutingDiscoveryState::Browsing,
+                        BrowseReadiness::Reconciling => RoutingDiscoveryState::Starting,
+                        _ => RoutingDiscoveryState::Failed,
+                    };
+                }
+            }
+        }
+        let key = (self.epoch, responder_revision, browser_revision, state);
+        if self.last_inventory == Some(key) {
+            return None;
+        }
+        self.last_inventory = Some(key);
+        let mut snapshot = DiscoverySnapshot::empty(state);
+        snapshot.browser_epoch = self.epoch;
+        let Some(started) = &mut self.started else {
+            return Some(snapshot);
+        };
+        snapshot
+            .permitted_interfaces
+            .clone_from(&started.interfaces);
+        if !self.browsing {
+            return Some(snapshot);
+        }
+        match tokio::time::timeout(Duration::from_millis(500), started.responder.published()).await
+        {
+            Ok(Ok(published)) => {
+                snapshot.own = published
+                    .into_iter()
+                    .map(|own| OwnAdvertisement {
+                        id: own.service.id,
+                        host: own.service.host,
+                        port: own.service.port,
+                        addresses: own.service.addresses,
+                        txt: own.service.txt,
+                        device: DeviceKey(own.device),
+                    })
+                    .collect();
+            }
+            _ => {
+                snapshot.health.state = RoutingDiscoveryState::Failed;
+                self.last_inventory = None;
+                // Without authoritative own records, observed advertisements
+                // cannot safely be distinguished from our local devices.
+                return Some(snapshot);
+            }
+        }
+        if let Some(browser) = &started.browser {
+            snapshot.health.dropped = browser.dropped();
+            snapshot.health.lost_events = browser
+                .lost_events()
+                .saturating_add(started.responder.dropped_events());
+            snapshot.health.resolve_failures = browser.resolve_failures();
+            for observation in browser.observations() {
+                if observation.source.len() > 128
+                    || observation.interface.as_ref().is_some_and(|s| s.len() > 64)
+                    || observation.service.id.instance.len() > 63
+                    || observation.service.host.len() > 255
+                    || observation.service.addresses.len() > 64
+                    || observation
+                        .service
+                        .txt
+                        .validate(&tessera_discovery::TxtLimits::default())
+                        .is_err()
+                {
+                    snapshot.health.rejected_observations += 1;
+                } else {
+                    snapshot.observations.push(observation);
+                }
+            }
+        }
+        Some(snapshot)
+    }
+
+    pub(crate) fn retry_inventory(&mut self) {
+        self.last_inventory = None;
+    }
+
+    pub(crate) fn browsing(&self) -> bool {
+        self.browsing
     }
 
     /// Warn, once per port, about an advertised control port nobody listens
@@ -481,12 +690,22 @@ impl DiscoveryManager {
     /// Withdraw everything and stop the backend.
     pub async fn shutdown(&mut self) {
         if let Some(s) = self.started.take() {
+            self.epoch += 1;
             for key in self.registered.keys() {
                 let _ = s.responder.withdraw(key).await;
             }
             self.registered.clear();
             self.unserved.clear();
             s.disco.shutdown().await;
+            drop(s.responder);
+            if let Some(mut events) = s.events {
+                if tokio::time::timeout(Duration::from_secs(1), &mut events)
+                    .await
+                    .is_err()
+                {
+                    events.abort();
+                }
+            }
             tracing::info!("discovery stopped");
         }
     }
@@ -506,7 +725,36 @@ mod tests {
             latency_ns: 4_000_000,
             tx_labels: labels.iter().map(|s| (*s).to_owned()).collect(),
             index: 0,
+            bundles: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_multicast_flow_is_advertised_and_marks_its_channels() {
+        let mut d = advert(&["TX 1", "TX 2"]);
+        d.bundles = vec![Bundle {
+            id: 3,
+            channels: vec![2],
+            addr: Ipv4Addr::new(239, 255, 1, 3),
+            port: 4321,
+            fpp: 32,
+        }];
+        let s = services_for(&d).unwrap();
+        let bund = s
+            .services
+            .iter()
+            .find(|x| x.kind == ServiceKind::Bund)
+            .unwrap();
+        assert_eq!(bund.instance, "3@My-Device-1");
+        assert_eq!(bund.txt.get_str("a.0"), Some("239.255.1.3"));
+        let chan = |name: &str| {
+            s.services
+                .iter()
+                .find(|x| x.kind == ServiceKind::Chan && x.instance.starts_with(name))
+                .unwrap()
+        };
+        assert_eq!(chan("TX 2@").txt.get_str("b.3"), Some("1"));
+        assert_eq!(chan("TX 1@").txt.get_str("b.3"), None);
     }
 
     #[test]

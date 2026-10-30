@@ -131,6 +131,26 @@ pub const CLI_ONLY: &[(&str, &str)] = &[
         "print-default-config",
         "an action, not a setting: prints the reference configuration and exits",
     ),
+    (
+        "native-device",
+        "a deployment role, set by the host's service drop-in together with disabling its compatibility runtime; not a configuration-file key until the handover is packaged",
+    ),
+    (
+        "native-lab-capabilities",
+        "a temporary lab capture setting in the service drop-in, never a product setting",
+    ),
+    (
+        "native-lab-lock-listener",
+        "a temporary lab capture setting in the service drop-in, never a product setting",
+    ),
+    (
+        "native-vendor",
+        "the deployment's device-info vendor token, set beside `--native-device` in the same drop-in",
+    ),
+    (
+        "native-identify-secs",
+        "a setting of the native device role, set beside `--native-device` in the same drop-in",
+    ),
     ("help", "an action"),
     ("version", "an action"),
 ];
@@ -139,7 +159,7 @@ pub const CLI_ONLY: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "tesserad",
-    version,
+    version = tessera_control_types::BUILD_VERSION,
     about = "tessera audio-over-IP daemon",
     long_about = "tessera audio-over-IP daemon.\n\nEvery setting lives in the configuration files (/etc/tessera/config.toml and config.d/*.toml; `tesserad --print-default-config` prints every key with its default). An option given here overrides its configuration key, and a reload (SIGHUP) does not change it; an option that is not given leaves the key to the files."
 )]
@@ -174,6 +194,40 @@ pub struct Options {
     /// socket_mode` (default 0o660).
     #[arg(long, value_parser = parse_octal_mode)]
     pub socket_mode: Option<u32>,
+
+    /// Serve the device role in this daemon: ARC, CMC and device-info
+    /// listeners and receive-flow negotiation. Only on a host whose
+    /// compatibility runtime is stopped and disabled: the ports are bound
+    /// exclusively and are not shared.
+    #[arg(long, env = "TESSERA_NATIVE_DEVICE")]
+    pub native_device: bool,
+
+    /// Vendor field of the native role's device-info messages (8 ASCII
+    /// bytes, space padded).
+    #[arg(long, env = "TESSERA_NATIVE_VENDOR", default_value = "tessera")]
+    pub native_vendor: String,
+
+    /// How long a controller's identify request stays visible (a notice on
+    /// the portal's status page and in `tesseractl status`), seconds; at
+    /// least 1.
+    #[arg(long, env = "TESSERA_NATIVE_IDENTIFY_SECS", default_value_t = 10)]
+    pub native_identify_secs: u64,
+
+    /// Lab capture mode of the native role: advertise this board-info
+    /// capability word (hex) and writable settings, and log requests the
+    /// role does not handle. Changes are received, not applied.
+    #[arg(long, env = "TESSERA_NATIVE_LAB_CAPABILITIES", value_parser = parse_hex_u32)]
+    pub native_lab_capabilities: Option<u32>,
+
+    /// Lab capture mode only: also listen on UDP 8002 (the vendor's lock
+    /// service) and log the source, length and first 64 bytes of each
+    /// datagram. Never answers. Needs `--native-lab-capabilities`.
+    #[arg(
+        long,
+        env = "TESSERA_NATIVE_LAB_LOCK_LISTENER",
+        requires = "native_lab_capabilities"
+    )]
+    pub native_lab_lock_listener: bool,
 
     /// Listen on `audio.sock` for audio clients (ADR 0007). Overrides
     /// `[audio] socket` (default auto).
@@ -369,6 +423,10 @@ pub struct Options {
     /// environment variable overrides both.
     #[arg(long)]
     pub log_level: Option<String>,
+}
+
+fn parse_hex_u32(s: &str) -> Result<u32, String> {
+    u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|e| e.to_string())
 }
 
 fn parse_octal_mode(s: &str) -> Result<u32, String> {

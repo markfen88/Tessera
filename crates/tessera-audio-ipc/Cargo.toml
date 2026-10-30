@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-audio-ipc"
 description = "Shared-memory audio rings and clock overlay shared between tesserad and audio clients"
 version.workspace = true
@@ -9,11 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-
-[lib]
-test = false
-bench = false
-doctest = false
+autotests = false
+autoexamples = false
+autobenches = false
 
 [dependencies]
 # ADR 0002/0003: this crate depends on nothing but nix (which wraps libc).
@@ -27,3 +22,8 @@ force-split-overlay-reads = []
 
 [lints]
 workspace = true
+
+[lib]
+test = false
+bench = false
+doctest = false

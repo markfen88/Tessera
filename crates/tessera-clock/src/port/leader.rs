@@ -38,6 +38,9 @@ impl<const N: usize> Port<N> {
         self.free_running = false;
         self.clock
             .set_gm_identity(gm_identity_from_uuid(&self.cfg.identity.uuid));
+        // A new leading episode: preferred rivals are reported afresh
+        // (spec:5.4 item 1).
+        self.foreign.clear_rival_reported();
         self.set_state(PortState::Master, sink);
         self.next_sync_at = Some(now);
         self.dirty = true;

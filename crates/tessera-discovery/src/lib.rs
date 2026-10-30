@@ -51,10 +51,28 @@
 //! * Avahi limits (Debian 13, avahi 0.8): the bus allows 512 match rules per
 //!   connection (the backend uses a handful), and the daemon about 1024 objects
 //!   per client: roughly 1020 advertised services per [`Discovery`], and about
-//!   330 resolved instances per connection, so a browse spreads resolvers over
-//!   up to 8 connections. What still does not fit is counted
+//!   330 resolved instances per connection. Each service-kind/interface browse
+//!   session owns up to 8 connections including its browser connection (at
+//!   most 32 per interface for the daemon's four service kinds). What still
+//!   does not fit is counted
 //!   ([`Browser::resolve_failures`]); an advertisement beyond the limit fails
 //!   with `TooManyObjectsError` and is rolled back.
+//! * A resolver failure removes that item's observations and leaves discovery
+//!   reconciling until a fresh item announcement or backend session retries it.
+//!   If a peer returns while its PTR remains cached, Avahi may not announce a
+//!   new item; recovery can require restarting discovery. With
+//!   [`IpFamilies::Both`], failure in either address family removes both
+//!   families for the item. The daemon's inventory uses IPv4 only.
+//! * Early resolver signals, pending creations and retired resolver paths are
+//!   bounded by the configured instance cap times address-family count. On
+//!   saturation, only the affected kind/interface browse session reconnects.
+//!   Its sources are withdrawn until re-enumerated, and changed endpoint
+//!   references expire. Aggregate browser readiness becomes reconciling, so
+//!   the daemon marks all remote inventory incomplete; recovery has no fixed
+//!   duration. Advertising and other sessions stay active. Retired paths cannot
+//!   crowd out a new resolver's first signal. A creation returning a retired
+//!   path also reconnects that session, without assuming retired paths are never
+//!   reused. Simultaneously active resolver paths are still matched by path alone.
 //! * Dropping a [`Discovery`] without [`Discovery::shutdown`] stops the
 //!   backend; with Avahi the services disappear when its connection closes. After
 //!   `shutdown` or the drop, every [`Browser::recv`] returns `None`.
@@ -106,8 +124,8 @@ pub use error::{Error, ValidationError};
 #[doc(hidden)]
 pub use ifaces::{MdnsSocket, own_mdns_sockets};
 pub use model::{
-    BrowseEvent, ConflictScope, DeviceServices, ResponderEvent, ServiceId, ServiceInstance,
-    ServiceKind, ServiceSpec,
+    BrowseEvent, ConflictScope, DeviceServices, PublishedService, ResponderEvent, ServiceId,
+    ServiceInstance, ServiceKind, ServiceObservation, ServiceSpec,
 };
 pub use select::{BusProbe, ProbeError, Selection, SystemBus, select_backend};
 pub use txt::{TxtEntry, TxtError, TxtLimits, TxtRecord};
@@ -251,6 +269,36 @@ pub struct Responder {
 }
 
 impl Responder {
+    /// Revision of authoritative advertisement state, independent of event loss.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        match &*self.inner {
+            Inner::Builtin(b) => b.revision(),
+            Inner::Avahi(a) => a.revision(),
+        }
+    }
+
+    /// Lifetime diagnostic count; loss never removes authoritative state.
+    #[must_use]
+    pub fn dropped_events(&self) -> u64 {
+        match &*self.inner {
+            Inner::Builtin(b) => b.dropped_events(),
+            Inner::Avahi(a) => a.dropped_events(),
+        }
+    }
+
+    /// Actual established advertisements, including conflict-assigned names.
+    /// This recovers state even when announcement notifications were lost.
+    ///
+    /// # Errors
+    /// The backend stopped before answering.
+    pub async fn published(&self) -> Result<Vec<model::PublishedService>, Error> {
+        match &*self.inner {
+            Inner::Builtin(b) => Ok(b.published()),
+            Inner::Avahi(a) => a.published().await,
+        }
+    }
+
     /// Registers a new device. Returns when the services were handed to the
     /// backend; probing and announcing finish later and are reported as
     /// [`ResponderEvent::Announced`] (or [`ResponderEvent::Conflict`]).
@@ -333,6 +381,7 @@ impl ResponderEvents {
 pub(crate) struct BrowseHandle {
     view: sink::BrowseView,
     on_drop: Option<Box<dyn FnOnce() + Send>>,
+    availability: Option<Box<dyn Fn() -> (bool, u64) + Send + Sync>>,
 }
 
 impl BrowseHandle {
@@ -340,7 +389,16 @@ impl BrowseHandle {
         Self {
             view,
             on_drop: Some(on_drop),
+            availability: None,
         }
+    }
+
+    pub(crate) fn with_availability(
+        mut self,
+        availability: impl Fn() -> (bool, u64) + Send + Sync + 'static,
+    ) -> Self {
+        self.availability = Some(Box::new(availability));
+        self
     }
 }
 
@@ -358,8 +416,17 @@ impl Drop for BrowseHandle {
     }
 }
 
-/// Stream of [`BrowseEvent`]s for some service kinds. Dropping it stops the
-/// browse.
+/// Backend availability and reconciliation of the available observation cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BrowseReadiness {
+    Unavailable,
+    Reconciling,
+    Ready,
+}
+
+/// Stream of [`BrowseEvent`]s. Dropping it stops browsing.
+/// Readiness is independent of channel closure.
 #[derive(Debug)]
 pub struct Browser {
     rx: mpsc::Receiver<BrowseEvent>,
@@ -367,6 +434,33 @@ pub struct Browser {
 }
 
 impl Browser {
+    /// Cheap change marker for debounced full snapshots. TTL refreshes do not
+    /// change it. Lifecycle and reconciliation changes do.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.handle.view.revision()
+    }
+
+    /// Whether the current backend session has reconciled its available
+    /// cache. This never proves discovery of the entire network.
+    #[must_use]
+    pub fn readiness(&self) -> BrowseReadiness {
+        let (available, generation) = self.handle.availability.as_ref().map_or((true, 0), |f| f());
+        if self.is_closed() || !available {
+            BrowseReadiness::Unavailable
+        } else if self.handle.view.reconciled(generation) {
+            BrowseReadiness::Ready
+        } else {
+            BrowseReadiness::Reconciling
+        }
+    }
+    /// The backend producers have stopped. A drained closed browser cannot
+    /// provide fresh inventory; its last snapshot is retained for inspection.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.rx.is_closed()
+    }
+
     /// Waits for the next event; `None` once the backend has stopped.
     pub async fn recv(&mut self) -> Option<BrowseEvent> {
         if let Some(ev) = self.try_recv() {
@@ -401,9 +495,10 @@ impl Browser {
         self.handle.view.lost()
     }
 
-    /// Resolutions that failed (Avahi: the daemon refused to create the
-    /// resolver, typically because of its per-client object limit). The
-    /// instances concerned are not tracked.
+    /// Resolution failures and Avahi session-recovery events. This includes
+    /// resolver creation/failure signals, saturated bookkeeping and returned
+    /// retired object paths. A session recovery withdraws that session's
+    /// observations. This lifetime diagnostic is not a completeness verdict.
     #[must_use]
     pub fn resolve_failures(&self) -> u64 {
         self.handle.view.failures()
@@ -421,11 +516,40 @@ impl Browser {
     pub fn snapshot(&self) -> Vec<ServiceInstance> {
         self.handle.view.snapshot()
     }
+
+    /// Every source view currently known, with its own TXT and interface
+    /// provenance. Unlike snapshot, this never merges different sources.
+    #[must_use]
+    pub fn observations(&self) -> Vec<ServiceObservation> {
+        self.handle.view.observations()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_tracks_owner_loss_and_reconciliation_without_channel_closure() {
+        use std::sync::Mutex;
+        let (producer, view, rx) = sink::BrowseShared::new(10, 2);
+        producer.session(0, None);
+        let owner = Arc::new(Mutex::new((true, 1)));
+        let observed = Arc::clone(&owner);
+        let handle = BrowseHandle::new(view, Box::new(|| {}))
+            .with_availability(move || *observed.lock().unwrap());
+        let browser = Browser { rx, handle };
+        assert_eq!(browser.readiness(), BrowseReadiness::Reconciling);
+        producer.session(0, Some(1));
+        assert_eq!(browser.readiness(), BrowseReadiness::Ready);
+        *owner.lock().unwrap() = (false, 2);
+        assert!(!browser.is_closed());
+        assert_eq!(browser.readiness(), BrowseReadiness::Unavailable);
+        *owner.lock().unwrap() = (true, 3);
+        assert_eq!(browser.readiness(), BrowseReadiness::Reconciling);
+        producer.session(0, Some(3));
+        assert_eq!(browser.readiness(), BrowseReadiness::Ready);
+    }
 
     struct FakeAvahiBus;
     impl BusProbe for FakeAvahiBus {

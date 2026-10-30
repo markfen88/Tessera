@@ -11,14 +11,17 @@ Ltd, which is not affiliated with this project).
 > (follower or leader), the media engine with **static flows** (`[[flow]]`,
 > provisional), receiver keepalives, mDNS advertisement, the local
 > control and audio sockets, and (in builds with the `alsa-bridge` feature)
-> the in-daemon sound-card bridge. `tesserad` itself does **not** implement the
-> vendor's control protocols (routing, device control, monitoring): a subscription
-> made with `tesseractl subscribe` is stored but no flow is set up from it by the
-> daemon, and audio crosses the network only through `[[flow]]` entries. The
-> packages also install and enable a separate **Controller compatibility
-> runtime** (`tessera-controller@main`) that serves the first logical device's
-> base control ports and hands the flows a controller sets up to the daemon as a
-> typed command (section 3, "Controller flows"). Everything
+> the in-daemon sound-card bridge. By default `tesserad` itself does **not**
+> implement the vendor's control protocols (routing, device control,
+> monitoring): a subscription made with `tesseractl subscribe` is stored but no
+> flow is set up from it by the daemon, and audio crosses the network only
+> through `[[flow]]` entries. The packages also install and enable a separate
+> **Controller compatibility runtime** (`tessera-controller@main`) that serves
+> the first logical device's base control ports and hands the flows a controller
+> sets up to the daemon as a typed command (section 3, "Controller flows"). An
+> administrator can instead enable the daemon's opt-in **native device role**
+> (`--native-device`), which serves those ports itself and requests a flow for
+> every saved subscription ([interoperability.md](interoperability.md#native-device-role)). Everything
 > that concerns the wire (packet format, ports, QoS values, timing defaults,
 > protocol identity values) is **provisional** until it has been confirmed
 > with external hardware. Compatibility limits: [interoperability.md](interoperability.md).
@@ -256,10 +259,10 @@ Exact human-readable output may change; use `--json` for integrations.
 
 ```
 $ tesseractl status
-tessera 0.3.0
+tessera 0.5.0
 
-DEVICE  NAME       RATE      BITS  LATENCY  RX  TX  LOCKED
-main    studio-pc  48000 Hz  24    6000 us  4   2   sample_rate
+DEVICE  NAME       RATE      BITS  LATENCY  RX  TX  LOCKED       ACCESS
+main    studio-pc  48000 Hz  24    6000 us  4   2   sample_rate  open
 
 Primary interface: enp3s0 (automatic)
 
@@ -310,12 +313,15 @@ $ tesseractl unsubscribe 2
 main: rx 2 unsubscribed
 ```
 
-(The subscription above is "in progress" because no `[[flow]]` carries rx channel 2:
-`tesserad` stores it, by name, but does not implement the flow-control protocol that
-would set it up. Audio is carried by `[[flow]]` entries in the configuration; see
-`configuration.md`, "Static flows". When an rx `[[flow]]` carries the channel, the state
-becomes "receiving" while its packets arrive and "no media" about 2 to 3 s after they stop. `tesserad` does not implement the vendor control plane, so vendor
-controllers cannot route to it on their own: see `interoperability.md`.)
+(The subscription above is "in progress" because no flow carries rx channel 2 yet.
+Without the native device role, `tesserad` stores it, by name, but does not implement
+the flow-control protocol that would set it up: audio is carried by `[[flow]]` entries
+in the configuration (see `configuration.md`, "Static flows") or by the flows the
+compatibility runtime submits. With the native device role, the daemon requests the
+flow from `stagebox-a` itself. When a rx flow carries the channel, the state becomes
+"receiving" while its packets arrive and "no media" about 2 to 3 s after they stop.
+For a reviewed change with lock checks use the portal's Routing page or
+`tesseractl routing`; see `interoperability.md`.)
 
 **Controller flows.** The flows that the Controller compatibility runtime (or you)
 sets up are a set of their own, kept in `state.toml` next to the `[[flow]]` entries
@@ -331,7 +337,8 @@ tesseractl --yes flows clear                   # store an explicit empty set
 Changes that restart a device ask first (`--yes` for scripts). A host that owns the
 flows, such as an NDIMon appliance, writes `[control] locked = ["flows"]` and every
 change is then refused. An old `/etc/tessera/config.d/90-probe-flows.toml` is still read
-with a warning until a set has been stored; the file is no longer supported from 0.4.0.
+with a warning until a set has been stored; the file is deprecated (still read in 0.5.0;
+its removal is deferred).
 Reference: `configuration.md`, "Controller flows and host ownership".
 
 **Clock**
@@ -487,9 +494,10 @@ it is on the bus, otherwise a built-in responder; never both), `avahi`,
 **Status:** advertising is **on by default** (`advertise_devices = true`), because
 the packages also enable the Controller compatibility runtime. The records name
 control ports (ARC 4440, CMC 8800, flow control 4455, plus 10 per further
-device); `tesserad` does not answer on them itself, the runtime serves the first
-logical device's base ports. A controller that finds a device whose runtime is not
-running, or a further logical device, cannot talk to it and shows it greyed out.
+device); the runtime serves the first logical device's base ports, or `tesserad`
+itself with the native device role. A controller that finds a device where
+neither is running, or a further logical device, cannot talk to it and shows it
+greyed out.
 The daemon warns once per advertised port that no socket is bound to (see
 `troubleshooting.md`); set `advertise_devices = false` to advertise nothing.
 `tesserad` does not browse for other devices. The record contents follow a

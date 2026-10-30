@@ -29,11 +29,11 @@ allow-wildcard-paths = true
 [advisories]
 yanked = "deny"
 ignore = [
-    # zbus_names: transitive via zbus for Avahi; replacement tracked upstream
+    # zbus_names: transitive via zbus for Avahi; remove the ignore once zbus is upgraded
     "RUSTSEC-2026-0371",
-    # zvariant: transitive via zbus for Avahi; replacement tracked upstream
+    # zvariant: transitive via zbus for Avahi; remove the ignore once zbus is upgraded
     "RUSTSEC-2026-0370",
-    # zvariant_derive: transitive via zbus for Avahi; replacement tracked upstream
+    # zvariant_derive: transitive via zbus for Avahi; remove the ignore once zbus is upgraded
     "RUSTSEC-2026-0372",
 ]
 

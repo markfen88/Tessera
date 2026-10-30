@@ -297,3 +297,145 @@ svg.signal .legend { fill: var(--muted); font-size: 12px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Routing crosspoints: a desktop-style matrix. Transmitters (TX) are rows
+   under a device band; receivers (RX) are columns under a vertical device
+   band. Fixed header heights keep both header rows sticky. */
+.app:has([data-routing-board]) { max-width: 1640px; }
+.routing-heading { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
+.routing-heading h2 { font-size: 18px; color: var(--text); text-transform: none; letter-spacing: 0; margin-bottom: 4px; }
+.routing-heading .actions { align-items: center; }
+.routing-view-switch { display: none; gap: 0; }
+.js .routing-view-switch { display: inline-flex; }
+.routing-view-switch .btn:first-child { border-radius: var(--r-sm) 0 0 var(--r-sm); }
+.routing-view-switch .btn:last-child { border-radius: 0 var(--r-sm) var(--r-sm) 0; margin-left: -1px; }
+.routing-view-switch [aria-pressed=true] { border-color: var(--accent); background: var(--accent-soft); position: relative; }
+.routing-stale { margin-top: 12px; }
+.routing-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); margin: 12px 0 10px; }
+.routing-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+.route-dot { font-style: normal; width: 18px; height: 18px; border: 1px solid var(--border-strong); border-radius: 3px; display: inline-grid; place-items: center; font-size: 12px; }
+.receiving { color: var(--ok); } .confirmed { color: var(--accent); } .no-media { color: var(--warn); }
+.pending { color: var(--warn); } .unavailable { color: var(--faint); }
+.routing-board {
+  --rt-band: 112px;     /* receiver device band height */
+  --rt-chan: 76px;      /* receiver channel header height */
+  --rt-cell: 30px;      /* crosspoint square */
+  --rt-head: 212px;     /* row header / corner width */
+  --rt-band-bg: var(--surface-3);
+  --rt-head-bg: var(--surface-2);
+}
+.routing-scroll { max-height: 72vh; overflow: auto; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg); margin-bottom: 14px; }
+.routing-scroll:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.routing-matrix { width: auto; border-collapse: separate; border-spacing: 0; font-size: 12px; table-layout: auto; }
+.routing-matrix th, .routing-matrix td { border: 0; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 0; text-align: left; text-transform: none; letter-spacing: 0; color: var(--text); vertical-align: middle; font-variant-numeric: tabular-nums; }
+.routing-matrix thead th { position: sticky; z-index: 4; background: var(--rt-head-bg); font-weight: 500; }
+.routing-matrix .routing-group-start { border-left: 2px solid var(--border-strong); }
+/* corner */
+.routing-matrix .routing-corner { top: 0; left: 0; z-index: 6; width: var(--rt-head); min-width: var(--rt-head); height: calc(var(--rt-band) + var(--rt-chan)); background: var(--surface); border-right: 2px solid var(--border-strong); border-bottom: 2px solid var(--border-strong); vertical-align: top; }
+.routing-corner-box { display: grid; grid-template-columns: minmax(0, 1fr) 30px; grid-template-rows: minmax(0, 1fr) 30px; height: calc(var(--rt-band) + var(--rt-chan) - 2px); padding: 6px 0 0 8px; gap: 2px; }
+.routing-filters { display: none; grid-column: 1; grid-row: 1; flex-direction: column; gap: 6px; min-width: 0; align-self: start; }
+.js .routing-filters { display: flex; }
+.routing-list .routing-filters { max-width: 420px; margin: 12px 0; }
+.routing-filters label { display: grid; gap: 3px; font-size: 11px; color: var(--muted); }
+[data-routing-board] .routing-filters input[type=search] { padding: 4px 8px; font-size: 12px; border-radius: 6px; max-width: 100%; width: 100%; }
+.routing-axis { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .2px; white-space: nowrap; }
+.routing-axis abbr { text-decoration: none; color: var(--text); }
+.routing-axis-rx { grid-column: 2; grid-row: 1 / span 2; flex-direction: column; justify-content: flex-end; border-left: 1px solid var(--border); padding-bottom: 6px; }
+.routing-axis-rx .routing-axis-name { flex: 1 1 auto; display: grid; align-items: start; justify-items: center; min-height: 0; overflow: hidden; }
+.routing-axis-rx .routing-axis-tools { flex-direction: column; }
+.routing-axis-tx { grid-column: 1; grid-row: 2; align-self: end; padding-bottom: 6px; }
+.routing-axis-tools { display: none; gap: 4px; align-items: center; }
+.js .routing-axis-tools { display: flex; }
+.routing-toggle-box { display: inline-grid; place-items: center; width: 16px; height: 16px; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--surface-2); color: var(--muted); font-size: 13px; line-height: 1; padding: 0; cursor: pointer; flex: none; }
+.routing-toggle-box:hover { color: var(--text); border-color: var(--accent); }
+.routing-toggle-box:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 1px; }
+/* vertical text: reads bottom to top like a desktop matrix */
+.routing-vlabel { display: inline-block; writing-mode: vertical-rl; transform: rotate(180deg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2; }
+/* receiver device band (vertical) */
+.routing-matrix .routing-rx-device { top: 0; height: var(--rt-band); min-width: var(--rt-cell); background: var(--rt-band-bg); border-left: 2px solid var(--border-strong); vertical-align: top; text-align: center; }
+.routing-rx-device button { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; height: calc(var(--rt-band) - 1px); border: 0; padding: 5px 0 4px; background: transparent; cursor: pointer; font: inherit; font-weight: 650; color: var(--text); }
+.routing-rx-device button .routing-vlabel { flex: 1 1 auto; max-height: calc(var(--rt-band) - 32px); }
+.routing-rx-device .routing-toggle-box { display: none; }
+.js .routing-rx-device .routing-toggle-box { display: inline-grid; }
+.routing-toggle-box:empty::before { content: "−"; }
+[aria-expanded=false] .routing-toggle-box:empty::before { content: "+"; }
+.routing-band-tag { position: absolute; left: 50%; bottom: 3px; transform: translateX(-50%); font-size: 9px; line-height: 1; color: var(--accent); border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 3px; background: var(--surface); text-transform: uppercase; letter-spacing: .4px; }
+.routing-band-tag.bad { color: var(--bad); border-color: var(--bad); font-weight: 700; bottom: auto; top: 4px; left: auto; right: 2px; transform: none; padding: 1px 4px; }
+.routing-matrix .routing-rx-device:has(.routing-band-tag) button { padding-bottom: 20px; }
+.routing-matrix .routing-rx-device:has(.routing-band-tag) button .routing-vlabel { max-height: calc(var(--rt-band) - 48px); }
+/* receiver channel headers (vertical names) */
+.routing-matrix .routing-rx-channel { top: var(--rt-band); height: var(--rt-chan); width: var(--rt-cell); min-width: var(--rt-cell); max-width: var(--rt-cell); text-align: center; vertical-align: bottom; padding: 0 0 6px; border-bottom: 2px solid var(--border-strong); }
+.routing-rx-channel .routing-vlabel { max-height: calc(var(--rt-chan) - 14px); font-weight: 600; }
+.routing-rx-channel.routing-rx-void { background: var(--surface); }
+.routing-rx-summary .routing-vlabel { color: var(--muted); font-weight: 500; }
+.routing-rx-channel .routing-open { margin: 0; display: inline-block; }
+.routing-rx-channel .routing-open button { writing-mode: vertical-rl; transform: rotate(180deg); font-size: 11px; color: var(--accent); font-weight: 600; max-height: calc(var(--rt-chan) - 14px); padding: 0; }
+.routing-rx-channel.routing-changed { box-shadow: inset 0 3px var(--warn); }
+.routing-rx-channel.routing-pending { opacity: .6; }
+.routing-rx-channel.routing-hover { background: var(--surface-3); }
+.routing-external { position: absolute; top: 2px; left: 50%; transform: translateX(-50%); width: 14px; height: 14px; border-radius: 50%; background: var(--warn); color: #111; font-size: 10px; font-weight: 800; display: grid; place-items: center; line-height: 1; }
+/* transmitter rows */
+.routing-matrix tbody th { position: sticky; left: 0; z-index: 2; width: var(--rt-head); min-width: var(--rt-head); max-width: var(--rt-head); background: var(--rt-head-bg); border-right: 2px solid var(--border-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.routing-matrix .routing-tx-device th, .routing-matrix .routing-tx-device td { background: var(--rt-band-bg); border-top: 2px solid var(--border-strong); height: calc(var(--rt-cell) - 2px); }
+.routing-matrix tbody:first-of-type .routing-tx-device th, .routing-matrix tbody:first-of-type .routing-tx-device td { border-top: 0; }
+.routing-tx-device button { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 100%; border: 0; padding: 0 8px 0 10px; height: calc(var(--rt-cell) - 2px); background: transparent; font: inherit; font-weight: 650; color: var(--text); cursor: pointer; text-align: left; }
+.routing-tx-device button bdi { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.routing-tx-device .routing-toggle-box { display: none; }
+.js .routing-tx-device .routing-toggle-box { display: inline-grid; }
+.routing-matrix .routing-tx-channel { height: var(--rt-cell); padding: 0 8px 0 20px; font-weight: 500; }
+.routing-matrix .routing-tx-channel bdi { vertical-align: middle; }
+.routing-tree { display: inline-block; width: 12px; height: var(--rt-cell); margin-right: 8px; vertical-align: middle; border-left: 1px solid var(--border-strong); position: relative; }
+.routing-tree::after { content: ""; position: absolute; left: 0; top: 50%; width: 10px; border-top: 1px solid var(--border-strong); }
+.routing-matrix tbody tr:last-child .routing-tree { height: calc(var(--rt-cell) / 2 + 1px); align-self: start; vertical-align: top; }
+/* crosspoints */
+.routing-crosspoint { width: var(--rt-cell); min-width: var(--rt-cell); max-width: var(--rt-cell); height: var(--rt-cell); text-align: center; background: var(--surface); }
+.routing-crosspoint.routing-void { background: repeating-linear-gradient(135deg, transparent 0 5px, var(--border) 5px 6px); }
+.routing-cell-form { margin: 0; padding: 0; display: grid; place-items: center; height: var(--rt-cell); }
+.route-cell { border: 1px solid var(--border-strong); border-radius: 4px; background: transparent; width: 24px; height: 24px; padding: 0; display: inline-grid; place-items: center; font-size: 16px; line-height: 1; cursor: pointer; color: inherit; }
+.route-cell.empty { color: var(--faint); border-style: dotted; }
+.route-cell.receiving { background: var(--ok-soft); border-color: var(--ok); }
+.route-cell.confirmed { background: var(--accent-soft); border-color: var(--accent); }
+.route-cell.no-media { background: var(--warn-soft); border-color: var(--warn); }
+.route-cell.unavailable { border-color: transparent; cursor: not-allowed; font-size: 13px; }
+.route-cell:disabled { cursor: not-allowed; }
+.route-cell:hover:not(:disabled), .route-cell:focus-visible { border-color: var(--accent-2); outline: 2px solid var(--accent-2); outline-offset: 1px; background: var(--accent-soft); }
+.routing-matrix tr:has(.route-cell:hover, .route-cell:focus-visible) .routing-tx-channel { background: var(--surface-3); }
+.routing-matrix tr:has(.route-cell:hover, .route-cell:focus-visible) .routing-crosspoint { background: color-mix(in srgb, var(--surface) 88%, var(--accent)); }
+.routing-pending .route-cell { opacity: .45; cursor: wait; }
+/* read-only counts in collapsed bands */
+.routing-summary { width: var(--rt-cell); min-width: var(--rt-cell); max-width: var(--rt-cell); text-align: center; }
+.route-sum { display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 4px; border-radius: 4px; background: var(--accent-soft); border: 1px solid var(--accent); color: var(--text); font-size: 11px; font-weight: 700; font-style: normal; }
+.routing-tx-device:not(.routing-collapsed) .route-sum { visibility: hidden; }
+.routing-rx-device.routing-collapsed button { color: var(--muted); }
+.routing-tx-device.routing-collapsed button { color: var(--muted); }
+.routing-host { font-size: 10px; color: var(--accent); border: 1px solid var(--border-strong); border-radius: 4px; padding: 2px 5px; vertical-align: middle; }
+.routing-reason { color: var(--muted); font-size: 12px; display: block; margin: 2px 0 0; max-width: 720px; }
+.routing-open { display: inline; margin: 0; }
+.routing-open button { border: 0; background: transparent; padding: 0; font-size: 12px; color: var(--accent); font-weight: 500; cursor: pointer; }
+.routing-open button:hover { text-decoration: underline; }
+.routing-notes { list-style: none; padding: 0; margin: 0 0 14px; display: grid; gap: 6px; font-size: 13px; }
+.routing-notes li { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.routing-notes .routing-open { margin-left: 10px; }
+.routing-dialog { color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; width: min(540px, calc(100vw - 32px)); padding: 20px; box-shadow: var(--shadow); }
+.routing-dialog::backdrop { background: rgba(0,0,0,.65); }
+.routing-dialog .card { border: 0; padding: 0; box-shadow: none; }
+.routing-dialog > button { margin-top: 12px; }
+.routing-dialog form { margin-top: 18px; }
+.routing-list { display: none; }
+.routing-list details { margin: 12px 0; }
+.routing-list > details { border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.routing-list summary { cursor: pointer; font-weight: 600; }
+.routing-list article { padding: 14px 0; border-top: 1px solid var(--border); }
+[data-routing-view=list] .routing-desktop, [data-routing-view=list] .routing-notes { display: none; }
+[data-routing-view=list] .routing-list { display: block; }
+[hidden] { display: none !important; }
+@media (max-width: 700px) {
+  .routing-desktop, .routing-notes { display: none; }
+  .routing-list { display: block; }
+  [data-routing-view=matrix] .routing-desktop { display: block; }
+  [data-routing-view=matrix] .routing-notes { display: grid; }
+  [data-routing-view=matrix] .routing-list { display: none; }
+  .routing-board { --rt-head: 150px; --rt-band: 96px; --rt-chan: 64px; }
+  .routing-scroll { max-height: 60vh; }
+  .routing-heading .actions { width: 100%; }
+}

@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-package"
 version.workspace = true
 edition.workspace = true
@@ -9,6 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Native Debian lifecycle hooks and one-shot package migrations"
+autotests = false
+autoexamples = false
+autobenches = false
+
+[dependencies]
+tessera-bundle = { path = "../tessera-bundle" }
+
+[lints]
+workspace = true
 
 [lib]
 test = false
@@ -20,9 +26,3 @@ name = "tessera-package"
 path = "src/main.rs"
 test = false
 bench = false
-
-[dependencies]
-tessera-bundle = { path = "../tessera-bundle" }
-
-[lints]
-workspace = true

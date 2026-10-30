@@ -298,13 +298,33 @@ pub const KEYS: &[KeySpec] = &[
     // [control]
     k!(
         "control",
+        "routing_sources",
+        Value("[]"),
+        "",
+        "qualified native wire identities (16 hexadecimal digits)",
+        Reload,
+        NONE,
+        "Operator-qualified native source hosts for the initial local receiver operation class. Empty disables execution. Qualify report preservation on every affected host before adding an identity; discovery is not authentication. Changes invalidate managed runtime binding and require a controlled runtime restart."
+    ),
+    k!(
+        "control",
         "locked",
         Value("[]"),
         "",
-        "flows",
+        "flows, subscriptions",
         Reload,
         NONE,
-        "Host-owned runtime domains. flows refuses controller flow commands and uses only host-configured flows."
+        "Host-owned runtime domains. flows refuses controller flow commands and uses only host-configured flows. subscriptions refuses runtime subscription intent changes; existing legacy intent remains stored."
+    ),
+    k!(
+        "control",
+        "allow_factory_reset",
+        Value("false"),
+        "",
+        "true|false",
+        Reload,
+        NONE,
+        "Accept a factory reset or clear configuration (a network controller's, or the clear_configuration command): the device's name, labels, subscriptions, sample rate, encoding, latency, clock role and priority, its controller and manual multicast flows and, unless network settings are kept, the primary interface selection go back to these files, and the native device role restarts. Off by default because it removes routes on a live system."
     ),
     k!(
         "control",
@@ -794,6 +814,16 @@ pub const KEYS: &[KeySpec] = &[
         Reload,
         NONE,
         "Advertise the logical devices. Enabled by default with the packaged Controller compatibility runtime."
+    ),
+    k!(
+        "discovery",
+        "browse_devices",
+        Value("false"),
+        "",
+        "true|false",
+        Reload,
+        NONE,
+        "Browse permitted interfaces for the read-only routing catalogue. Does not send routing commands."
     ),
     // [backends]
     k!(
@@ -1548,7 +1578,7 @@ pub const REFERENCE_HEADER: &str = "\
 # some settings can be pinned: in [[device]] name, sample_rate, encoding,
 # latency, rx_channels, tx_channels and the channel labels; in [clock]
 # role and priority; in [network] the primary interface; in [control]
-# flows. Every other key has no run-time form and no lock.
+# flows and subscriptions. Every other key has no run-time form and no lock.
 # `tesseractl config show` prints the merged files.
 # reload = takes effect on SIGHUP (systemctl reload tesserad) or
 # `tesseractl config reload`. restart = needs a daemon restart.

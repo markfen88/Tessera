@@ -16,7 +16,7 @@ use tessera_web::{AppState, router};
 
 /// The web portal of a tessera device.
 #[derive(Debug, Parser)]
-#[command(version)]
+#[command(version = tessera_control_types::BUILD_VERSION)]
 struct Cli {
     /// Configuration file.
     #[arg(long, default_value = DEFAULT_PATH)]
@@ -160,7 +160,17 @@ fn serve(cfg: WebConfig) -> ExitCode {
                 Arc::new(ProcessRunner),
             ));
         }
+        let federation = match tessera_web::routing_peers::Federation::new(cfg.routing.clone()) {
+            Ok(federation) => federation,
+            Err(error) => { eprintln!("tessera-web: {error}"); return ExitCode::FAILURE; }
+        };
+        state = state.with_routing_peers(federation);
         let state = Arc::new(state);
+        let peer_listener = match tessera_web::routing_peers::transport::Listener::bind(&cfg.routing).await {
+            Ok(listener) => listener,
+            Err(error) => { eprintln!("tessera-web: {error}"); return ExitCode::FAILURE; }
+        };
+        let peer_app = tessera_web::routing_peers::machine_router(state.clone());
         if let Some(appliance) = &state.appliance {
             // The amplifier's saved volume, set again as soon as its card is there.
             tessera_web::appliance::volume::spawn_restore(Arc::clone(appliance));
@@ -181,9 +191,13 @@ fn serve(cfg: WebConfig) -> ExitCode {
         }
         tracing::info!("tessera-web on http://{}", cfg.listen);
         let app = router(state).into_make_service_with_connect_info::<tessera_web::network_profiles::Connection>();
-        let r = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown())
-            .await;
+        let web = axum::serve(listener, app).with_graceful_shutdown(shutdown());
+        let r = if let Some(peer_listener) = peer_listener {
+            tokio::select! {
+                result = web => result,
+                result = peer_listener.serve(peer_app) => result,
+            }
+        } else { web.await };
         match r {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

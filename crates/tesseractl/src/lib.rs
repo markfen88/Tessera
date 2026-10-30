@@ -18,12 +18,13 @@ use std::time::{Duration, Instant};
 
 use clap::CommandFactory;
 use tessera_control_types::{
-    Command, CommandError, DeviceKey, Impact, Query, Reply, RequestBody, Status,
+    AccessPin, Command, CommandError, DeviceKey, Impact, Query, Reply, RequestBody, Status,
 };
 use tessera_state::{ConfigPaths, Environment, load_config};
 
 use crate::cli::{
-    Cli, ClockCmd, Cmd, ConfigCmd, DirArgs, FlowCmd, NetworkCmd, ShowArgs, WatchArgs,
+    AccessCmd, Cli, ClockCmd, Cmd, ConfigCmd, DirArgs, FlowCmd, NetworkCmd, RoutingCmd, ShowArgs,
+    WatchArgs,
 };
 use crate::client::{Client, ClientError};
 
@@ -37,6 +38,43 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_CONNECT: u8 = 3;
 /// Exit code: not allowed.
 pub const EXIT_DENIED: u8 = 4;
+
+/// Side-effect-free installed-role probe, handled before configuration, stdin
+/// or daemon access. Missing snapshot identity deliberately fails closed.
+#[doc(hidden)]
+pub fn runtime_build_probe(role: &str) -> Option<std::process::ExitCode> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--runtime-build-id"))
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let Some(source) = tessera_control_types::RUNTIME_BUILD_ID.filter(|id| {
+        id.len() == 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) else {
+        eprintln!("tessera: build has no qualified runtime integration identity");
+        return Some(std::process::ExitCode::FAILURE);
+    };
+    let result = writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        serde_json::json!({
+            "contract": 1,
+        "probe": tessera_control_types::RUNTIME_BUILD_PROBE_MARKER,
+            "role": role,
+            "version": tessera_control_types::BUILD_VERSION,
+            "source": source,
+        })
+    );
+    Some(if result.is_ok() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    })
+}
 
 /// Why a command did not succeed.
 #[derive(Debug)]
@@ -238,6 +276,93 @@ pub fn run_with(
                 }
             }
         }
+        Cmd::Routing(command) => {
+            use tessera_control_types::{
+                EndpointRef, RoutingChannelsQuery, RoutingCursor, RoutingDevicesQuery,
+                RoutingReceiverQuery,
+            };
+            let request = match command {
+                RoutingCmd::GrantNextRun { review } => {
+                    RequestBody::Command(Command::GrantRuntimeCarriersToNextRun {
+                        review: tessera_control_types::ReceiverExpectation(review.clone()),
+                    })
+                }
+                RoutingCmd::ReleaseCarriers { review } => {
+                    RequestBody::Command(Command::ReleaseRuntimeCarriers {
+                        review: tessera_control_types::ReceiverExpectation(review.clone()),
+                    })
+                }
+                RoutingCmd::Reconcile { review } => {
+                    RequestBody::Command(Command::ReconcileReceiverOperation {
+                        review: tessera_control_types::ReceiverExpectation(review.clone()),
+                    })
+                }
+                RoutingCmd::Execute {
+                    expectation,
+                    change,
+                } => RequestBody::Command(Command::RouteReceiver {
+                    expectation: tessera_control_types::ReceiverExpectation(expectation.clone()),
+                    change: serde_json::from_str(change)
+                        .map_err(|e| CliError::Config(format!("invalid receiver change: {e}")))?,
+                }),
+                _ => RequestBody::Query(match command {
+                    RoutingCmd::InspectCarriers => Query::InspectRuntimeCarriers,
+                    RoutingCmd::Inspect { operation } => Query::InspectReceiverOperation {
+                        operation: operation
+                            .clone()
+                            .map(tessera_control_types::ReceiverExpectation),
+                    },
+                    RoutingCmd::Devices { cursor } => Query::RoutingDevices(
+                        RoutingDevicesQuery::new(cursor.clone().map(RoutingCursor)),
+                    ),
+                    RoutingCmd::Channels {
+                        endpoint,
+                        generation,
+                        direction,
+                        cursor,
+                    } => Query::RoutingChannels(RoutingChannelsQuery::new(
+                        EndpointRef::new(endpoint, generation),
+                        (*direction).into(),
+                        cursor.clone().map(RoutingCursor),
+                    )),
+                    RoutingCmd::Receiver {
+                        endpoint,
+                        generation,
+                        first,
+                    } => Query::RoutingReceiver(RoutingReceiverQuery::new(
+                        EndpointRef::new(endpoint, generation),
+                        first.get(),
+                    )),
+                    RoutingCmd::Execute { .. }
+                    | RoutingCmd::Reconcile { .. }
+                    | RoutingCmd::ReleaseCarriers { .. }
+                    | RoutingCmd::GrantNextRun { .. } => unreachable!(),
+                }),
+            };
+            let reply = c.request(request)?;
+            if !matches!(
+                &reply,
+                Reply::RoutingDevices(_)
+                    | Reply::RoutingChannels(_)
+                    | Reply::RoutingReceiver(_)
+                    | Reply::ReceiverOperation(_)
+                    | Reply::ReceiverRecovery(_)
+                    | Reply::RuntimeCarrierRecovery(_)
+            ) && !(matches!(
+                command,
+                RoutingCmd::ReleaseCarriers { .. } | RoutingCmd::GrantNextRun { .. }
+            ) && matches!(reply, Reply::Done))
+            {
+                return Err(unexpected(&reply));
+            }
+            if cli.json {
+                json(out, &reply)?;
+            } else {
+                let text = serde_json::to_string_pretty(&reply)
+                    .map_err(|e| CliError::Config(e.to_string()))?;
+                writeln!(out, "{}", sanitize::clean_text(&text))?;
+            }
+        }
         Cmd::Metrics => {
             let reply = c.request(RequestBody::Query(Query::Metrics))?;
             let Reply::Metrics(m) = reply else {
@@ -329,6 +454,9 @@ pub fn run_with(
                 let flows =
                     tessera_state::flows::parse_flow_specs(&text).map_err(CliError::Config)?;
                 Command::SetProtocolFlows { flows }
+            } else if let Cmd::Access(a @ (AccessCmd::Lock | AccessCmd::Unlock)) = cmd {
+                let pin = read_pin(input, err, matches!(a, AccessCmd::Lock))?;
+                cli::access_command(a, &device, pin)
             } else {
                 cli::to_command(cmd, &device)
                     .ok_or_else(|| CliError::Usage("this command is not implemented".into()))?
@@ -588,7 +716,85 @@ fn confirmation(cmd: &Cmd, device: &DeviceKey) -> String {
             None => "primary interface selection cleared".into(),
         },
         Cmd::Config(ConfigCmd::Reload) => "configuration reloaded".into(),
+        Cmd::Access(AccessCmd::Lock) => format!("{d}: access lock set"),
+        Cmd::Access(AccessCmd::Unlock) => format!("{d}: access lock removed"),
+        Cmd::Access(AccessCmd::Reset) => {
+            format!("{d}: access lock reset (removed without the PIN)")
+        }
         _ => "ok".into(),
+    }
+}
+
+/// Read the access-lock PIN: typed on the terminal without echo (twice for
+/// `confirm`), else one line of standard input. Checked for form here so a
+/// typing error is not sent; never printed.
+fn read_pin(
+    input: &mut Input<'_>,
+    err: &mut dyn Write,
+    confirm: bool,
+) -> Result<AccessPin, CliError> {
+    let interactive = input.interactive;
+    let mut ask = |prompt: &str| -> Result<String, CliError> {
+        if interactive {
+            write!(err, "{prompt}")?;
+            err.flush()?;
+        }
+        let quiet = interactive.then(EchoOff::stdin);
+        let mut line = String::new();
+        let n = input.reader.read_line(&mut line);
+        drop(quiet);
+        if interactive {
+            writeln!(err)?;
+        }
+        if n? == 0 {
+            return Err(CliError::Usage(
+                "no PIN given: type it, or pass it as one line on standard input".into(),
+            ));
+        }
+        Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+    };
+    let pin = AccessPin::new(ask("PIN (four digits): ")?);
+    if !pin.is_well_formed() {
+        return Err(CliError::Usage(
+            "the PIN must be exactly four digits 0-9; nothing was changed".into(),
+        ));
+    }
+    if confirm && interactive && AccessPin::new(ask("Again: ")?) != pin {
+        return Err(CliError::Usage(
+            "the two PINs differ; nothing was changed".into(),
+        ));
+    }
+    Ok(pin)
+}
+
+/// Terminal echo of standard input switched off while it lives.
+struct EchoOff(Option<nix::sys::termios::Termios>);
+
+impl EchoOff {
+    fn stdin() -> Self {
+        use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+        let stdin = io::stdin();
+        let Ok(saved) = tcgetattr(&stdin) else {
+            return Self(None);
+        };
+        let mut quiet = saved.clone();
+        quiet.local_flags.remove(LocalFlags::ECHO);
+        if tcsetattr(&stdin, SetArg::TCSANOW, &quiet).is_err() {
+            return Self(None);
+        }
+        Self(Some(saved))
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.0 {
+            let _ = nix::sys::termios::tcsetattr(
+                io::stdin(),
+                nix::sys::termios::SetArg::TCSANOW,
+                saved,
+            );
+        }
     }
 }
 

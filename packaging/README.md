@@ -48,7 +48,7 @@ and the PipeWire user unit likewise need no such exception.
 
 To read the reference of the version that is installed, run `tesserad --print-default-config`: it prints the same text, reads no file and needs no privileges (the header of the file names it). A copy is installed as `/usr/share/doc/tessera/examples/config.toml`, next to the prose reference `/usr/share/doc/tessera/configuration.md` (`docs/configuration.md` in the sources), but minimised images (containers, some cloud images) exclude `/usr/share/doc` with a dpkg `path-exclude` rule, and then neither is installed. `/etc/tessera/config.toml` itself is a conffile and is always there (as the package shipped it, or as the administrator changed it); `dist/etc/tessera/config.toml` in the sources is the same file.
 
-The file is **generated** from the schema in `crates/tessera-state/src/schema.rs`, not written by hand. `dist/etc/tessera/config.toml` is the one committed output; `cargo xtask build-deb` installs that same file twice, as `/etc/tessera/config.toml` and as `/usr/share/doc/tessera/examples/config.toml` (there is no second copy in the tree), so a build does not depend on a generator run. Three things keep it equal to the schema:
+The file is **generated** from the schema in `crates/tessera-state/src/schema.rs`, not written by hand. `dist/etc/tessera/config.toml` is the one committed output; `cargo xtask build-deb` installs that same file twice, as `/etc/tessera/config.toml` and as `/usr/share/doc/tessera/examples/config.toml` (there is no second copy in the tree), so a build does not depend on a generator run. These keep it equal to the schema:
 
 * `cargo xtask build-deb` regenerates the file from the workspace (`cargo run --release --locked -p tessera-state --example reference_config`: a host build, also in a cross build, that needs no network once the dependencies are in the cargo cache, as after the builds before it; `CARGO_NET_OFFLINE=true` enforces that) and stops with the same message if `dist/` differs (skipped with `NO_BUILD=1`);
 * `cargo xtask check-deb` checks the built package: the conffile exists (a missing one is a failure), the examples copy is identical and the file contains only comments.
@@ -76,9 +76,12 @@ Unknown keys are errors: a daemon older than a key refuses a configuration that 
 ## Versioning
 
 Controller compatibility is a required core runtime. The package builds the
-existing `lab/cmc-probe` runtime without changing its protocol implementation,
-installs it under `/usr/lib/tessera`, and enables `tessera-controller@main`
-with the daemon. The Rust launcher reads the daemon's current wired interface,
+existing compatibility runtime from this source tree without changing its
+protocol implementation, installs it under `/usr/lib/tessera`, and enables
+`tessera-controller@main` with the daemon. A host can instead use the daemon's
+opt-in native device role (docs/interoperability.md, "Native device role"); the
+packages do not switch a host and leave a disabled runtime unit disabled.
+The Rust launcher reads the daemon's current wired interface,
 IPv4 address, device name and persisted identity at startup; no operator
 username or installation-machine address is compiled in. Device advertisement
 is enabled by default. Keep the runtime source when assembling source releases.
@@ -106,7 +109,7 @@ show` and use `flows set|clear` for explicit changes. Flows persist in
 not replace the stored set: the adapter applies an empty report only from a run that
 has applied one (`/var/lib/tessera-controller/flows-run`, docs/control-interface.md).
 Existing `90-probe-flows.toml` is a deprecated fallback with a warning (still read
-in 0.3.0, removed in 0.4.0), and any stored set (including an explicit clear)
+in 0.5.0; removal is deferred), and any stored set (including an explicit clear)
 supersedes it. Packages neither create that file nor grant it a writable unit
 path. Local `tesseractl` commands still run as the service user. No sudoers grant
 or privilege elevation is installed. The unit retains its daemon-admin group;
@@ -137,6 +140,18 @@ Without the origin remote or origin/main ref, the build exits 2 and asks for
 uses that explicit revision without a Git suffix.
 `cargo xtask build-deb --print-version` prints the version without building.
 Release tags use `v<version>`, for example `v0.3.0`. The reference configuration contains no version.
+
+## Script policy
+
+`cargo xtask check-no-scripts` fails on tracked or untracked, non-ignored
+`.sh`, `.py` and handwritten `.js`/`.cjs`/`.mjs` files, and on files whose first line selects a shell, including
+`env -S` and BusyBox shell invocations. Generated build outputs remain ignored
+by Git. The one committed browser asset `crates/tessera-web/assets/generated/live.js`
+is generated from TypeScript and checked for drift by `cargo xtask web-assets
+--check`; Rust packaging embeds it without Node. The shell allowlist in
+`xtask/src/no_scripts.rs` is **empty**. Any
+future exception must identify an exact path and the external requirement
+that makes shell unavoidable; migration work is not an exception.
 
 ## Native Debian lifecycle hooks
 

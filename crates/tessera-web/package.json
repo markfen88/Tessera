@@ -1,0 +1,21 @@
+{
+  "name": "tessera-web-assets",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Build-only TypeScript tooling for the Rust-rendered portal",
+  "engines": {
+    "node": ">=24.10.0 <25"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "check": "tsc --project tsconfig.json --noEmit",
+    "build-tests": "tsc --project tsconfig.tests.json",
+    "test": "node --test .test-build/live.cjs"
+  },
+  "devDependencies": {
+    "@types/jsdom": "21.1.7",
+    "@types/node": "24.10.1",
+    "jsdom": "26.1.0",
+    "typescript": "5.9.3"
+  }
+}

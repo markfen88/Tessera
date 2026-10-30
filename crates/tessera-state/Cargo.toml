@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-state"
 description = "Config schema, state model, persistence, event bus"
 version.workspace = true
@@ -9,22 +6,35 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+autotests = false
+autoexamples = false
+autobenches = false
+
+[features]
+default = []
+# Private diagnostic preparation, never adopts flows or dispatches native actions.
+routing-shadow = []
+# Private Rust-only premises; never enabled in a product build.
+routing-shadow-test-hooks = ["routing-shadow"]
 
 [lints]
 workspace = true
 
-[[example]]
-name = "reference_config"
-path = "examples/reference_config.rs"
-test = false
+[dependencies]
+tessera-control-types = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+# The device access lock keeps a salted Argon2id hash of its PIN
+# (`device-lock.md` §9.1 L4); the same versions the portal uses.
+argon2 = { version = "0.5", features = ["std"] }
+getrandom = "0.4"
 
 [lib]
 test = false
 bench = false
 doctest = false
 
-[dependencies]
-tessera-control-types = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-toml = "1.1"
-
+[[example]]
+name = "reference_config"
+path = "examples/reference_config.rs"
+test = false

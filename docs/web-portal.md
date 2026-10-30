@@ -8,6 +8,39 @@ separate typed Rust helper described in [network-vlans.md](network-vlans.md);
 NDIMon remains the network owner when it hosts Tessera. Code:
 `crates/tessera-web`.
 
+The **Routing** page connects, replaces and disconnects receive inputs: a
+matrix of transmit channels and receive inputs, a review step, then one command
+through the daemon ([below](#routing)). It routes this host's receiver and other
+devices' receivers, so either host's portal can route a pair. The Device page
+also keeps a plain-HTML picker for saved subscription intent: choose the
+receiving input (RX), transmitting device (TX), output channel, then review the
+names before saving. Lists use the daemon's paged inventory; expired selections
+require choosing again. Ambiguous names cannot be selected. Advanced manual
+entry remains available for offline sources. Network browsing is opt-in through
+`[discovery] browse_devices = true`; it defaults to off, and the Routing page
+needs it.
+
+After an Avahi resolver failure, a returning source can remain absent until a
+new discovery session if Avahi keeps its cached service pointer without a new
+announcement. Discovery stays reconciling in that case. Prefer advanced manual
+entry for saved intent when a source is not listed. Toggling `browse_devices`
+off and on with configuration reloads starts a new discovery session;
+restarting tesserad also does so but interrupts audio.
+The built-in discovery backend cannot identify the interface, and an empty
+available cache never proves that the LAN has no devices.
+
+What saving a subscription does depends on who serves the device role
+([interoperability.md](interoperability.md#native-device-role)). With the
+native device role, the saved subscriptions are what the daemon requests from
+transmitters: saving, replacing or removing one connects, changes or
+disconnects that input, although the picker's own messages still say that
+audio flows are unchanged. With the compatibility runtime, saving intent does
+not connect or disconnect audio, and the daemon refuses it for the first
+device while the runtime is registered; use the Routing page there. Existing
+configured flows and routes established through Dante Controller continue to
+carry audio; intent, carrier ownership and packet observations are shown
+separately. Packet activity does not verify the selected source.
+
 ---
 
 ## Contents
@@ -40,6 +73,12 @@ the unit, enables and starts the portal on a fresh install, and initializes
 the password to **`tessera`** only if no password file exists. Upgrades preserve
 an existing password and restart a running portal. Purging
 the package deletes `web.toml` and the password file.
+
+If `tessera` is refused after an upgrade, an existing password was preserved.
+Use `sudo tessera-web set-password` on the device to choose a replacement of
+at least eight characters. The command prompts privately; do not put the
+password in command arguments. The new password applies at the next login
+without restarting the portal or audio services.
 
 ---
 
@@ -80,7 +119,8 @@ a phone (under 720 px).
 |------|------|-----------|---------|
 | `/` | Overview: the **signal path** (network, flows, device, audio clients; a path is highlighted while packets move on it, judged from two metric samples), devices, network, clock, warnings | every 5 s | |
 | `/network` | standalone VLAN profiles (addressing, and management's DNS servers and search domains) and management/audio assignments; legacy interface selection where the helper is absent | | edit a draft, review/apply, explicitly keep or revert |
-| `/devices` | Device: per device, settings, channel labels, subscriptions | | name, rate, encoding, latency; channel counts (with a confirmation step, see below); labels; subscribe and unsubscribe (stored only, see below the table) |
+| `/devices` | Device: per device, the access lock, settings, channel labels, the receiver's routes, subscriptions | | lock and unlock (see below); name, rate, encoding, latency; channel counts (with a confirmation step, see below); labels; subscribe and unsubscribe (what that does: above the table) |
+| `/routing` | Routing: the matrix of transmit channels and receive inputs, or a list ([below](#routing)); `/routing/review`, `/routing/recovery`, `/routing/carrier-recovery` | every 10 s | Connect, Replace, Disconnect after a review; recovery of an uncertain operation |
 | `/clock` | clock settings and the clock table | every 10 s | role and priority |
 | `/metrics` | daemon counters (with the audio clients), media engine counters, per-flow counters | every 5 s | |
 | `/events` | the latest events since the portal started (it keeps 200), newest first, UTC | every 5 s | |
@@ -90,6 +130,65 @@ a phone (under 720 px).
 | `/speaker` | **appliance mode only** ([below](#appliance-mode)): the control panel: volume and signal boost, warnings, host vitals and the daemon summary, the clock, one switch per configured service, sources, the signal path, devices and subscriptions, EQ files, network, links | every 5 s | volume and boost (live sliders), enable, disable or restart an allowlisted service (an essential one asks first), EQ files |
 | `/device`, `/overview` | appliance mode only: the overview (`/` redirects to `/speaker`) | every 5 s | |
 | `/assets/<hash>/style.css` | the stylesheet, at a path that changes with its content (cached for a year); `/style.css` and `/static/style.css` serve it uncached | | |
+
+### Routing
+
+`/routing` shows a matrix: transmit channels (TX, application to network) down
+the left, grouped by device, and receive inputs (RX, network to application)
+across the top, grouped by device. Device bands can be collapsed (a collapsed
+band shows read-only route counts), both axes can be filtered, and **List**
+shows the same routes receiver by receiver (the view on a narrow screen). The
+first four devices' inputs are read when the page loads; further devices have a
+**Read inputs** link. Transmit channels come in pages of 16. A column's title
+names the device, marks this host, gives its 16-digit device ID (the value for
+`[control] routing_sources`, [configuration.md](configuration.md#receiver-routing))
+and the reason when its inputs cannot be changed. Each cell shows the state of
+the route: receiving, receiver-confirmed, no media, pending, empty or
+unavailable.
+
+A cell opens a change: **Connect** an empty input, **Replace** its source, or
+**Disconnect** the current one. The review page shows the change and the current
+source; **Confirm change** sends one command, and the result page says whether
+the receiver confirmed the selection, refused it, had changed in the meantime,
+or whether the outcome is unknown (then further changes on that receiver wait
+for **Recover uncertain operation**,
+[troubleshooting](troubleshooting.md#recovering-an-uncertain-routing-operation)).
+Nothing is retried. The daemon checks the receiver's selection, the source and
+the locks again before it sends anything. Allow about five seconds for audio to
+settle.
+
+A cell is disabled when the receiver cannot be changed (the reason is in its
+column title: a `subscriptions` lock, the device access lock, an uncertain
+operation, a remote receiver with more than one page of inputs, this host's
+receiver with neither the native device role nor a running compatibility
+runtime), when the
+source's name is ambiguous, when the source is the receiving device itself, and,
+on a receiver still on the compatibility runtime, when the source channel
+already feeds another input of that receiver. A receiver on another device is
+changed over that device's control protocol and applies its own locks. A
+confirmed selection does not verify audio: "receiving" means packets arrive.
+**Review restart recovery** is for hosts on the compatibility runtime
+([troubleshooting](troubleshooting.md#reviewing-carriers-after-a-runtime-restart)).
+
+### Device access lock
+
+Each device card on `/devices` starts with **Access lock: open** or **locked**,
+and the overview's device table has an **Access** column. An open device offers
+**Lock**: the PIN (four digits) typed twice; the portal refuses a mismatch or
+another form before asking the daemon. A locked device says what is refused
+and offers **Unlock** with the PIN. The commands are the same `LockAccess` and
+`UnlockAccess` that `tesseractl access` sends, and the daemon decides
+everything ([what a lock refuses](cli.md#access), [where it is stored and how
+the PIN is protected](configuration.md#device-access-lock)). The PIN fields are
+password fields that the browser is asked not to fill in; the portal never
+logs, shows or keeps a PIN. Wrong PINs from the portal are counted apart from
+the command line: after five, unlocking from the portal pauses for 60 s while
+`tesseractl access unlock` still works.
+
+There is no reset in the portal: a forgotten PIN is reset by an administrator
+on the device (`sudo tesseractl access reset`). The daemon refuses a reset sent
+by the portal's account, and `POST /api/v1/commands` refuses
+`reset_access_lock` itself (403) without forwarding it.
 
 ### Appearance
 
@@ -113,8 +212,8 @@ Subscriptions on `/devices` are stored by name. Their state follows the media of
 static `[[flow]]` that carries the rx channel: "in progress" until it does (and for
 the first seconds of a flow), then "receiving" while packets arrive or "no media" (about 2 to 3 s after the last packet),
 and the "N of M receiving" count uses it ([control-interface.md](control-interface.md#status)).
-`tesserad` does not implement the vendor control plane itself; the packaged Controller
-compatibility runtime submits the flows a controller sets up
+Who sets up those flows is the device role: the daemon itself with the native device role, otherwise the
+packaged Controller compatibility runtime, which submits the flows a controller sets up
 ([interoperability.md](interoperability.md)).
 
 **Changes that restart something.** The channel counts form on `/devices`
@@ -127,6 +226,16 @@ shown (reloading that page only repeats the refusal with the current impact;
 nothing is applied until Confirm is pressed on a page that shows it). Errors (locked, invalid, over the memory budget, not a number) appear
 above the form again. The other restarting forms (rate, encoding, latency,
 primary interface, reload) use the same page; the JSON API has no such step yet.
+
+**Rate and encoding.** The two lists on `/devices` hold exactly the values the
+daemon accepts now, the values a network controller is offered too
+(`DeviceStatus.formats`). When nothing but the current value is accepted, the
+list is disabled and a line under the form says why: ``Sample rate fixed at 48
+kHz: bridge `speaker` runs its card at 48000 Hz (`sample_rate` in its
+configuration).`` (an enabled `[[bridge]]` pins it), ``... locked by the
+configuration (`locked` of the device).`` or ``... no other value is supported.``
+A daemon that does not report the lists gets the documented rates and
+encodings.
 
 The sound-card bridges and the receiver keepalive counters are not shown on
 the pages yet; `GET /api/v1/status` and `GET /api/v1/metrics` include them.
@@ -149,7 +258,12 @@ The contract for any other user interface. Bodies are the types of
 | `GET /api/v1/metrics` | | `Metrics` |
 | `GET /api/v1/config` | | the effective configuration, `application/toml` |
 | `GET /api/v1/devices/{key}` | | `DeviceStatus` |
-| `POST /api/v1/commands` | a `Command`, e.g. `{"set_latency":{"device":"main","latency":6000}}`; header `X-CSRF-Token` | `{"ok": true}` |
+| `GET /api/v1/routing/devices?cursor=…` | optional opaque continuation | `RoutingDevicePage` (provisional 0.x) |
+| `GET /api/v1/routing/channels?endpoint=…&generation=…&direction=rx\|tx&cursor=…` | current daemon endpoint reference | `RoutingChannelPage` (provisional 0.x) |
+| `GET /api/v1/routing/receiver?endpoint=…&generation=…&first=…` | current daemon endpoint reference | `RoutingReceiverPage`: the receiver's selections, with a single-use expectation per changeable input for a `route_receiver` command (provisional 0.x) |
+| `GET /api/v1/routing/operation?operation=…` | optional operation ID | the inspection of an uncertain receiver operation, with its review token |
+| `GET /api/v1/routing/carrier-recovery` | | the carrier-recovery inspection of a host on the compatibility runtime |
+| `POST /api/v1/commands` | a `Command`, e.g. `{"set_latency":{"device":"main","latency":6000}}`; header `X-CSRF-Token` | `{"ok": true, "reply": <Reply>}`, e.g. `{"ok": true, "reply": "done"}` |
 | `GET /api/v1/events` | | Server-Sent Events: `event` messages (an `Event` as JSON) and `resync` (events were lost: re-read the status); keep-alive comments every 15 s |
 
 Errors are JSON objects with an `error`: `{"error":{"message":"..."}}` for the
@@ -163,9 +277,9 @@ rejection of a `POST /api/v1/session` body that is not a JSON
 |------|------|
 | 400 | `invalid` from the daemon, or a body that is not a command |
 | 401 | no session (`log in first`), or a wrong password |
-| 403 | missing or wrong `X-CSRF-Token`, a cross-origin request, or `permission_denied` from the daemon |
+| 403 | missing or wrong `X-CSRF-Token`, a cross-origin request, `permission_denied` or `incorrect_pin` from the daemon, or a `reset_access_lock` command (refused by the portal) |
 | 404 | `not_found` |
-| 409 | `locked`, or `confirmation_required`: the command restarts something and was sent unconfirmed; nothing changed, and the error carries the `impact` (there is no confirmed form in the API yet) |
+| 409 | `locked`, `access_locked` (the device access lock refuses the change), or `confirmation_required`: the command restarts something and was sent unconfirmed; nothing changed, and the error carries the `impact` (there is no confirmed form in the API yet) |
 | 429 | `rate_limited`, or too many failed logins |
 | 500, 501 | `internal`, `unsupported` |
 | 502 | the daemon is not reachable or answered unexpectedly, or refused to send a reply above its frame limit (`response_too_large`; `[control] max_frame_bytes`) |
@@ -267,7 +381,9 @@ sudo usermod -aG tessera-admin tessera-web && sudo systemctl restart tessera-web
 
 Without that the portal is read-only and says so when a change is refused.
 The daemon records the portal's commands as coming from the CLI with the
-portal's uid (`origin: {"cli":{"uid":N}}`); the portal's log
+portal's uid (`origin: {"cli":{"uid":N}}`), except the device access lock
+commands, which it records as `{"api":{"principal":"portal"}}` so that the
+portal cannot reset a lock without its PIN; the portal's log
 (`journalctl -u tessera-web`) names the session that sent each command kind.
 The daemon currently identifies the portal process rather than individual web users.
 
@@ -816,5 +932,6 @@ sudo runuser -u tessera-web -- touch /opt/camilladsp/configs/.probe \
 - Bridges and keepalive counters are only in the JSON.
 - One operator password, no user accounts; commands are attributed to the
   portal's uid in the daemon.
-- A richer interface (a routing matrix) is meant to live in a separate
-  repository on top of the API.
+- The routing matrix reads at most four receivers per page load and offers
+  changes to another device's receiver only when its inputs fit on one page;
+  "receiving" is packet activity, not verified audio.

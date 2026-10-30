@@ -1,11 +1,19 @@
-//! The one place `tesserad` needs `unsafe` (ADR 0002): `SO_PEERGROUPS`, which
-//! `nix` does not wrap.
+//! The one place `tesserad` needs `unsafe` (ADR 0002): socket process/group
+//! observations and polling their kernel process handles.
 #![allow(unsafe_code)]
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use nix::libc;
+
+pub(crate) mod connector;
+pub(crate) use connector::{ConnectedProcess, ProcessKey};
+
+// Read-only preparation, disconnected from admission and the runtime actor.
+#[cfg(any(test, feature = "routing-shadow"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod network_facts;
 
 /// Largest group list accepted, in bytes (the kernel limit is 65536 groups).
 const MAX_BYTES: usize = 1 << 20;

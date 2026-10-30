@@ -6,6 +6,6 @@ use axum::response::IntoResponse;
 pub(crate) async fn script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../assets/live.js"),
+        include_str!("../assets/generated/live.js"),
     )
 }

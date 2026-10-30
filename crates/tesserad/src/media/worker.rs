@@ -56,6 +56,7 @@ use tessera_media::{FrameSource, IngestOutcome, MediaClock, RxFlow, RxMetrics, T
 use super::clock::{FrozenClock, OverlayClock};
 use super::format::AnyFormat;
 use super::keepalive::Keepalive;
+use super::plan::UNUSED;
 use super::stats::{EngineCounters, MediaStats, RxFlowCounters, wake_bucket};
 use super::udp::{RxSock, TxSock};
 use crate::rtsys;
@@ -105,7 +106,7 @@ pub struct RxRt {
     pub sock: RxSock,
     /// The flow engine.
     pub flow: RxFlow<AnyFormat>,
-    /// Device channel (0-based) of each flow channel.
+    /// Device channel (0-based) of each flow channel ([`UNUSED`]: none).
     pub chan: Vec<u32>,
     /// Only accept datagrams from this address.
     pub peer: Option<Ipv4Addr>,
@@ -154,6 +155,9 @@ pub struct TxRt {
     /// Scratch for `f32` rings (frames per packet long).
     pub scratch_f: Vec<f32>,
 }
+
+/// Datagrams read per TX socket and tick looking for receiver keepalives.
+const KEEPALIVE_DRAIN: usize = 64;
 
 /// A shared TX socket.
 #[derive(Debug)]
@@ -846,6 +850,15 @@ impl Worker {
             sessions,
             ..
         } = t;
+        // Receiver keepalives arrive at the sending sockets: note, per flow,
+        // when its destination was last heard (bounded, non-blocking).
+        for (i, s) in socks.iter().enumerate() {
+            s.sock.drain(KEEPALIVE_DRAIN, |from| {
+                for f in tx.iter().filter(|f| f.sock == i && f.dest == from) {
+                    f.flow.metrics_ref().last_keepalive_ns.record_max(now);
+                }
+            });
+        }
         if !allowed {
             st.tx_suppressed_ticks.inc();
             for f in tx.iter_mut() {
@@ -935,6 +948,9 @@ fn deliver<C: MediaClock>(f: &mut RxRt, sessions: &mut [Box<SessionRt>], clock: 
             break;
         }
         for (c, &dev_ch) in f.chan.iter().enumerate() {
+            if dev_ch == UNUSED {
+                continue;
+            }
             let Some(out) = f.scratch.get_mut(..n) else {
                 break;
             };

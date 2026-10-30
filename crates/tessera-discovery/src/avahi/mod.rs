@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{BackendKind, DiscoveryConfig, IpFamilies};
 use crate::error::Error;
-use crate::model::{BrowseEvent, DeviceServices, ResponderEvent, ServiceKind};
+use crate::model::{BrowseEvent, DeviceServices, PublishedService, ResponderEvent, ServiceKind};
 use crate::{BrowseHandle, ResponderEvents};
 
 use proxies::{PROTO_INET, PROTO_INET6, UNSPEC};
@@ -145,6 +145,7 @@ pub(crate) enum Cmd {
     Register(DeviceServices, Reply),
     Update(DeviceServices, Reply),
     Withdraw(String, Reply),
+    Published(oneshot::Sender<Vec<PublishedService>>),
     Shutdown(oneshot::Sender<()>),
     /// An entry group (by object path) changed state.
     GroupSignal(String, i32),
@@ -163,6 +164,7 @@ pub(crate) struct Avahi {
     cmd: mpsc::Sender<Cmd>,
     events_rx: Mutex<Option<mpsc::Receiver<ResponderEvent>>>,
     events_dropped: Arc<AtomicU64>,
+    revision: Arc<AtomicU64>,
     actor: Mutex<Option<JoinHandle<()>>>,
     owner: watch::Receiver<Owner>,
     owner_task: JoinHandle<()>,
@@ -180,8 +182,9 @@ impl Avahi {
             .await
             .map_err(|e| Error::AvahiUnavailable(format!("system bus: {e}")))?;
         let (owner, owner_task) = watch_owner(&conn).await?;
+        let revision = Arc::new(AtomicU64::new(0));
         let (cmd, events_rx, events_dropped, actor) =
-            responder::spawn(conn, Arc::clone(&cfg), owner.clone()).await?;
+            responder::spawn(conn, Arc::clone(&cfg), owner.clone(), Arc::clone(&revision)).await?;
         let (stop_all, _) = watch::channel(false);
         Ok(Self {
             cfg,
@@ -189,6 +192,7 @@ impl Avahi {
             cmd,
             events_rx: Mutex::new(Some(events_rx)),
             events_dropped,
+            revision,
             actor: Mutex::new(Some(actor)),
             owner,
             owner_task,
@@ -203,6 +207,24 @@ impl Avahi {
                 rx,
                 dropped: Arc::clone(&self.events_dropped),
             })
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn dropped_events(&self) -> u64 {
+        self.events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) async fn published(&self) -> Result<Vec<PublishedService>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::Published(tx))
+            .await
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)
     }
 
     async fn call(&self, make: impl FnOnce(Reply) -> Cmd) -> Result<(), Error> {

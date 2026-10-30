@@ -285,26 +285,36 @@ pub fn check_channel_counts(
 /// | `SetDeviceName`, `SetChannelLabel` | none | re-announced in place; audio does not stop |
 /// | `Subscribe`, `Unsubscribe` | none | only that RX channel changes |
 /// | `SetClockRole`, `SetClockPriority` | none | sent to the running PTP port as live commands; nothing restarts |
+/// | `LockAccess`, `UnlockAccess`, `ResetAccessLock` | none | only what later commands may change; media is untouched |
 /// | `SetSampleRate`, `SetEncoding`, `SetLatency` | device | the device's flows are rebuilt and its audio clients detached (new ring geometry) |
 /// | `SetDeviceChannels` | device | as above, plus channels and their subscriptions go away |
 /// | `SetPrimaryInterface` | device (every device) | the PTP port restarts on the new interface and every flow moves |
+/// | `ClearConfiguration` | device (every device when the primary interface selection goes) | rate, encoding and latency return to the configuration, subscriptions and controller flows go |
 /// | `ReloadConfig` | device (at most) | computed from what the files changed: device for geometry, interfaces, `[[flow]]`/`[[bridge]]` entries, MTU, Wi-Fi permission or a removed device; changed keys of apply class `restart` are listed in `Impact::restart_keys` but restart nothing now |
 #[must_use]
 pub fn declared_scope(cmd: &Command) -> RestartScope {
     match cmd {
+        Command::RouteReceiver { .. }
+        | Command::ReconcileReceiverOperation { .. }
+        | Command::ReleaseRuntimeCarriers { .. }
+        | Command::GrantRuntimeCarriersToNextRun { .. } => RestartScope::None,
         Command::SetSampleRate { .. }
         | Command::SetEncoding { .. }
         | Command::SetLatency { .. }
         | Command::SetDeviceChannels { .. }
         | Command::SetProtocolFlows { .. }
         | Command::SetPrimaryInterface { .. }
+        | Command::ClearConfiguration { .. }
         | Command::ReloadConfig => RestartScope::Device,
         Command::SetDeviceName { .. }
         | Command::SetChannelLabel { .. }
         | Command::Subscribe { .. }
         | Command::Unsubscribe { .. }
         | Command::SetClockRole { .. }
-        | Command::SetClockPriority { .. } => RestartScope::None,
+        | Command::SetClockPriority { .. }
+        | Command::LockAccess { .. }
+        | Command::UnlockAccess { .. }
+        | Command::ResetAccessLock { .. } => RestartScope::None,
         // A command added to control-types later: assume the worst until
         // this table names it.
         _ => RestartScope::Daemon,

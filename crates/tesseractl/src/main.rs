@@ -7,6 +7,9 @@ use clap::Parser;
 use tesseractl::cli::Cli;
 
 fn main() -> ExitCode {
+    if let Some(code) = tesseractl::runtime_build_probe("cli") {
+        return code;
+    }
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         // Prints help/version to stdout (exit 0) or the usage error to stderr

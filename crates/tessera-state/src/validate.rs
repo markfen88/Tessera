@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use tessera_control_types::Direction;
 
 use crate::config::{Config, DeviceConfig, TickUs};
-use crate::env::{Environment, validate_name};
+use crate::env::{Environment, validate_channel_label, validate_device_name, validate_name};
 use crate::error::{Issue, Severity};
 
 const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
@@ -14,6 +14,11 @@ const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 /// Validate a configuration as it is loaded. Host-dependent findings
 /// (interface missing, wireless interface without permission) are warnings
 /// here; [`validate_for_start`] turns them into errors.
+///
+/// Private removal-only report admission relies on every flow-dependent error
+/// across this complete validator being unary or pairwise under fixed context.
+/// An aggregate or existence-dependent error, including one in tunable checks,
+/// must revisit recovery's subset argument and the whole-validator properties.
 #[must_use]
 pub fn validate(config: &Config, env: &Environment) -> Vec<Issue> {
     let mut issues = Vec::new();
@@ -245,6 +250,14 @@ fn check(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
                     d.name
                 ),
             );
+        }
+        if validate_name(&d.name, env.max_name_bytes).is_ok() {
+            if let Err(e) = validate_device_name(&d.name, env.max_name_bytes) {
+                out.push(Issue::warning(
+                    format!("{p}.name"),
+                    format!("device name {e}; retained unchanged for existing subscriptions; external controllers may refuse routing"),
+                ));
+            }
         }
         check_device(&p, d, env, out);
     }
@@ -518,9 +531,25 @@ fn check_bridges(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
     }
 }
 
+/// The multicast group an rx flow listens on: its `local_address`, when
+/// that is a group (`flows-media.md` §5: the receiver binds the group).
+fn listened_group(f: &crate::config::FlowConfig) -> Option<std::net::Ipv4Addr> {
+    f.local_address
+        .filter(|a| f.direction == Direction::Rx && a.is_multicast())
+}
+
 /// `[[flow]]` (PROVISIONAL static flows): ids, device references, channel
 /// ranges, ports. Packet-size limits depend on the packet format and are
 /// checked by the daemon when it builds the flow.
+///
+/// An rx flow whose `local_address` is a multicast group listens on that
+/// group. Every socket bound to a group receives every datagram, so several
+/// such flows may share the group's port and sender (one per input, each
+/// independent of the others), and in such a flow a channel of 0 marks a
+/// wire position that no device channel takes.
+// Private report-admission removal-only recovery relies on flow errors being
+// unary or pairwise under fixed configuration. A new dependency/existence or
+// aggregate rule must revisit that subset-safety argument and its properties.
 fn check_flows(config: &Config, out: &mut Vec<Issue>) {
     let err = |out: &mut Vec<Issue>, key: String, msg: String| out.push(Issue::error(key, msg));
     let mut ids = BTreeSet::new();
@@ -529,11 +558,21 @@ fn check_flows(config: &Config, out: &mut Vec<Issue>) {
     let mut rx_seen: Vec<(usize, &crate::config::FlowConfig)> = Vec::new();
     for (i, f) in config.flows.iter().enumerate() {
         let p = format!("flow[{i}]");
-        if let Some(previous) = endpoints.insert((f.peer, f.port, f.direction), i) {
+        let group = listened_group(f);
+        if group.is_none() {
+            if let Some(previous) = endpoints.insert((f.peer, f.port, f.direction), i) {
+                err(
+                    out,
+                    format!("{p}.peer"),
+                    format!("one flow per peer, port and direction: duplicates flow[{previous}]"),
+                );
+            }
+        }
+        if f.direction == Direction::Tx && f.local_address.is_some_and(|a| a.is_multicast()) {
             err(
                 out,
-                format!("{p}.peer"),
-                format!("one flow per peer, port and direction: duplicates flow[{previous}]"),
+                format!("{p}.local_address"),
+                "only an rx flow can listen on a multicast group; a tx flow sends to a group named in `peer`".into(),
             );
         }
         let valid_id = !f.id.is_empty()
@@ -586,7 +625,7 @@ fn check_flows(config: &Config, out: &mut Vec<Issue>) {
                     out,
                     format!("{p}.peer"),
                     format!(
-                        "`{peer}` is a multicast address; an rx flow's `peer` is the sender's unicast address (receiving from a multicast group is not supported yet)"
+                        "`{peer}` is a multicast address; an rx flow's `peer` is the sender's unicast address (to receive a multicast group, set the group as `local_address`)"
                     ),
                 );
             }
@@ -608,14 +647,19 @@ fn check_flows(config: &Config, out: &mut Vec<Issue>) {
             }
             // Two rx flows must not listen on one port (a missing interface
             // or address may resolve to the other flow's, so it counts as a
-            // possible clash), nor carry the same device channel.
+            // possible clash; a missing address is the interface's, never a
+            // group), nor carry the same device channel. Listeners on one
+            // multicast group share it.
             for (j, g) in &rx_seen {
                 let same_if =
                     f.interface == g.interface || f.interface.is_none() || g.interface.is_none();
-                let same_addr = f.local_address == g.local_address
-                    || f.local_address.is_none()
-                    || g.local_address.is_none();
-                if f.port != 0 && f.port == g.port && same_if && same_addr {
+                let same_addr = match (f.local_address, g.local_address) {
+                    (Some(a), Some(b)) => a == b,
+                    (Some(a), None) | (None, Some(a)) => !a.is_multicast(),
+                    (None, None) => true,
+                };
+                let shared_group = group.is_some() && group == listened_group(g);
+                if f.port != 0 && f.port == g.port && same_if && same_addr && !shared_group {
                     err(
                         out,
                         format!("{p}.port"),
@@ -633,7 +677,7 @@ fn check_flows(config: &Config, out: &mut Vec<Issue>) {
                         if x.channels.is_empty() {
                             (1..=all(x)).collect()
                         } else {
-                            x.channels.iter().copied().collect()
+                            x.channels.iter().copied().filter(|c| *c != 0).collect()
                         }
                     };
                     let (a, b) = (chans(f), chans(g));
@@ -675,16 +719,31 @@ fn check_flows(config: &Config, out: &mut Vec<Issue>) {
         for (j, c) in f.channels.iter().enumerate() {
             let cp = format!("{p}.channels[{j}]");
             if *c == 0 {
-                err(out, cp, "channel numbers start at 1".into());
+                // In a group listener: a wire position no device channel
+                // takes; in a tx flow: a position sent as silence
+                // (`control-flows.md` §1).
+                if group.is_none() && f.direction == Direction::Rx {
+                    err(out, cp, "channel numbers start at 1".into());
+                }
             } else if let Some(n) = count.filter(|n| c > n) {
                 err(
                     out,
                     cp,
                     format!("channel {c} is beyond the device's {n} channel(s) in that direction"),
                 );
-            } else if !seen.insert(*c) {
+            } else if f.direction == Direction::Rx && !seen.insert(*c) {
                 err(out, cp, format!("channel {c} is listed twice"));
             }
+        }
+        if f.direction == Direction::Tx
+            && !f.channels.is_empty()
+            && f.channels.iter().all(|c| *c == 0)
+        {
+            err(
+                out,
+                format!("{p}.channels"),
+                "a tx flow must carry at least one channel; 0 only marks a silent position".into(),
+            );
         }
         if f.channels.is_empty() && count == Some(0) {
             err(
@@ -784,6 +843,11 @@ fn check_device(p: &str, d: &DeviceConfig, env: &Environment, out: &mut Vec<Issu
             }
             if let Err(e) = validate_name(label, env.max_name_bytes) {
                 err(out, &format!("{key}.{ch}"), format!("label {e}"));
+            } else if let Err(e) = validate_channel_label(label, env.max_name_bytes) {
+                out.push(Issue::warning(
+                    format!("{p}.{key}.{ch}"),
+                    format!("label {e}; retained unchanged for existing subscriptions; external controllers may refuse routing"),
+                ));
             }
         }
     }
@@ -877,6 +941,20 @@ fn check_tunables(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
     );
 
     let c = &config.control;
+    let mut routing_sources = BTreeSet::new();
+    for (index, source) in c.routing_sources.iter().enumerate() {
+        if source.len() != 16
+            || !source.bytes().all(|b| b.is_ascii_hexdigit())
+            || source.bytes().all(|b| b == b'0')
+            || !routing_sources.insert(source.to_ascii_lowercase())
+        {
+            err(
+                out,
+                &format!("control.routing_sources[{index}]"),
+                "expected a unique nonzero native wire identity of 16 hexadecimal digits".into(),
+            );
+        }
+    }
     if c.max_frame_bytes < MIN_MAX_FRAME_BYTES {
         err(
             out,

@@ -1,24 +1,13 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-bundle"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Shell-free Tessera bundle lifecycle and integrity verification"
-
-[lib]
-test = false
-bench = false
-doctest = false
-
-[[bin]]
-name = "tessera-bundle"
-path = "src/main.rs"
-test = false
-bench = false
+autotests = false
+autoexamples = false
+autobenches = false
 
 [dependencies]
 minisign-verify = "=0.2.4"
@@ -33,3 +22,13 @@ toml = "1.1"
 [lints]
 workspace = true
 
+[lib]
+test = false
+bench = false
+doctest = false
+
+[[bin]]
+name = "tessera-bundle"
+path = "src/main.rs"
+test = false
+bench = false

@@ -471,9 +471,9 @@ pub(crate) fn load_from_sources_for_state(
             let mut warning = Issue::warning(
                 "flow",
                 if protocol_stored {
-                    "90-probe-flows.toml is deprecated; ignored because controller flows are owned by state.toml (removed in 0.4.0)"
+                    "90-probe-flows.toml is deprecated; ignored because controller flows are owned by state.toml (removal deferred)"
                 } else {
-                    "90-probe-flows.toml is deprecated; submit set_protocol_flows instead (removed in 0.4.0)"
+                    "90-probe-flows.toml is deprecated; submit set_protocol_flows instead (removal deferred)"
                 },
             );
             warning.source = Some(s.path.clone());

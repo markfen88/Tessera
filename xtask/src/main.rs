@@ -6,6 +6,8 @@ mod files;
 mod news;
 mod no_scripts;
 mod release;
+mod runtime_build;
+mod web_assets;
 
 use std::env;
 use std::fmt;
@@ -51,19 +53,38 @@ enum Task {
     CheckDeb(Vec<PathBuf>),
     Release(release::Action, Vec<String>),
     CheckNoScripts,
+    WebAssets(bool),
+    RuntimeBuildId,
     WriteNews {
         directory: PathBuf,
         package: String,
         source: PathBuf,
         version: String,
     },
+    /// Development, test, lab and internal publishing tasks. Published source
+    /// releases leave their modules out and build xtask without this feature.
+    #[cfg(feature = "internal")]
+    Internal(internal::Task),
     Help,
 }
+
+const USAGE: &str = "ci|web-assets [--check]|runtime-build-id|build-deb|build-bundle|check-deb|check-no-scripts|release|verify-release|release-keygen";
 
 fn parse(args: &[String]) -> Result<Task> {
     let Some(name) = args.first() else {
         return Ok(Task::Help);
     };
+    #[cfg(feature = "internal")]
+    if let Some(task) = internal::parse(args) {
+        return task.map(Task::Internal);
+    }
+    if name == "web-assets" {
+        return match &args[1..] {
+            [] => Ok(Task::WebAssets(false)),
+            [flag] if flag == "--check" => Ok(Task::WebAssets(true)),
+            _ => Err(Failure::new("unexpected web-assets arguments")),
+        };
+    }
     if let Some(action) = match name.as_str() {
         "release" => Some(release::Action::Sign),
         "verify-release" => Some(release::Action::Verify),
@@ -110,6 +131,7 @@ fn parse(args: &[String]) -> Result<Task> {
     let task = match name.as_str() {
         "ci" => Task::Ci,
         "check-no-scripts" => Task::CheckNoScripts,
+        "runtime-build-id" => Task::RuntimeBuildId,
         "help" | "--help" | "-h" => Task::Help,
         _ => return Err(Failure::new(format!("unknown task: {name}"))),
     };
@@ -226,6 +248,7 @@ fn execute(task: Task, root: &Path) -> Result<()> {
     match task {
         Task::Ci => {
             no_scripts::check(root)?;
+            web_assets::build(root, true)?;
             for args in ci_commands() {
                 run(Command::new("cargo").current_dir(root).args(args))?;
             }
@@ -236,16 +259,24 @@ fn execute(task: Task, root: &Path) -> Result<()> {
         Task::CheckDeb(paths) => check_deb::check(root, &paths),
         Task::Release(action, args) => release::execute(action, &args, root),
         Task::CheckNoScripts => no_scripts::check(root),
+        Task::WebAssets(check) => web_assets::build(root, check),
+        Task::RuntimeBuildId => {
+            println!("{}", runtime_build::source_id(root)?);
+            Ok(())
+        }
         Task::WriteNews {
             directory,
             package,
             source,
             version,
         } => news::write_news(&directory, &package, &source, &version),
+        #[cfg(feature = "internal")]
+        Task::Internal(task) => internal::execute(task, root),
         Task::Help => {
-            println!(
-                "usage: cargo xtask <ci|build-deb|build-bundle|check-deb|check-no-scripts|release|verify-release|release-keygen>"
-            );
+            #[cfg(feature = "internal")]
+            println!("usage: cargo xtask <{USAGE}|{}>", internal::USAGE);
+            #[cfg(not(feature = "internal"))]
+            println!("usage: cargo xtask <{USAGE}>");
             Ok(())
         }
     }
@@ -267,6 +298,18 @@ fn task_root(override_root: Option<&str>) -> Result<PathBuf> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    #[cfg(feature = "internal")]
+    if let Some(result) = internal::dispatch(&args) {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                if !error.message.is_empty() {
+                    eprintln!("{error}");
+                }
+                ExitCode::from(error.code)
+            }
+        };
+    }
     let override_root = env::var("TESSERA_XTASK_ROOT").ok();
     let result = task_root(override_root.as_deref())
         .and_then(|root| parse(&args).and_then(|task| execute(task, &root)));
@@ -278,5 +321,127 @@ fn main() -> ExitCode {
             }
             ExitCode::from(error.code)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_task_parses_and_rejects_arguments() {
+        for (name, expected) in [
+            ("ci", Task::Ci),
+            ("check-no-scripts", Task::CheckNoScripts),
+            ("web-assets", Task::WebAssets(false)),
+            ("runtime-build-id", Task::RuntimeBuildId),
+            ("help", Task::Help),
+            ("--help", Task::Help),
+            ("-h", Task::Help),
+        ] {
+            assert_eq!(parse(&[name.into()]).unwrap(), expected);
+            assert!(parse(&[name.into(), "--unknown".into()]).is_err());
+        }
+        assert_eq!(parse(&[]).unwrap(), Task::Help);
+        assert!(parse(&["unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn check_deb_accepts_default_or_multiple_paths_and_rejects_options() {
+        assert_eq!(
+            parse(&["check-deb".into()]).unwrap(),
+            Task::CheckDeb(vec![])
+        );
+        assert_eq!(
+            parse(&[
+                "check-deb".into(),
+                "a.deb".into(),
+                "with space/b.deb".into()
+            ])
+            .unwrap(),
+            Task::CheckDeb(vec!["a.deb".into(), "with space/b.deb".into()]),
+        );
+        assert!(parse(&["check-deb".into(), "--unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn ci_contains_the_complete_merge_gate_in_order() {
+        let commands = ci_commands();
+        assert_eq!(commands.len(), 10);
+        assert_eq!(commands[0], ["fmt", "--all", "--check"]);
+        assert_eq!(
+            commands[1],
+            [
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
+        assert_eq!(commands[2], ["test", "--workspace"]);
+        assert_eq!(commands[3], ["deny", "check"]);
+        for (command, name) in commands[4..].iter().zip([
+            "proto",
+            "control",
+            "clock",
+            "media",
+            "aes67",
+            "control-types",
+        ]) {
+            assert_eq!(
+                command,
+                &[
+                    "check".to_owned(),
+                    "--target".to_owned(),
+                    "thumbv8m.main-none-eabihf".to_owned(),
+                    "-p".to_owned(),
+                    format!("tessera-{name}"),
+                    "--no-default-features".to_owned(),
+                ]
+                .to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn internal_news_writer_requires_exactly_four_values() {
+        let args = ["__write-news", "/stage", "tessera", "/NEWS", "0.2.1-1"].map(str::to_owned);
+        assert!(matches!(parse(&args).unwrap(), Task::WriteNews { .. }));
+        for count in 1..5 {
+            assert!(parse(&args[..count]).is_err());
+        }
+        let mut extra = args.to_vec();
+        extra.push("extra".into());
+        assert!(parse(&extra).is_err());
+        for index in 1..args.len() {
+            let mut invalid = args.clone();
+            invalid[index] = "--unknown".into();
+            assert!(parse(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn fixture_root_is_explicit_and_absolute() {
+        assert!(task_root(None).unwrap().is_absolute());
+        assert_eq!(
+            task_root(Some("/fixture/repository")).unwrap(),
+            Path::new("/fixture/repository")
+        );
+        assert!(task_root(Some("relative")).is_err());
+    }
+
+    #[test]
+    fn command_lookup_failures_keep_shell_exit_codes() {
+        assert_eq!(command_error(std::io::ErrorKind::NotFound.into()).code, 127);
+        assert_eq!(
+            command_error(std::io::ErrorKind::PermissionDenied.into()).code,
+            126
+        );
+        assert_eq!(
+            Failure::from(std::io::Error::from(std::io::ErrorKind::NotFound)).code,
+            1
+        );
     }
 }

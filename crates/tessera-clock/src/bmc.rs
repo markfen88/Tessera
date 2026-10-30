@@ -75,6 +75,11 @@ pub fn compare_std2002(a: &ClockDataset, b: &ClockDataset) -> Ordering {
         // Same grandmaster seen through different paths: fewer hops wins.
         return a.steps_removed.cmp(&b.steps_removed);
     }
+    // Between two preferred clocks only the lower MAC decides (spec:5.4
+    // item 1, documented election rule).
+    if a.preferred && b.preferred {
+        return a.uuid.cmp(&b.uuid);
+    }
     // Preferred beats not preferred.
     b.preferred
         .cmp(&a.preferred)
@@ -115,6 +120,23 @@ pub struct ForeignMaster {
     pub count: u8,
     /// True once `count` reached the threshold.
     pub qualified: bool,
+    /// This sender was already reported as a preferred clock heard while we
+    /// lead (spec:5.4 item 1). Cleared when the record restarts after a
+    /// silence and when the port starts to lead again.
+    pub rival_reported: bool,
+}
+
+/// A Sync this many sequence ids behind the sender's last one, or fewer, is
+/// stale (a duplicate or a reordered datagram, spec:4 "stale sequence number
+/// (wrapping compare)"). A larger step back is the sender restarting its
+/// sequence: tessera's own leader does so when its port restarts on an
+/// interface change, and its followers must keep their lock across that
+/// (ADR 0005 amendment), so such a Sync is accepted.
+const STALE_SPAN: u16 = 16;
+
+/// `seq` is stale against the sender's `last` sequence id (wrapping).
+fn seq_stale(seq: u16, last: u16) -> bool {
+    last.wrapping_sub(seq) < STALE_SPAN
 }
 
 /// Qualification parameters for [`ForeignMasters::update`].
@@ -150,9 +172,11 @@ impl<const N: usize> ForeignMasters<N> {
     }
 
     /// Records a Sync. See [`QualifyParams`]. Returns the updated record, or
-    /// `None` if the datagram was a duplicate (same sequence id as the
-    /// previous Sync from that sender) or the table is full of records that
-    /// may not be evicted.
+    /// `None` if the datagram was a duplicate or stale (equal to or at most
+    /// `STALE_SPAN - 1` behind the previous Sync's sequence id from that
+    /// sender, in wrapping arithmetic, spec:4) or the table is full of
+    /// records that may not be evicted. After a silence longer than the
+    /// window the sender starts afresh, whatever its sequence id.
     ///
     /// Eviction (table full, unknown sender): only an *unqualified* record
     /// that is not `protect` (the current parent) can be replaced, the
@@ -175,21 +199,27 @@ impl<const N: usize> ForeignMasters<N> {
             None => self.free_slot(protect)?,
         };
         let slot = self.recs.get_mut(idx)?;
-        let (count, qualified, last_counted) = match slot {
+        let (count, qualified, last_counted, rival_reported) = match slot {
             Some(r) => {
-                if r.last_seq == header.sequence_id && now.saturating_sub(r.last_rx) < p.window_ns {
+                let silent = now.saturating_sub(r.last_rx);
+                if silent < p.window_ns && seq_stale(header.sequence_id, r.last_seq) {
                     return None;
                 }
-                if now.saturating_sub(r.last_rx) > p.window_ns {
-                    (1, false, now)
+                if silent > p.window_ns {
+                    (1, false, now, false)
                 } else if now.saturating_sub(r.last_counted) >= p.min_spacing_ns {
-                    (r.count.saturating_add(1), r.qualified, now)
+                    (
+                        r.count.saturating_add(1),
+                        r.qualified,
+                        now,
+                        r.rival_reported,
+                    )
                 } else {
                     // A burst: does not count towards qualification.
-                    (r.count, r.qualified, r.last_counted)
+                    (r.count, r.qualified, r.last_counted, r.rival_reported)
                 }
             }
-            None => (1, false, now),
+            None => (1, false, now, false),
         };
         let qualified = qualified || count >= p.threshold;
         *slot = Some(ForeignMaster {
@@ -202,6 +232,7 @@ impl<const N: usize> ForeignMasters<N> {
             last_counted,
             count,
             qualified,
+            rival_reported,
         });
         slot.as_ref()
     }
@@ -247,6 +278,28 @@ impl<const N: usize> ForeignMasters<N> {
             .iter()
             .flatten()
             .find(|r| r.sender.same_port(sender))
+    }
+
+    /// Every record.
+    pub fn iter(&self) -> impl Iterator<Item = &ForeignMaster> {
+        self.recs.iter().flatten()
+    }
+
+    /// Marks the record of `sender` as reported (see
+    /// [`ForeignMaster::rival_reported`]); `true` if it was not marked yet.
+    pub fn mark_rival_reported(&mut self, sender: &PortIdentity) -> bool {
+        self.recs
+            .iter_mut()
+            .flatten()
+            .find(|r| r.sender.same_port(sender))
+            .is_some_and(|r| !core::mem::replace(&mut r.rival_reported, true))
+    }
+
+    /// Clears every report mark.
+    pub fn clear_rival_reported(&mut self) {
+        for r in self.recs.iter_mut().flatten() {
+            r.rival_reported = false;
+        }
     }
 
     /// Number of records.
@@ -306,6 +359,15 @@ mod tests {
         assert_eq!(c(&base, &base), Ordering::Equal);
         // Unknown identifiers rank after DFLT.
         assert_eq!(c(&base, &ds(false, 4, b"ZZZZ", 0, 1)), Ordering::Less);
+    }
+
+    #[test]
+    fn between_preferred_clocks_only_the_lower_mac_decides() {
+        let c = compare_std2002;
+        let low = ds(true, 0x2A, b"DFLT", 0, 1);
+        let high = ds(true, 0x29, b"DFLT", -100, 9);
+        assert_eq!(c(&low, &high), Ordering::Less);
+        assert_eq!(c(&high, &low), Ordering::Greater);
     }
 
     #[test]
@@ -389,6 +451,62 @@ mod tests {
             up(&mut t, 20_000_000_000, None, &hdr(1, 4), &body(4, 1)),
             Some(false)
         );
+    }
+
+    #[test]
+    fn stale_sequence_ids_are_dropped_with_wrapping_compare() {
+        let mut t = ForeignMasters::<4>::new();
+        assert_eq!(up(&mut t, 0, None, &hdr(1, 10), &body(4, 1)), Some(false));
+        // An older (reordered) Sync is dropped like a duplicate (spec:4).
+        assert_eq!(up(&mut t, 600_000_000, None, &hdr(1, 9), &body(4, 1)), None);
+        assert_eq!(t.get(&hdr(1, 0).source).unwrap().last_seq, 10);
+        // Later ids count, across the 16-bit wrap.
+        let mut t = ForeignMasters::<4>::new();
+        up(&mut t, 0, None, &hdr(1, 0xFFFF), &body(4, 1));
+        assert_eq!(
+            up(&mut t, 600_000_000, None, &hdr(1, 0), &body(4, 1)),
+            Some(true),
+            "0 follows 0xFFFF"
+        );
+        // Stale reaches back STALE_SPAN - 1 ids ...
+        let mut t = ForeignMasters::<4>::new();
+        up(&mut t, 0, None, &hdr(1, 5000), &body(4, 1));
+        let back = 5000 - (STALE_SPAN - 1);
+        assert_eq!(
+            up(&mut t, 600_000_000, None, &hdr(1, back), &body(4, 1)),
+            None
+        );
+        // ... a larger step back is the sender restarting its sequence (a
+        // tessera leader restarted on an interface change): it counts at once
+        // and the record stays qualified, so its followers keep their lock.
+        up(&mut t, 600_000_000, None, &hdr(1, 5001), &body(4, 1));
+        assert_eq!(
+            up(&mut t, 1_200_000_000, None, &hdr(1, 0), &body(4, 1)),
+            Some(true)
+        );
+        assert_eq!(t.get(&hdr(1, 0).source).unwrap().last_seq, 0);
+        // After a silence longer than the window any id starts afresh.
+        assert_eq!(
+            up(&mut t, 1_200_000_000 + W + 1, None, &hdr(1, 0), &body(4, 1)),
+            Some(false),
+            "a fresh record after the silence"
+        );
+    }
+
+    #[test]
+    fn the_rival_mark_is_kept_per_record_and_reset_by_a_silence() {
+        let mut t = ForeignMasters::<4>::new();
+        let s = hdr(1, 0).source;
+        up(&mut t, 0, None, &hdr(1, 0), &body(4, 1));
+        assert!(t.mark_rival_reported(&s));
+        assert!(!t.mark_rival_reported(&s), "once");
+        up(&mut t, 600_000_000, None, &hdr(1, 1), &body(4, 1));
+        assert!(t.get(&s).unwrap().rival_reported, "kept across Syncs");
+        t.clear_rival_reported();
+        assert!(t.mark_rival_reported(&s));
+        up(&mut t, 600_000_000 + W + 1, None, &hdr(1, 2), &body(4, 1));
+        assert!(!t.get(&s).unwrap().rival_reported, "a new episode");
+        assert!(!t.mark_rival_reported(&hdr(2, 0).source), "unknown sender");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use tessera_control_types::{
-    ClockRole, Command, DeviceKey, Direction, Encoding, LatencyUs, SampleRate,
+    AccessPin, ClockRole, Command, DeviceKey, Direction, Encoding, LatencyUs, SampleRate,
 };
 
 /// Default location of the control socket.
@@ -16,7 +16,7 @@ pub const DEFAULT_SOCKET: &str = "/run/tessera/control.sock";
 #[derive(Debug, Parser)]
 #[command(
     name = "tesseractl",
-    version,
+    version = tessera_control_types::BUILD_VERSION,
     about = "Control the tessera daemon (tesserad)",
     after_help = "Exit codes: 0 ok, 1 error (also: a change that restarts something was not confirmed), 2 usage, 3 cannot connect, 4 permission denied.\n\
                   Changing settings needs root or membership of the daemon's admin group \
@@ -98,6 +98,9 @@ pub enum Cmd {
     Status,
     /// Show the daemon's counters and gauges.
     Metrics,
+    /// Inspect discovered endpoints, channels and receiver-reported selections.
+    #[command(subcommand)]
+    Routing(RoutingCmd),
     /// Show the in-daemon hardware-card bridges (`[[bridge]]`).
     Bridges,
     /// Inspect flow counters or replace the controller-managed flow set.
@@ -177,6 +180,10 @@ pub enum Cmd {
     /// Configuration.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// The device access lock: freeze the device's configuration and
+    /// routing behind a four-digit PIN.
+    #[command(subcommand)]
+    Access(AccessCmd),
     /// Print a shell completion script.
     Completions {
         /// The shell.
@@ -238,6 +245,21 @@ pub enum NetworkCmd {
         /// and use the configured or automatic choice again.
         interface: String,
     },
+}
+
+/// `tesseractl access ...`. The PIN is never an argument (other users could
+/// read it in the process list): it is typed on the terminal without echo,
+/// or read as one line from standard input.
+#[derive(Debug, Subcommand)]
+pub enum AccessCmd {
+    /// Lock the device: changes from any controller, the portal or this
+    /// command are refused until it is unlocked. Asks for the PIN twice.
+    Lock,
+    /// Unlock the device with the PIN it was locked with.
+    Unlock,
+    /// Unlock without the PIN, for a forgotten PIN (local administrators
+    /// only).
+    Reset,
 }
 
 /// `tesseractl config ...`.
@@ -338,8 +360,99 @@ pub fn to_command(cmd: &Cmd, device: &DeviceKey) -> Option<Command> {
         },
         Cmd::Config(ConfigCmd::Reload) => Command::ReloadConfig,
         Cmd::Flows(FlowCmd::Clear) => Command::SetProtocolFlows { flows: Vec::new() },
+        Cmd::Access(AccessCmd::Reset) => Command::ResetAccessLock { device: d() },
         _ => return None,
     })
+}
+
+/// The access-lock command for `cmd` with `pin` (`lock` and `unlock`).
+#[must_use]
+pub fn access_command(cmd: &AccessCmd, device: &DeviceKey, pin: AccessPin) -> Command {
+    match cmd {
+        AccessCmd::Lock => Command::LockAccess {
+            device: device.clone(),
+            pin,
+        },
+        AccessCmd::Unlock => Command::UnlockAccess {
+            device: device.clone(),
+            pin,
+        },
+        AccessCmd::Reset => Command::ResetAccessLock {
+            device: device.clone(),
+        },
+    }
+}
+
+/// Read-only routing queries. References come from `routing devices`.
+#[derive(Debug, Subcommand)]
+pub enum RoutingCmd {
+    /// Review retired-runtime carrier ownership; no routing change.
+    InspectCarriers,
+    /// Return the reviewed occurrences to current runtime management.
+    ReleaseCarriers {
+        /// Single-use token returned by `routing inspect-carriers`.
+        #[arg(long)]
+        review: String,
+    },
+    /// Authorize the next runtime start to replace reviewed first-device carriers.
+    GrantNextRun {
+        /// Single-use next_run_review token from `routing inspect-carriers`.
+        #[arg(long)]
+        review: String,
+    },
+    /// Inspect complete local receiver state after an uncertain operation.
+    Inspect {
+        /// Optional exact unresolved operation ID to inspect.
+        #[arg(long)]
+        operation: Option<String>,
+    },
+    /// Accept a fresh reviewed baseline; never retries a receiver mutation.
+    Reconcile {
+        /// Single-use token from a complete `routing inspect` review.
+        #[arg(long)]
+        review: String,
+    },
+    /// Execute one Connect, Replace or Disconnect using a fresh receiver token.
+    Execute {
+        /// Expectation returned by `routing receiver` (expires after 30 seconds).
+        #[arg(long)]
+        expectation: String,
+        /// ReceiverChange JSON, using source references from routing inventory.
+        #[arg(long)]
+        change: String,
+    },
+    /// Show a page of available local and discovered endpoints.
+    Devices {
+        /// Opaque continuation from the previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Show advertised or local channel rows for a current endpoint.
+    Channels {
+        /// Daemon-issued endpoint ID.
+        #[arg(long)]
+        endpoint: String,
+        /// Current endpoint generation.
+        #[arg(long)]
+        generation: String,
+        /// Receive or transmit channels.
+        direction: Dir,
+        /// Opaque continuation from the previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Read one page of selections currently reported by the receiver.
+    Receiver {
+        /// Daemon-issued endpoint ID.
+        #[arg(long)]
+        endpoint: String,
+        /// Current endpoint generation.
+        #[arg(long)]
+        generation: String,
+        /// One-based item position; advance using next_first from the reply.
+        #[arg(long, default_value = "1")]
+        first: NonZeroU16,
+    },
 }
 
 /// `default` and `auto` clear the selection; anything else names an interface.
@@ -361,6 +474,7 @@ pub fn needs_device(cmd: &Cmd) -> bool {
             | Cmd::SetLabel { .. }
             | Cmd::Subscribe { .. }
             | Cmd::Unsubscribe { .. }
+            | Cmd::Access(_)
     )
 }
 
@@ -491,6 +605,42 @@ mod tests {
             &parse(&["clock", "set-priority", "5"]).unwrap().command
         ));
         assert!(!needs_device(&parse(&["status"]).unwrap().command));
+    }
+
+    #[test]
+    fn receiver_reads_use_inventory_references_and_reject_zero_page_index() {
+        let command = parse(&[
+            "routing",
+            "receiver",
+            "--endpoint",
+            "opaque",
+            "--generation",
+            "current",
+            "--first",
+            "257",
+        ])
+        .unwrap();
+        assert!(
+            matches!(&command.command, Cmd::Routing(RoutingCmd::Receiver { first, .. }) if first.get() == 257)
+        );
+        assert!(!needs_device(&command.command));
+        assert_eq!(
+            to_command(&command.command, &DeviceKey("ignored".into())),
+            None
+        );
+        assert!(
+            parse(&[
+                "routing",
+                "receiver",
+                "--endpoint",
+                "opaque",
+                "--generation",
+                "current",
+                "--first",
+                "0"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

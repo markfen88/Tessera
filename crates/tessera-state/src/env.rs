@@ -244,6 +244,41 @@ pub struct Environment {
     /// an `[audio] ring_budget_mib` above it is reported as a warning: the
     /// rings could not all be locked in memory.
     pub memlock_limit_bytes: Option<u64>,
+    /// Cost of the Argon2id hash that stores a device access lock PIN.
+    pub pin_cost: PinCost,
+}
+
+/// Argon2id cost of a stored access-lock PIN (`device-lock.md` §9.1 L4).
+/// The PIN has only 10 000 values, so no cost makes the hash secret: it keeps
+/// the digits out of casual view, the file mode does the protecting. A
+/// stored hash carries its own parameters, so a change affects new locks only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinCost {
+    /// Memory in KiB.
+    pub memory_kib: u32,
+    /// Passes over the memory.
+    pub iterations: u32,
+}
+
+impl PinCost {
+    /// The library's recommended defaults (19 MiB, 2 passes): a few tens of
+    /// milliseconds on the state thread per lock or unlock.
+    pub const DEFAULT: Self = Self {
+        memory_kib: 19 * 1024,
+        iterations: 2,
+    };
+
+    /// The smallest cost the algorithm accepts, for tests.
+    pub const MINIMAL: Self = Self {
+        memory_kib: 8,
+        iterations: 1,
+    };
+}
+
+impl Default for PinCost {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// Default sample rates from `docs/configuration.md`.
@@ -275,6 +310,7 @@ impl Environment {
             // can run them (`tesserad` built with `alsa-bridge`).
             bridges_supported: false,
             memlock_limit_bytes: None,
+            pin_cost: PinCost::DEFAULT,
         }
     }
 
@@ -309,7 +345,7 @@ fn system_hostname() -> String {
         .unwrap_or_else(|| "tessera".to_owned())
 }
 
-/// Check a device name or channel label against the wire rules: non-empty,
+/// Check stored or observed text against the wire safety rules: non-empty,
 /// at most `max_bytes` bytes of UTF-8, no NUL or other control characters
 /// (wire strings are NUL-terminated; `spec/protocol/overview.md`,
 /// `spec/protocol/settings.md`).
@@ -330,6 +366,48 @@ pub fn validate_name(name: &str, max_bytes: usize) -> Result<(), String> {
         return Err(format!(
             "contains the control character U+{:04X}",
             u32::from(c)
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a new interoperable device name. Existing stored names and remote
+/// observations retain the broader [`validate_name`] safety checks; silently
+/// normalizing a name would change subscription identity.
+///
+/// Rules: Audinate's public Controller guide, "Device and Channel Names"
+/// (recorded in ADR 0008's 2026-10-28 naming amendment).
+///
+/// # Errors
+/// A reason suitable for the CLI, API or portal to display.
+pub fn validate_device_name(name: &str, max_bytes: usize) -> Result<(), String> {
+    validate_name(name, max_bytes.min(31))?;
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(
+            "must use only ASCII letters, digits and hyphens; spaces are not allowed".into(),
+        );
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err("must not begin or end with a hyphen".into());
+    }
+    Ok(())
+}
+
+/// Validate a new interoperable RX or TX label. Spaces and mixed case are
+/// allowed; the reserved name separators `=`, `.` and `@` are not.
+/// Uniqueness is checked by the command against the device's effective labels.
+/// See [`validate_device_name`] for the public naming reference.
+///
+/// # Errors
+/// A reason suitable for the CLI, API or portal to display.
+pub fn validate_channel_label(label: &str, max_bytes: usize) -> Result<(), String> {
+    validate_name(label, max_bytes.min(31))?;
+    if !label.is_ascii() {
+        return Err("must use ASCII characters; spaces and mixed case are allowed".into());
+    }
+    if let Some(c) = label.chars().find(|c| matches!(c, '=' | '.' | '@')) {
+        return Err(format!(
+            "must not contain `{c}`; spaces and mixed case are allowed"
         ));
     }
     Ok(())

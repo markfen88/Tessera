@@ -222,12 +222,58 @@ pub struct ServiceInstance {
     pub txt: TxtRecord,
 }
 
+/// One backend source's observation, without merging its TXT or provenance
+/// with another interface. Source identifiers are browser-scoped, not device
+/// identities. A backend that cannot establish an interface reports `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServiceObservation {
+    /// Opaque source within this browser.
+    pub source: String,
+    /// Browser-scoped incarnation of this source's service. Removal and
+    /// identical reappearance change this value; ordinary refreshes do not.
+    /// Zero means lifecycle information was not supplied.
+    pub incarnation: u64,
+    /// Observing interface, when established by the backend.
+    pub interface: Option<String>,
+    /// The service as seen by this source only.
+    pub service: ServiceInstance,
+}
+
+impl ServiceObservation {
+    /// One source view; use None when interface provenance is unavailable.
+    #[must_use]
+    pub fn new(
+        source: impl Into<String>,
+        interface: Option<String>,
+        service: ServiceInstance,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            incarnation: 0,
+            interface,
+            service,
+        }
+    }
+}
+
+/// One established service from authoritative responder state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PublishedService {
+    /// Logical device that owns this advertisement.
+    pub device: String,
+    /// Actual established instance/hostname, including conflict renames.
+    pub service: ServiceInstance,
+}
+
 /// What a [`crate::Browser`] reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowseEvent {
     /// A new instance was found and resolved.
     Appeared(ServiceInstance),
-    /// A known instance changed (TXT, port, host or addresses).
+    /// A known instance or one of its source views changed. The merged
+    /// payload may be unchanged; use Browser::observations for source detail.
     Updated(ServiceInstance),
     /// An instance went away (goodbye or TTL expiry).
     Disappeared(ServiceId),

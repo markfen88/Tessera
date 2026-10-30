@@ -296,6 +296,7 @@ struct Build<'a> {
     version: String,
     epoch: String,
     upstream: String,
+    runtime_build_id: String,
 }
 
 pub(crate) fn build(root: &Path, print_version: bool) -> Result<()> {
@@ -360,6 +361,7 @@ pub(crate) fn build(root: &Path, print_version: bool) -> Result<()> {
         version,
         epoch,
         upstream,
+        runtime_build_id: crate::runtime_build::source_id(root)?,
     };
     build.binaries()?;
     build.packages()
@@ -370,6 +372,7 @@ impl Build<'_> {
         let mut command = Command::new("cargo");
         command
             .current_dir(self.root)
+            .env("TESSERA_RUNTIME_BUILD_ID", &self.runtime_build_id)
             .env("SOURCE_DATE_EPOCH", &self.epoch);
         let sysroot = text(Command::new("rustc").args(["--print", "sysroot"]))?;
         let cargo_home = env_or("CARGO_HOME", &format!("{}/.cargo", env_or("HOME", "")));

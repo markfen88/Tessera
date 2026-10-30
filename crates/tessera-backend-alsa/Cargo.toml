@@ -1,7 +1,4 @@
 [package]
-autotests = false
-autoexamples = false
-autobenches = false
 name = "tessera-backend-alsa"
 description = "ALSA backend: the pcm.tessera PCM plugin and the in-daemon hardware-card bridge with drift compensation"
 version.workspace = true
@@ -10,6 +7,9 @@ edition.workspace = true
 rust-version = "1.87"
 license.workspace = true
 repository.workspace = true
+autotests = false
+autoexamples = false
+autobenches = false
 
 [lib]
 # `cdylib`: the ALSA plugin (installed as libasound_module_pcm_tessera.so).
@@ -31,11 +31,11 @@ plugin = []
 bridge = ["dep:alsa", "dep:tessera-media", "dep:tessera-resample", "dep:rtrb"]
 
 [dependencies]
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.3.0" }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.5.0" }
 libc = "0.2"
 nix = { version = "0.31", default-features = false, features = ["socket", "poll", "fs", "user"] }
-tessera-media = { path = "../tessera-media", version = "0.3.0", optional = true }
-tessera-resample = { path = "../tessera-resample", version = "0.3.0", optional = true }
+tessera-media = { path = "../tessera-media", version = "0.5.0", optional = true }
+tessera-resample = { path = "../tessera-resample", version = "0.5.0", optional = true }
 alsa = { version = "0.12", optional = true }
 rtrb = { version = "0.4", optional = true }
 

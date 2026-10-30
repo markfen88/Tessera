@@ -58,6 +58,8 @@ use core::num::NonZeroU16;
 use serde::{Deserialize, Serialize};
 
 mod impact;
+mod routing;
+pub use routing::*;
 
 pub use impact::{
     Impact, ImpactToken, Limits, RemovedSubscription, RestartImpact, RestartScope, RingMemory,
@@ -65,6 +67,25 @@ pub use impact::{
 
 /// Version of the request/response envelope (ADR 0008).
 pub const WIRE_VERSION: u32 = 1;
+
+/// Display version shared by the daemon, CLI and portal. Development builds
+/// may set `TESSERA_BUILD_VERSION` at compile time to identify their snapshot.
+/// This does not change the control envelope or crate dependency versions.
+pub const BUILD_VERSION: &str = match option_env!("TESSERA_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+/// Own-source snapshot identity for the guarded runtime integration. Packaging
+/// sets this from `cargo xtask runtime-build-id`; an ordinary semver/display
+/// version is insufficient to qualify a mixed installation. It is not evidence
+/// about the compatibility runtime or its protocol behavior.
+pub const RUNTIME_BUILD_ID: Option<&str> = option_env!("TESSERA_RUNTIME_BUILD_ID");
+
+/// Marker in our own executables that implement the side-effect-free build
+/// probe. Older launchers must be refused before executing an unknown flag.
+#[doc(hidden)]
+pub const RUNTIME_BUILD_PROBE_MARKER: &str = "tessera-runtime-build-probe-v1-20261029";
 
 /// Operator-chosen key of a logical device (`[[device]] id` in config).
 /// Not the device ID on the wire.
@@ -105,6 +126,42 @@ pub struct Encoding(pub u8);
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct LatencyUs(pub u32);
 
+/// The PIN of the device access lock ([`Command::LockAccess`]): exactly
+/// four ASCII digits on the vendor's controllers (`device-lock.md` §6.2);
+/// the daemon checks the form. Its `Debug` never shows the digits, and the
+/// daemon keeps only a salted slow hash of it: no reply, event, status or log
+/// line carries it. Build it with [`AccessPin::new`].
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+pub struct AccessPin(String);
+
+impl AccessPin {
+    /// A PIN as typed; [`is_well_formed`](Self::is_well_formed) says whether
+    /// the daemon will take it.
+    #[must_use]
+    pub fn new(pin: impl Into<String>) -> Self {
+        Self(pin.into())
+    }
+
+    /// The digits, for hashing and checking. Never print them.
+    #[must_use]
+    pub fn reveal(&self) -> &str {
+        &self.0
+    }
+
+    /// Exactly four ASCII digits `0`-`9`.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        self.0.len() == 4 && self.0.bytes().all(|b| b.is_ascii_digit())
+    }
+}
+
+impl fmt::Debug for AccessPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccessPin(<redacted>)")
+    }
+}
+
 /// Who issued a command. Recorded with every resulting event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
@@ -140,6 +197,11 @@ pub enum ClockRole {
     Auto,
 }
 
+/// A clock priority below this value marks the device as a preferred leader.
+/// A follower-only device (role [`ClockRole::Follower`]) is never preferred:
+/// the state refuses either combination.
+pub const PREFERRED_LEADER_BELOW: u8 = 64;
+
 /// A controller-managed media flow (ADR 0015). The state actor applies the
 /// same validation as `[[flow]]` configuration, including IPv4 addresses,
 /// channel bounds, packet settings and uniqueness across all flow sources.
@@ -155,6 +217,8 @@ pub struct FlowSpec {
     /// Logical device key.
     pub device: DeviceKey,
     /// Device channels in wire order; empty means all in this direction.
+    /// In an RX flow on a multicast group, 0 marks an unused wire position;
+    /// in a TX flow, a position sent as silence.
     #[cfg_attr(feature = "serde", serde(default))]
     pub channels: Vec<u16>,
     /// Destination (TX) or permitted sender (RX), as an IPv4 address.
@@ -171,7 +235,8 @@ pub struct FlowSpec {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub interface: Option<String>,
-    /// Local IPv4 bind address override.
+    /// Local IPv4 bind address override. For RX, a multicast group address
+    /// binds and joins that group on the flow's interface.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -265,6 +330,26 @@ impl FlowSpec {
 )]
 #[non_exhaustive]
 pub enum Command {
+    /// Execute one observed receiver change through daemon-owned control.
+    /// This is distinct from the legacy saved-intent commands.
+    RouteReceiver {
+        expectation: ReceiverExpectation,
+        change: ReceiverChange,
+    },
+    /// Accept a freshly inspected baseline without sending a receiver mutation.
+    ReconcileReceiverOperation {
+        review: ReceiverExpectation,
+    },
+    /// Return reviewed retired-runtime occurrences to current runtime management.
+    /// Changes no carrier bytes and sends no receiver mutation.
+    ReleaseRuntimeCarriers {
+        review: ReceiverExpectation,
+    },
+    /// Authorize one subsequent runtime start to replace reviewed carriers.
+    /// This grants new authority; it does not establish historical provenance.
+    GrantRuntimeCarriersToNextRun {
+        review: ReceiverExpectation,
+    },
     /// Atomically replace all controller-originated flows, retaining host
     /// configuration flows. Empty clears the controller set and prevents
     /// legacy-file fallback. A host's `[control] locked = ["flows"]` refuses
@@ -343,12 +428,63 @@ pub enum Command {
         #[cfg_attr(feature = "serde", serde(default))]
         dry_run: bool,
     },
+    /// Factory reset or clear configuration of a device
+    /// (`device-settings.md` §6): every value set at run time for it goes
+    /// back to the host configuration: name, channel labels, subscriptions,
+    /// sample rate, encoding, latency, the clock role and priority (preferred
+    /// leader), its controller flows (manual multicast flows included) and,
+    /// unless `keep_network`, the primary interface selection. Its identity
+    /// and channel counts stay. Refused unless the host enables it (`[control]
+    /// allow_factory_reset`), because it removes routes on a live system.
+    ClearConfiguration {
+        device: DeviceKey,
+        /// Keep the network settings (clear configuration "preserve
+        /// network").
+        #[cfg_attr(feature = "serde", serde(default))]
+        keep_network: bool,
+    },
+    /// Lock the device against changes with a four-digit PIN (the device
+    /// access lock, `device-lock.md` §9). Until it is unlocked, every
+    /// command that would change the device's configuration, settings,
+    /// routing intent or carriers is refused with
+    /// [`CommandError::AccessLocked`], whoever sends it, and so are the
+    /// host-wide clock and primary-interface settings; reads, configuration
+    /// reloads and the media already flowing continue. `pin` must be four
+    /// digits `0`-`9` (`Invalid` otherwise). Locking a locked device is
+    /// refused (`AccessLocked`): to change the PIN, unlock and lock again.
+    /// Unrelated to the configuration's `locked` lists
+    /// ([`CommandError::Locked`]).
+    LockAccess {
+        device: DeviceKey,
+        pin: AccessPin,
+    },
+    /// Remove the device access lock with the PIN it was locked with. A
+    /// wrong PIN is refused with [`CommandError::IncorrectPin`] and changes
+    /// nothing; after five wrong PINs for one device, unlocking it from the
+    /// same kind of origin (command line, API, network) is refused with
+    /// `RateLimited` for 60 s. `Invalid` when the device is not locked.
+    UnlockAccess {
+        device: DeviceKey,
+        pin: AccessPin,
+    },
+    /// Remove the device access lock without the PIN (recovery after a
+    /// forgotten PIN). Accepted only from a local administrator on the
+    /// control socket (root or the daemon's admin group); the portal and
+    /// network controllers get `PermissionDenied`. A device that is not
+    /// locked is left as it is.
+    ResetAccessLock {
+        device: DeviceKey,
+    },
 }
 
 impl Command {
     /// Every value [`kind`](Self::kind) can return. Tests use it to make sure
     /// every command is covered by permission and logging tables.
     pub const KINDS: &'static [&'static str] = &[
+        "route_receiver",
+        "reconcile_receiver_operation",
+        "release_runtime_carriers",
+        "grant_runtime_carriers_to_next_run",
         "set_protocol_flows",
         "set_device_name",
         "set_channel_label",
@@ -362,6 +498,10 @@ impl Command {
         "set_primary_interface",
         "reload_config",
         "set_device_channels",
+        "clear_configuration",
+        "lock_access",
+        "unlock_access",
+        "reset_access_lock",
     ];
 
     /// The command's name without its arguments: safe to log (the arguments
@@ -372,6 +512,10 @@ impl Command {
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::RouteReceiver { .. } => "route_receiver",
+            Self::ReconcileReceiverOperation { .. } => "reconcile_receiver_operation",
+            Self::ReleaseRuntimeCarriers { .. } => "release_runtime_carriers",
+            Self::GrantRuntimeCarriersToNextRun { .. } => "grant_runtime_carriers_to_next_run",
             Self::SetProtocolFlows { .. } => "set_protocol_flows",
             Self::SetDeviceName { .. } => "set_device_name",
             Self::SetChannelLabel { .. } => "set_channel_label",
@@ -385,6 +529,10 @@ impl Command {
             Self::SetPrimaryInterface { .. } => "set_primary_interface",
             Self::ReloadConfig => "reload_config",
             Self::SetDeviceChannels { .. } => "set_device_channels",
+            Self::ClearConfiguration { .. } => "clear_configuration",
+            Self::LockAccess { .. } => "lock_access",
+            Self::UnlockAccess { .. } => "unlock_access",
+            Self::ResetAccessLock { .. } => "reset_access_lock",
         }
     }
 }
@@ -398,6 +546,18 @@ impl Command {
 )]
 #[non_exhaustive]
 pub enum Query {
+    /// Paged local and discovered endpoint inventory (provisional 0.x).
+    RoutingDevices(RoutingDevicesQuery),
+    /// Paged channels for a current endpoint (provisional 0.x).
+    RoutingChannels(RoutingChannelsQuery),
+    /// One on-demand receiver-name page; no mutation or saved intent change.
+    RoutingReceiver(RoutingReceiverQuery),
+    /// Complete local receiver review, available while execution is fenced.
+    InspectReceiverOperation {
+        operation: Option<ReceiverExpectation>,
+    },
+    /// Administrator review of persisted carrier provenance, without writes.
+    InspectRuntimeCarriers,
     Status,
     Device {
         device: DeviceKey,
@@ -421,6 +581,14 @@ pub enum Query {
 )]
 #[non_exhaustive]
 pub enum CommandError {
+    /// Refresh inventory and choose again; no label-based rebinding.
+    RoutingSnapshotExpired,
+    /// The receiver read deadline expired; endpoint inventory need not be stale.
+    ReceiverReadTimeout,
+    /// Transport or reply decoding failed; no receiver selection is inferred.
+    ReceiverReadUnavailable {
+        reason: String,
+    },
     Invalid {
         field: String,
         reason: String,
@@ -456,7 +624,7 @@ pub enum CommandError {
     /// `key` names the setting that sets the limit
     /// (`"control.max_frame_bytes"`).
     ResponseTooLarge {
-        /// Size of the reply that was not sent, bytes.
+        /// Known size or lower bound for the rejected reply, bytes.
         size: u64,
         /// The limit, bytes.
         limit: u64,
@@ -470,6 +638,15 @@ pub enum CommandError {
         /// What applying the command would do.
         impact: Box<Impact>,
     },
+    /// The device access lock ([`Command::LockAccess`]) of `device` refuses
+    /// this change. Nothing changed. Not [`CommandError::Locked`], which is a
+    /// value pinned by the configuration.
+    AccessLocked {
+        device: DeviceKey,
+    },
+    /// [`Command::UnlockAccess`] with a PIN that does not match. Nothing
+    /// changed.
+    IncorrectPin,
 }
 
 impl CommandError {
@@ -495,6 +672,15 @@ impl CommandError {
 impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RoutingSnapshotExpired => {
+                f.write_str("routing inventory changed; refresh and choose again")
+            }
+            Self::ReceiverReadTimeout => {
+                f.write_str("receiver did not answer in time; no retry was sent")
+            }
+            Self::ReceiverReadUnavailable { reason } => {
+                write!(f, "receiver read unavailable: {reason}")
+            }
             Self::Invalid { field, reason } => write!(f, "invalid {field}: {reason}"),
             Self::Locked { field, by: None } => {
                 write!(f, "{field} is locked by the configuration")
@@ -510,11 +696,17 @@ impl fmt::Display for CommandError {
             Self::Internal { message } => write!(f, "internal error: {message}"),
             Self::ResponseTooLarge { size, limit, key } => write!(
                 f,
-                "response of {size} bytes exceeds the daemon's limit of {limit} bytes ({key})"
+                "response requires at least {size} bytes, exceeding the daemon's limit of {limit} bytes ({key})"
             ),
             Self::ConfirmationRequired { impact } => {
                 write!(f, "confirmation required: {}", impact.restart.reason)
             }
+            Self::AccessLocked { device } => write!(
+                f,
+                "device `{}` is locked against changes (device access lock); unlock it first",
+                device.0
+            ),
+            Self::IncorrectPin => f.write_str("incorrect PIN"),
         }
     }
 }
@@ -714,6 +906,13 @@ impl SubscriptionStatus {
 pub struct ChannelStatus {
     pub channel: Channel,
     pub label: String,
+    /// Independent intent, carrier and media evidence for a local input.
+    /// None for TX or a daemon that predates this read model.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub routing: Option<ReceiverRoute>,
 }
 
 impl ChannelStatus {
@@ -723,6 +922,7 @@ impl ChannelStatus {
         Self {
             channel,
             label: label.into(),
+            routing: None,
         }
     }
 }
@@ -741,6 +941,109 @@ pub struct DeviceStatus {
     pub subscriptions: Vec<SubscriptionStatus>,
     /// Config keys pinned by `locked`.
     pub locked: Vec<String>,
+    /// Host-wide routing locks, separate from device configuration locks.
+    /// None means the daemon does not report them.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub routing_locks: Option<Vec<String>>,
+    /// The sample rates and encodings the device can be set to now, and why
+    /// not, when nothing but the current value is accepted. None means the
+    /// daemon does not report them. Boxed: the status travels inside
+    /// request and reply enums.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub formats: Option<Box<FormatOptions>>,
+    /// The device access lock is set ([`Command::LockAccess`]): changes are
+    /// refused until it is unlocked. Not the configuration's `locked` keys.
+    /// Absent in JSON when false (and from daemons that predate it).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "core::ops::Not::not")
+    )]
+    pub access_locked: bool,
+}
+
+/// What a device's sample rate and encoding can be set to now: exactly the
+/// values `SetSampleRate` and `SetEncoding` would accept, the current value
+/// always included, ascending. A network controller is offered the same
+/// lists (`device-settings.md` §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct FormatOptions {
+    /// Sample rates in Hz.
+    pub sample_rates: Vec<u32>,
+    /// Why no rate but the current one is accepted; None when another is.
+    pub sample_rate_pin: Option<SettingPin>,
+    /// Encodings in bits per sample.
+    pub encodings: Vec<u8>,
+    /// Why no encoding but the current one is accepted; None when another
+    /// is.
+    pub encoding_pin: Option<SettingPin>,
+}
+
+impl FormatOptions {
+    /// The options, with no pin; set one with the `with_*` methods.
+    #[must_use]
+    pub fn new(sample_rates: Vec<u32>, encodings: Vec<u8>) -> Self {
+        Self {
+            sample_rates,
+            sample_rate_pin: None,
+            encodings,
+            encoding_pin: None,
+        }
+    }
+
+    /// Set why the sample rate cannot change.
+    #[must_use]
+    pub fn with_sample_rate_pin(mut self, pin: Option<SettingPin>) -> Self {
+        self.sample_rate_pin = pin;
+        self
+    }
+
+    /// Set why the encoding cannot change.
+    #[must_use]
+    pub fn with_encoding_pin(mut self, pin: Option<SettingPin>) -> Self {
+        self.encoding_pin = pin;
+        self
+    }
+}
+
+/// Why a device setting accepts no value but its current one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "snake_case")
+)]
+#[non_exhaustive]
+pub enum SettingPin {
+    /// Listed in the device's `locked` configuration.
+    Configuration,
+    /// An enabled hardware bridge runs its card at this rate (`sample_rate`
+    /// in the bridge's configuration).
+    Bridge { name: String, sample_rate: u32 },
+    /// The daemon supports no other value.
+    Unsupported,
+}
+
+impl fmt::Display for SettingPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration => {
+                f.write_str("locked by the configuration (`locked` of the device)")
+            }
+            Self::Bridge { name, sample_rate } => write!(
+                f,
+                "bridge `{name}` runs its card at {sample_rate} Hz (`sample_rate` in its configuration)"
+            ),
+            Self::Unsupported => f.write_str("no other value is supported"),
+        }
+    }
 }
 
 impl DeviceStatus {
@@ -764,7 +1067,17 @@ impl DeviceStatus {
             tx_channels: Vec::new(),
             subscriptions: Vec::new(),
             locked: Vec::new(),
+            routing_locks: None,
+            formats: None,
+            access_locked: false,
         }
+    }
+
+    /// Set the sample rates and encodings the device can be set to.
+    #[must_use]
+    pub fn with_formats(mut self, formats: FormatOptions) -> Self {
+        self.formats = Some(Box::new(formats));
+        self
     }
 
     /// Set the RX channels.
@@ -792,6 +1105,13 @@ impl DeviceStatus {
     #[must_use]
     pub fn with_locked(mut self, locked: Vec<String>) -> Self {
         self.locked = locked;
+        self
+    }
+
+    /// Set whether the device access lock is set.
+    #[must_use]
+    pub fn with_access_locked(mut self, access_locked: bool) -> Self {
+        self.access_locked = access_locked;
         self
     }
 }
@@ -1557,6 +1877,10 @@ impl Metrics {
 )]
 #[non_exhaustive]
 pub enum Event {
+    /// Progress of a daemon-owned receiver command; no audio assertion.
+    ReceiverOperationChanged {
+        result: ReceiverOperationResult,
+    },
     /// Origin-bearing companion to the legacy `ConfigReloaded` event.
     /// Reload changes always carry `Origin::Config` (ADR 0008).
     ConfigReloadedWithOrigin {
@@ -1651,6 +1975,13 @@ pub enum Event {
         tx_channels: u16,
         origin: Origin,
     },
+    /// The device access lock was set (`locked: true`) or removed (unlock or
+    /// reset). Committed to disk before it is published. Carries no PIN.
+    AccessLockChanged {
+        device: DeviceKey,
+        locked: bool,
+        origin: Origin,
+    },
 }
 
 /// Body of a request on the local control socket.
@@ -1662,6 +1993,26 @@ pub enum Event {
 )]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// Routing-only delegation. Accepted only from the trusted local portal
+    /// account (or root) with admin rights. `principal` grants no rights by itself.
+    RoutingPeer {
+        principal: String,
+        request: RoutingPeerRequest,
+    },
+    /// Private compatibility launcher handshake. Kernel process/unit evidence,
+    /// never these fields, establishes the sender's role. The daemon compares
+    /// the launch inputs with current authority state before registering a run.
+    RuntimeStart {
+        device: DeviceStatus,
+        network: NetworkStatus,
+        wire_device_id: String,
+    },
+    /// A COMPLETE compatibility-runtime report, including empty startup reports.
+    /// This has no intentional whole-set setter authority. Only an associated,
+    /// live report adapter can use the guarded report transition.
+    RuntimeReport {
+        flows: Vec<FlowSpec>,
+    },
     /// A trusted local compatibility adapter forwarding a protocol command.
     /// Requires the same admin rights as other mutations. Only
     /// `SetProtocolFlows` is accepted; it runs as `Origin::Protocol` so the
@@ -1725,6 +2076,18 @@ pub struct Request {
 )]
 #[non_exhaustive]
 pub enum Reply {
+    /// An accounted receiver operation, independent of saved intent and audio.
+    ReceiverOperation(ReceiverOperationResult),
+    /// Complete observations and a principal-bound, single-use review token.
+    ReceiverRecovery(ReceiverRecoveryInspection),
+    /// Current runtime and stored carrier occurrences eligible for review.
+    RuntimeCarrierRecovery(RuntimeCarrierRecoveryInspection),
+    /// A byte-bounded endpoint inventory page.
+    RoutingDevices(RoutingDevicePage),
+    /// A byte-bounded channel inventory page.
+    RoutingChannels(RoutingChannelPage),
+    /// One receiver-reported selection page, without an audio claim.
+    RoutingReceiver(RoutingReceiverPage),
     Done,
     Status(Status),
     Device(DeviceStatus),
@@ -2122,6 +2485,21 @@ mod kind_tests {
     #[test]
     fn kind_is_the_serde_variant_name() {
         let samples = [
+            Command::RouteReceiver {
+                expectation: ReceiverExpectation("boot-observation".into()),
+                change: ReceiverChange::Disconnect {
+                    previous: ReceiverSelection::new("source", "1"),
+                },
+            },
+            Command::ReconcileReceiverOperation {
+                review: ReceiverExpectation("boot-review".into()),
+            },
+            Command::ReleaseRuntimeCarriers {
+                review: ReceiverExpectation("boot-carrier-review".into()),
+            },
+            Command::GrantRuntimeCarriersToNextRun {
+                review: ReceiverExpectation("boot-next-run-review".into()),
+            },
             Command::SetProtocolFlows { flows: Vec::new() },
             Command::SetDeviceName {
                 device: DeviceKey("d".into()),
@@ -2168,6 +2546,21 @@ mod kind_tests {
                 rx: 4,
                 tx: 0,
                 dry_run: false,
+            },
+            Command::ClearConfiguration {
+                device: DeviceKey("d".into()),
+                keep_network: true,
+            },
+            Command::LockAccess {
+                device: DeviceKey("d".into()),
+                pin: AccessPin::new("1234"),
+            },
+            Command::UnlockAccess {
+                device: DeviceKey("d".into()),
+                pin: AccessPin::new("1234"),
+            },
+            Command::ResetAccessLock {
+                device: DeviceKey("d".into()),
             },
         ];
         let mut seen: Vec<&str> = Vec::new();
@@ -2319,7 +2712,7 @@ mod config_api_tests {
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), resp);
         assert_eq!(
             resp.result.unwrap_err().to_string(),
-            "response of 2000000 bytes exceeds the daemon's limit of 1048576 bytes (control.max_frame_bytes)"
+            "response requires at least 2000000 bytes, exceeding the daemon's limit of 1048576 bytes (control.max_frame_bytes)"
         );
     }
 
@@ -2580,5 +2973,92 @@ mod host_mode_tests {
             serde_json::to_string(&empty).unwrap(),
             r#"{"set_protocol_flows":{"flows":[]}}"#
         );
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod access_lock_tests {
+    use super::*;
+    use alloc::format;
+    use alloc::string::ToString;
+
+    #[test]
+    fn the_pin_travels_as_a_plain_string_but_never_prints() {
+        let lock = Command::LockAccess {
+            device: DeviceKey("main".into()),
+            pin: AccessPin::new("0429"),
+        };
+        let json = serde_json::to_string(&lock).unwrap();
+        assert_eq!(json, r#"{"lock_access":{"device":"main","pin":"0429"}}"#);
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), lock);
+        let debug = format!("{lock:?}");
+        assert!(!debug.contains("0429"), "{debug}");
+        assert!(debug.contains("redacted"), "{debug}");
+        assert_eq!(
+            serde_json::to_string(&Command::ResetAccessLock {
+                device: DeviceKey("main".into())
+            })
+            .unwrap(),
+            r#"{"reset_access_lock":{"device":"main"}}"#
+        );
+    }
+
+    #[test]
+    fn only_four_ascii_digits_are_a_pin() {
+        for good in ["0000", "1234", "9999"] {
+            assert!(AccessPin::new(good).is_well_formed(), "{good}");
+        }
+        for bad in ["", "123", "12345", "12a4", " 123", "١٢٣٤", "12 4"] {
+            assert!(!AccessPin::new(bad).is_well_formed(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn access_errors_and_events_have_stable_shapes() {
+        let e = CommandError::AccessLocked {
+            device: DeviceKey("main".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"access_locked":{"device":"main"}}"#
+        );
+        assert!(e.to_string().contains("locked against changes"));
+        assert_eq!(
+            serde_json::to_string(&CommandError::IncorrectPin).unwrap(),
+            r#""incorrect_pin""#
+        );
+        let ev = Event::AccessLockChanged {
+            device: DeviceKey("main".into()),
+            locked: true,
+            origin: Origin::Cli { uid: 0 },
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            json,
+            r#"{"access_lock_changed":{"device":"main","locked":true,"origin":{"cli":{"uid":0}}}}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn the_access_flag_is_omitted_when_clear_and_defaults_when_absent() {
+        let d = DeviceStatus::new(
+            DeviceKey("main".into()),
+            "n",
+            SampleRate(48_000),
+            Encoding(24),
+            LatencyUs(1),
+        );
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("access_locked"), "{json}");
+        assert!(
+            !serde_json::from_str::<DeviceStatus>(&json)
+                .unwrap()
+                .access_locked
+        );
+        let locked = d.with_access_locked(true);
+        let json = serde_json::to_string(&locked).unwrap();
+        assert!(json.contains(r#""access_locked":true"#), "{json}");
+        assert_eq!(serde_json::from_str::<DeviceStatus>(&json).unwrap(), locked);
     }
 }

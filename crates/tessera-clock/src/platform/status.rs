@@ -67,6 +67,10 @@ pub struct SharedStatus {
     pub local_stratum: AtomicU64,
     /// Advertised preferred flag (0/1).
     pub local_preferred: AtomicU64,
+    /// While leading: the grandmaster uuid (MAC as a big-endian number) of a
+    /// foreign clock that advertises itself as preferred
+    /// ([`Port::preferred_rival`]); 0 = none.
+    pub preferred_rival: AtomicU64,
     /// Publish-guard hold time, ns (0 = guard off).
     pub publish_guard_hold_ns: AtomicU64,
     /// Loop iterations (liveness).
@@ -137,9 +141,15 @@ impl SharedStatus {
             },
             r,
         );
-        self.local_stratum.store(u64::from(cfg.local.stratum), r);
-        self.local_preferred
-            .store(u64::from(cfg.local.preferred), r);
+        let local = port.advertised_local();
+        self.local_stratum.store(u64::from(local.stratum), r);
+        self.local_preferred.store(u64::from(local.preferred), r);
+        self.preferred_rival.store(
+            port.preferred_rival().map_or(0, |u| {
+                u.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+            }),
+            r,
+        );
         self.publish_guard_hold_ns
             .store(cfg.publish_guard_hold_ns, r);
         self.epoch.store(epoch, r);

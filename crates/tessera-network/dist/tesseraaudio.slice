@@ -2,4 +2,3 @@
 Description=tessera audio network isolation
 
 [Slice]
-CPUAccounting=yes

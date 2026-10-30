@@ -54,8 +54,9 @@ pub struct SyncBody {
     pub gm_preferred: bool,
     /// grandmasterIsBoundaryClock (79).
     pub gm_is_boundary_clock: bool,
-    /// syncInterval (83), log2 seconds. Delay_Req from the reference carries
-    /// 0x7F (`guess`).
+    /// syncInterval (83), log2 seconds; written with byte 82 as its sign
+    /// extension (`00 00 FF FE` for -2, spec:5.4 item 3). Our Delay_Req
+    /// copies the parent's value (spec:5.4 item 4).
     pub sync_interval: i8,
     /// localClockVariance (86).
     pub local_clock_variance: i16,
@@ -162,7 +163,10 @@ impl SyncBody {
         w.u8(flag(self.gm_preferred))?;
         w.zeros(1)?;
         w.u8(flag(self.gm_is_boundary_clock))?;
-        w.zeros(3)?;
+        // Bytes 80-82: zero, then the sign extension of byte 83, so -2 is
+        // `00 00 FF FE` as every real sender writes it (spec:5.4 item 3).
+        w.zeros(2)?;
+        w.u8(if self.sync_interval < 0 { 0xFF } else { 0 })?;
         w.i8(self.sync_interval)?;
         w.zeros(2)?;
         w.i16(self.local_clock_variance)?;

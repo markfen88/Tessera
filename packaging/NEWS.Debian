@@ -1,3 +1,51 @@
+tessera (0.5.0-1) unstable; urgency=medium
+
+  A running tesserad is not restarted by the upgrade: restart it when an
+  audio interruption is acceptable. Upgrade tessera, tessera-alsa,
+  tessera-web and tessera-dsp together (and tessera-pw if installed).
+
+  The daemon can serve the device role itself (the native device role,
+  opt-in). Nothing switches on upgrade: tessera-controller@main stays
+  enabled, and a disabled one stays disabled. To switch a host, stop and
+  disable tessera-controller@main (both bind the same ports), then add a
+  tesserad.service drop-in with Environment=TESSERA_NATIVE_DEVICE=true and
+  Environment=TESSERA_NATIVE_VENDOR=<the --vendor value of
+  /usr/lib/tessera/controller.args>, run systemctl daemon-reload and
+  restart tesserad. Steps and the way back: docs/interoperability.md,
+  "Native device role".
+
+  PTPv1 changes take effect on every host when tesserad restarts: a
+  leader-capable port advertises stratum 0x2A to 0x2D instead of 4, Sync is
+  sent every 250 ms instead of every second, and general messages use DSCP
+  46 (EF) instead of 8; review switch QoS rules that matched the old value.
+  Clock role follower and Preferred Leader (priority below 64) now exclude
+  each other; a stored or configured combination is corrected at start
+  with a warning (the follower role wins).
+
+  New: the portal's Routing page and tesseractl routing; the device access
+  lock (tesseractl access, the portal's Lock and Unlock; a vendor controller
+  sees it but cannot set it); [control] allow_factory_reset, default false,
+  which keeps factory reset and clear configuration refused.
+
+  The deprecated 90-probe-flows.toml fallback is still read; its removal
+  remains deferred.
+
+ -- tessera maintainers <tessera@invalid>  Fri, 30 Oct 2026 00:00:00 +0000
+
+tessera (0.4.1-1) unstable; urgency=medium
+
+  This is a development checkpoint. The Device page can browse sources and
+  edit saved subscription intent; it does not establish or remove audio flows.
+  Browser Connect/Replace/Disconnect and selected-source audio/continuity
+  acceptance remain unfinished. Private routing diagnostics are disabled by
+  default; no native routing dispatcher is enabled.
+
+  Network device browsing is opt-in (discovery.browse_devices = true).
+  The deprecated 90-probe-flows.toml fallback is retained in this version;
+  its previously announced 0.4.0 removal is deferred.
+
+ -- tessera maintainers <tessera@invalid>  Tue, 27 Oct 2026 00:00:00 +0000
+
 tessera (0.3.0-1) unstable; urgency=medium
 
   Upgrading from 0.2.2 or 0.2.1. A running tesserad is not restarted by the

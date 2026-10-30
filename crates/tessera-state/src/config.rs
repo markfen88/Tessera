@@ -181,6 +181,8 @@ string_enum! {
     ControlLock {
         /// Configuration owns flows; controller flow commands are refused.
         Flows = "flows",
+        /// Refuse runtime subscription intent changes from every controller.
+        Subscriptions = "subscriptions",
     }
 }
 
@@ -293,6 +295,14 @@ impl Default for DaemonConfig {
 pub struct ControlConfig {
     /// Runtime domains owned by the host configuration.
     pub locked: BTreeSet<ControlLock>,
+    /// Native source wire identities explicitly qualified by the operator for
+    /// receiver execution. Qualification includes report protection on that
+    /// source host. Empty disables this initial native operation class.
+    pub routing_sources: Vec<String>,
+    /// Accept `ClearConfiguration` (a controller's factory reset or clear
+    /// configuration, `device-settings.md` §6). Off by default: it removes
+    /// routes on a live system.
+    pub allow_factory_reset: bool,
     /// Largest request or response frame, bytes.
     pub max_frame_bytes: u64,
     /// Most simultaneous control connections.
@@ -336,6 +346,8 @@ impl Default for ControlConfig {
     fn default() -> Self {
         Self {
             locked: BTreeSet::new(),
+            routing_sources: Vec::new(),
+            allow_factory_reset: false,
             max_frame_bytes: 1 << 20,
             max_connections: 256,
             max_connections_per_uid: 16,
@@ -638,6 +650,8 @@ pub struct DiscoveryConfig {
     /// Advertise the logical devices (ARC, CMC and channel records) with
     /// mDNS. Enabled by default with the packaged Controller runtime.
     pub advertise_devices: bool,
+    /// Browse the existing permitted interfaces for the read-only catalogue.
+    pub browse_devices: bool,
     /// Discovery at all; `false` advertises nothing whatever
     /// `advertise_devices` says (`--no-discovery`).
     pub enabled: bool,
@@ -649,6 +663,7 @@ impl Default for DiscoveryConfig {
             enabled: true,
             mdns: MdnsMode::Auto,
             advertise_devices: true,
+            browse_devices: false,
         }
     }
 }
@@ -944,7 +959,9 @@ pub struct FlowConfig {
     /// The `device.id` the flow belongs to.
     pub device: String,
     /// Device channels (1-based) carried, in wire order. Empty means every
-    /// channel of the device in that direction.
+    /// channel of the device in that direction. In an rx flow on a multicast
+    /// group, 0 marks a wire position that no device channel takes; in a tx
+    /// flow, a position sent as silence (at least one entry must not be 0).
     pub channels: Vec<u16>,
     /// `tx`: the destination address (required; may be multicast). `rx`:
     /// accept packets only from this address (optional).
@@ -956,6 +973,7 @@ pub struct FlowConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
     /// Local IPv4 address to bind (default: the interface's first address).
+    /// `rx`: a multicast group is bound and joined on the interface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_address: Option<Ipv4Addr>,
     /// Packet format.
@@ -969,8 +987,8 @@ pub struct FlowConfig {
     pub send_offset_us: u32,
     /// `rx`: accept datagrams from any source address. Off by default: an rx
     /// flow accepts only the sender named in `peer`, so that another host on
-    /// the segment cannot inject audio. (Receive from a multicast group is
-    /// not supported yet.)
+    /// the segment cannot inject audio. (A multicast group is received by
+    /// binding it as `local_address`.)
     pub any_source: bool,
     /// `tx`: DSCP of the media packets (default 46, EF, `docs/lab.md`).
     pub dscp: u8,
@@ -1481,6 +1499,12 @@ pub(crate) fn extract(table: Table, env: &Environment) -> (Config, Vec<Issue>) {
             if let Some(v) = r.enum_list("locked", ControlLock::parse, &ControlLock::names()) {
                 c.locked = v.into_iter().collect();
             }
+            if let Some(v) = r.string_list("routing_sources") {
+                c.routing_sources = v;
+            }
+            if let Some(v) = r.boolean("allow_factory_reset") {
+                c.allow_factory_reset = v;
+            }
             if let Some(v) = r.u64("max_frame_bytes") {
                 c.max_frame_bytes = v;
             }
@@ -1657,6 +1681,9 @@ pub(crate) fn extract(table: Table, env: &Environment) -> (Config, Vec<Issue>) {
             }
             if let Some(v) = r.boolean("advertise_devices") {
                 d.advertise_devices = v;
+            }
+            if let Some(v) = r.boolean("browse_devices") {
+                d.browse_devices = v;
             }
             if let Some(v) = r.boolean("enabled") {
                 d.enabled = v;

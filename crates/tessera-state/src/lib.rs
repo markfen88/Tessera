@@ -130,7 +130,16 @@
 //!   `SetDeviceChannels` or by a reload of a running device until
 //!   `tesserad` has a test for a device restarted into that shape
 //!   (CFG-ZERO); starting the daemon with 0 is allowed.
+//! * **Device access lock** (`device-lock.md` §9): `LockAccess` freezes a
+//!   device's configuration and routing intent behind a four-digit PIN. The
+//!   state lives in `access-lock.toml` beside `state.toml` (mode 0600, an
+//!   Argon2id hash per locked device, written before the change is visible),
+//!   not in `state.toml`. Every origin except `Internal` and `Config` is
+//!   refused before any other validation; commands not classified yet are
+//!   refused while any device is locked. An unreadable file keeps the
+//!   configured devices locked until a local reset.
 
+mod access;
 pub mod bus;
 pub mod config;
 pub mod dropin;
@@ -138,6 +147,7 @@ pub mod engine;
 pub mod env;
 pub mod error;
 pub mod flows;
+pub mod formats;
 pub mod impact;
 pub mod loader;
 pub mod model;
@@ -145,6 +155,17 @@ pub mod network_profiles;
 pub mod persist;
 pub mod schema;
 pub mod validate;
+
+// Private default-off diagnostic preparation. Dormant proof/model branches stay
+// private until their concrete launch/holder contracts are implemented. No
+// candidate adoption, native dispatch or public wire types exist here.
+#[cfg(any(test, feature = "routing-shadow"))]
+#[cfg_attr(not(test), allow(dead_code))]
+mod report_admission;
+
+#[cfg(feature = "routing-shadow-test-hooks")]
+#[doc(hidden)]
+pub use report_admission::test_hooks as routing_shadow_test_hooks;
 
 pub use bus::{EventBus, Received, RecvError, Subscription};
 pub use config::{Config, DeviceConfig, FlowConfig, FlowFormat};

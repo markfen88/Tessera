@@ -20,6 +20,7 @@ pub mod config;
 mod live;
 pub mod network_profiles;
 pub mod pages;
+pub mod routing_peers;
 pub mod signal;
 pub mod theme;
 
@@ -45,6 +46,8 @@ use crate::backend::{Backend, EventHub};
 pub struct AppState {
     /// The daemon.
     pub backend: Arc<dyn Backend>,
+    /// Routing-only receiver-host API federation.
+    pub routing_peers: routing_peers::Federation,
     /// Recent events and API subscribers.
     pub hub: EventHub,
     /// Logged-in clients.
@@ -97,6 +100,7 @@ impl AppState {
     ) -> Self {
         Self {
             backend,
+            routing_peers: Default::default(),
             hub: EventHub::new(200),
             sessions: Sessions::new(session_idle, 64),
             limiter: LoginLimiter::new(std::time::Duration::from_secs(60), 5, 30),
@@ -114,6 +118,12 @@ impl AppState {
             network_drafts: Mutex::new(HashMap::new()),
             confirm_limiter: network_profiles::ConfirmLimiter::default(),
         }
+    }
+
+    /// Configure explicit peers without changing daemon authority.
+    pub fn with_routing_peers(mut self, peers: routing_peers::Federation) -> Self {
+        self.routing_peers = peers;
+        self
     }
 
     /// Turn appliance mode on (the Speaker page, the service switches).
@@ -188,11 +198,29 @@ pub fn router(state: Shared) -> Router {
     )
     .merge(network_profiles::token_routes())
     .route("/devices", get(pages::devices))
+    .route("/routing", get(pages::routing::receivers))
+    .route("/routing/review", get(pages::routing::review))
+    .route("/routing/recovery", get(pages::routing::inspect))
+    .route(
+        "/routing/carrier-recovery",
+        get(pages::routing::inspect_carriers),
+    )
+    .route(
+        "/routing/peer-operation",
+        get(pages::routing::peer_operation).post(pages::routing::retire_peer_operation),
+    )
+    .route("/routing/apply", post(pages::routing::apply))
     .route("/devices/{key}/settings", post(pages::device_settings))
     .route("/devices/{key}/channels", post(pages::device_channels))
     .route("/confirm", post(pages::confirm))
     .route("/devices/{key}/label", post(pages::device_label))
+    .route("/devices/{key}/lock", post(pages::device_lock))
+    .route("/devices/{key}/unlock", post(pages::device_unlock))
     .route("/devices/{key}/subscribe", post(pages::subscribe))
+    .route(
+        "/devices/{key}/mapping",
+        get(pages::mapping::picker).post(pages::mapping::save),
+    )
     .route("/devices/{key}/unsubscribe", post(pages::unsubscribe))
     .route("/clock", get(pages::clock).post(pages::clock_settings))
     .route("/metrics", get(pages::metrics))
@@ -322,6 +350,14 @@ pub fn peer(ext: &axum::http::Extensions) -> IpAddr {
 
 /// Ask the daemon, on the blocking pool.
 pub async fn call(st: &AppState, body: RequestBody) -> Result<Reply, ClientError> {
+    if let Some(reply) = st.routing_peers.dispatch(st, &body).await {
+        return reply;
+    }
+    local_call(st, body).await
+}
+
+/// Ask only the local daemon; machine requests cannot recursively federate.
+pub(crate) async fn local_call(st: &AppState, body: RequestBody) -> Result<Reply, ClientError> {
     let b = Arc::clone(&st.backend);
     tokio::task::spawn_blocking(move || b.request(body))
         .await
