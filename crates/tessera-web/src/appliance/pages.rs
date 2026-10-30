@@ -31,7 +31,7 @@ use crate::appliance::camilla::{self, Snapshot};
 use crate::appliance::capture_rate::{self, CaptureRate, FormatNotice};
 use crate::appliance::host::{self, BLUETOOTH_UNIT, Bluetooth, HostInfo};
 use crate::appliance::services::{self, Action, Row};
-use crate::appliance::{Appliance, files, volume};
+use crate::appliance::{Appliance, files, rate_follow, volume};
 use crate::auth::Session;
 use crate::config::{ServiceEntry, is_own_unit};
 use crate::pages::{
@@ -140,7 +140,7 @@ pub async fn speaker(State(st): State<Shared>, headers: HeaderMap) -> Response {
         div.grid {
             (master_card(a, vol.as_ref(), eq.as_ref(), gui.as_deref(), &s.csrf))
             @if let (Some(check), Some(eq)) = (capture_rate.as_ref(), eq.as_ref()) {
-                (capture_rate_card(check, eq.active_label(), &s.csrf))
+                (capture_rate_card(check, eq.active_label(), &s.csrf, a.config.rate_follow.enabled))
             }
             @if let (Some(notice), Some(eq)) = (format_notice.as_ref(), eq.as_ref()) {
                 (format_card(notice, eq.active_label()))
@@ -170,7 +170,15 @@ pub async fn speaker(State(st): State<Shared>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
-fn capture_rate_card(check: &CaptureRate, config_label: &str, csrf: &str) -> Markup {
+/// The capture-rate notice. While the rate follower runs (`follower`) it
+/// offers no fix of its own: the follower sets the rates within seconds, and
+/// two writers of the same keys must not fight.
+fn capture_rate_card(
+    check: &CaptureRate,
+    config_label: &str,
+    csrf: &str,
+    follower: bool,
+) -> Markup {
     let CaptureRate::Mismatch {
         device_name,
         device_rate,
@@ -198,7 +206,10 @@ fn capture_rate_card(check: &CaptureRate, config_label: &str, csrf: &str) -> Mar
                 dt { "EQ processing rate" } dd { (khz(*samplerate)) }
                 dt { "Configuration" } dd { (config_label) }
             }
-            @if *fixable {
+            @if follower {
+                p.sub { "The rate follower sets the EQ engine's rates to the device's ("
+                    code { "[appliance.rate_follow]" } "); this notice goes when it has." }
+            } @else if *fixable {
                 form method="post" action="/speaker/capture-rate" {
                     input type="hidden" name="csrf" value=(csrf);
                     button.btn.primary type="submit" { "Set capture rate to " (khz(*device_rate)) " and reload the EQ engine" }
@@ -270,9 +281,10 @@ fn format_card(notice: &FormatNotice, config_label: &str) -> Markup {
 }
 
 /// The master card at the top: the Volume pane (with `[appliance.volume]`)
-/// and the signal boost pane (with the EQ engine), side by side, and under
-/// them the button to the engine's GUI (with `gui_url`). Nothing when none
-/// is configured.
+/// and the signal boost pane (with the EQ engine), side by side, under them
+/// the rate the speaker follows (with `[appliance.rate_follow]`) and the
+/// button to the engine's GUI (with `gui_url`). Nothing when none is
+/// configured.
 fn master_card(
     a: &Appliance,
     vol: Option<&Result<volume::Level, String>>,
@@ -281,7 +293,13 @@ fn master_card(
     csrf: &str,
 ) -> Markup {
     let volume = a.config.volume.as_ref().zip(vol);
-    if volume.is_none() && eq.is_none() && gui.is_none() {
+    let follow = a.config.rate_follow.enabled.then(|| {
+        a.rate_follow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    });
+    if volume.is_none() && eq.is_none() && gui.is_none() && follow.is_none() {
         return html! {};
     }
     html! {
@@ -292,12 +310,30 @@ fn master_card(
                     @if let Some(eq) = eq { (camilla::boost_pane(&eq.active, csrf)) }
                 }
             }
+            @if let Some(r) = &follow { (rate_follow_line(r)) }
             @if let Some(url) = gui {
                 div.actions.manage {
                     (camilla::gui_button(url, eq.map(|e| &e.playback), false))
                     span.muted { "filters, pipeline and devices of the EQ engine, in its own GUI" }
                 }
             }
+        }
+    }
+}
+
+/// The rate follower's line: the rate the speaker follows and, while there
+/// is one, the follower's last problem.
+fn rate_follow_line(r: &rate_follow::Report) -> Markup {
+    html! {
+        div id="rate-follow" {
+            p.sub {
+                "Sample rate follows the network device: "
+                @match r.rate {
+                    Some(hz) => { b { (hz) " Hz" } }
+                    None => { "not known yet" }
+                }
+            }
+            @if let Some(e) = &r.error { p.flash.bad role="status" { (e) } }
         }
     }
 }
@@ -1059,7 +1095,7 @@ mod tests {
     fn capture_rate_card_only_shows_a_mismatch_and_offers_only_safe_fixes() {
         for check in [CaptureRate::Ok, CaptureRate::Unchecked("not YAML".into())] {
             assert!(
-                capture_rate_card(&check, "speaker.yml", "token")
+                capture_rate_card(&check, "speaker.yml", "token", false)
                     .into_string()
                     .is_empty()
             );
@@ -1074,7 +1110,7 @@ mod tests {
                 fixable,
                 stop_reason: Some("Capture error <detail>".into()),
             };
-            let out = capture_rate_card(&check, "speaker.yml", "token").into_string();
+            let out = capture_rate_card(&check, "speaker.yml", "token", false).into_string();
             assert!(out.contains("id=\"capture-rate\""));
             assert!(out.contains("role=\"alert\""));
             assert!(out.contains("Kitchen &lt;speaker&gt;"));
@@ -1096,9 +1132,63 @@ mod tests {
             fixable: true,
             stop_reason: None,
         };
-        let out = capture_rate_card(&check, "speaker.yml", "token").into_string();
+        let out = capture_rate_card(&check, "speaker.yml", "token", false).into_string();
         assert!(out.contains("44.1 kHz · capture_samplerate"));
         assert!(!out.contains("from samplerate"));
         assert!(!out.contains("The EQ engine reported:"));
+        // With the rate follower the notice stays, the fix does not: the
+        // follower owns those keys.
+        let out = capture_rate_card(&check, "speaker.yml", "token", true).into_string();
+        assert!(out.contains("id=\"capture-rate\"") && out.contains("44.1 kHz"));
+        assert!(!out.contains("<form") && !out.contains("/speaker/capture-rate"));
+        assert!(out.contains("[appliance.rate_follow]"), "{out}");
+    }
+
+    #[test]
+    fn the_rate_follow_line_names_the_rate_and_the_last_problem() {
+        let out = rate_follow_line(&rate_follow::Report {
+            rate: Some(96_000),
+            error: None,
+        })
+        .into_string();
+        assert!(
+            out.contains("Sample rate follows the network device: <b>96000 Hz</b>"),
+            "{out}"
+        );
+        assert!(!out.contains("flash"));
+        let out = rate_follow_line(&rate_follow::Report {
+            rate: None,
+            error: Some("the daemon has 2 devices <x>".into()),
+        })
+        .into_string();
+        assert!(out.contains("not known yet"), "{out}");
+        assert!(
+            out.contains("class=\"flash bad\"") && out.contains("2 devices &lt;x&gt;"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_master_card_shows_the_follower_only_when_it_is_enabled() {
+        let runner: std::sync::Arc<dyn services::Runner> =
+            std::sync::Arc::new(FakeRunner::default());
+        let mut c = cfg();
+        let a = Appliance::new(c.clone(), runner.clone());
+        assert!(
+            master_card(&a, None, None, None, "t")
+                .into_string()
+                .is_empty()
+        );
+        c.rate_follow.enabled = true;
+        let a = Appliance::new(c, runner);
+        *a.rate_follow.lock().unwrap() = rate_follow::Report {
+            rate: Some(48_000),
+            error: None,
+        };
+        let out = master_card(&a, None, None, None, "t").into_string();
+        assert!(
+            out.contains("id=\"master\"") && out.contains("48000 Hz"),
+            "{out}"
+        );
     }
 }

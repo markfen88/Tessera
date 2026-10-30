@@ -114,3 +114,25 @@
 #min_db = -60
 #max_db = 0
 #state_file = "/var/lib/tessera-web/volume.json"
+
+# One sample rate for the speaker chain: the tessera device's (changed from
+# a network controller, the portal or `tesseractl set-rate`). The whole table
+# is optional and off by default. Every 2 s the portal writes the device's
+# rate into `rate_file` as `tessera.rate <Hz>`, the ALSA snippet a shared
+# dmix bus reads its slave rate from when it opens (`rate { @func refer
+# file "<rate_file>" name tessera.rate }`); while the bus runs at another
+# rate (`bus_hw_params`, its /proc/asound hw_params) it stops the EQ engine
+# and restarts the `restart` units that are active, so the bus reopens at
+# the new rate; and it keeps the EQ engine's `samplerate` (and a set
+# `capture_samplerate`) at that rate, in the active configuration file and
+# in the running engine. `device` defaults to the daemon's only device.
+# `restart` lists the bus clients that may hold it open (squeezelite, ...);
+# each must be an [[appliance.service]] unit. The package creates the
+# default `rate_file` (/var/lib/tessera-rate, readable by every ALSA client)
+# and opens it in the unit. See docs/raspberry-pi-speaker.md.
+#[appliance.rate_follow]
+#enabled = false
+#device = "main"
+#rate_file = "/var/lib/tessera-rate/alsa.conf"
+#bus_hw_params = "/proc/asound/Loopback/pcm0p/sub0/hw_params"
+#restart = ["shairport-sync"]

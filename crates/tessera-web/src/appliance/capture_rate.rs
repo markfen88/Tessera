@@ -216,23 +216,100 @@ struct Settings {
     capture_line: Option<usize>,
 }
 
-impl Settings {
-    fn read(yaml: &str) -> Result<Self, String> {
-        let ls = lines(yaml);
-        let root = children(&ls, None)?;
-        let devices = required(&root, "devices")?;
-        let fields = block(&ls, devices, "devices")?;
-        validate_block(&ls, &fields)?;
-        let samplerate_line = required(&fields, "samplerate")?;
-        let samplerate = rate(raw(&ls, samplerate_line, "samplerate")?)?;
-        let capture_line = child(&fields, "capture_samplerate");
+/// The fields of the `devices` block, validated as readable block YAML.
+fn device_fields(ls: &[(usize, &str)]) -> Result<Vec<(String, usize)>, String> {
+    let root = children(ls, None)?;
+    let devices = required(&root, "devices")?;
+    let fields = block(ls, devices, "devices")?;
+    validate_block(ls, &fields)?;
+    Ok(fields)
+}
+
+/// `devices.samplerate` and `devices.capture_samplerate` (`None` when it is
+/// absent or null) with their lines.
+#[derive(Debug)]
+struct RateLines {
+    samplerate: u32,
+    samplerate_line: usize,
+    capture_samplerate: Option<u32>,
+    capture_line: Option<usize>,
+}
+
+impl RateLines {
+    fn read(ls: &[(usize, &str)], fields: &[(String, usize)]) -> Result<Self, String> {
+        let samplerate_line = required(fields, "samplerate")?;
+        let samplerate = rate(raw(ls, samplerate_line, "samplerate")?)?;
+        let capture_line = child(fields, "capture_samplerate");
         let capture_samplerate = capture_line
             .map(|i| {
-                let v = raw(&ls, i, "capture_samplerate")?;
+                let v = raw(ls, i, "capture_samplerate")?;
                 if null(v) { Ok(None) } else { rate(v).map(Some) }
             })
             .transpose()?
             .flatten();
+        Ok(Self {
+            samplerate,
+            samplerate_line,
+            capture_samplerate,
+            capture_line,
+        })
+    }
+}
+
+/// `devices.samplerate` and `devices.capture_samplerate` (`None` when absent
+/// or null) of readable block YAML, as the capture-rate check reads them.
+///
+/// # Errors
+/// The device settings cannot be read safely as block YAML.
+pub fn rates(yaml: &str) -> Result<(u32, Option<u32>), String> {
+    let ls = lines(yaml);
+    let r = RateLines::read(&ls, &device_fields(&ls)?)?;
+    Ok((r.samplerate, r.capture_samplerate))
+}
+
+/// Set `devices.samplerate`, and `devices.capture_samplerate` when it holds
+/// a rate, to `rate`, replacing only those scalars: every other byte (the
+/// comments after them included) stays. An absent or null
+/// `capture_samplerate` follows `samplerate` and is left as it is. A file
+/// already at `rate` comes back unchanged.
+///
+/// # Errors
+/// The device settings cannot be read safely as block YAML, or rate is zero.
+pub fn set_rates(yaml: &str, rate: u32) -> Result<String, String> {
+    if rate == 0 {
+        return Err("the sample rate must be positive".into());
+    }
+    let ls = lines(yaml);
+    let r = RateLines::read(&ls, &device_fields(&ls)?)?;
+    let mut edits = Vec::new();
+    if r.samplerate != rate {
+        edits.push((r.samplerate_line, "samplerate"));
+    }
+    if let (Some(i), Some(c)) = (r.capture_line, r.capture_samplerate) {
+        if c != rate {
+            edits.push((i, "capture_samplerate"));
+        }
+    }
+    // The later line first: an edit moves only the bytes after it.
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+    let mut out = yaml.to_owned();
+    for (i, key) in edits {
+        let ls = lines(&out);
+        out = replace_scalar(&out, &ls, i, key, &rate.to_string());
+    }
+    Ok(out)
+}
+
+impl Settings {
+    fn read(yaml: &str) -> Result<Self, String> {
+        let ls = lines(yaml);
+        let fields = device_fields(&ls)?;
+        let RateLines {
+            samplerate,
+            samplerate_line,
+            capture_samplerate,
+            capture_line,
+        } = RateLines::read(&ls, &fields)?;
         let resampler = child(&fields, "resampler")
             .map(|i| {
                 let v = raw(&ls, i, "resampler")?;
@@ -751,6 +828,72 @@ pipeline: []
             set_capture_samplerate(&yaml, 48_000).unwrap(),
             yaml.replace("\t96000", "\t48000")
         );
+    }
+
+    #[test]
+    fn set_rates_changes_only_the_rate_scalars() {
+        // `samplerate` alone; the comment after it stays.
+        assert_eq!(rates(CONFIG), Ok((96_000, None)));
+        let out = set_rates(CONFIG, 48_000).unwrap();
+        assert_eq!(
+            out,
+            CONFIG.replace(
+                "samplerate: 96000   # processing",
+                "samplerate: 48000   # processing"
+            )
+        );
+        assert_eq!(rates(&out), Ok((48_000, None)));
+        assert_eq!(
+            set_rates(&out, 48_000).unwrap(),
+            out,
+            "already there: unchanged"
+        );
+        // A set capture rate follows too, quoted or not, CRLF kept.
+        let both = CONFIG
+            .replace(
+                "  chunksize:",
+                "  capture_samplerate: '44100' # input\n  chunksize:",
+            )
+            .replace('\n', "\r\n");
+        let out = set_rates(&both, 192_000).unwrap();
+        assert_eq!(
+            out,
+            both.replace("samplerate: 96000", "samplerate: 192000")
+                .replace("capture_samplerate: '44100'", "capture_samplerate: 192000")
+        );
+        assert_eq!(rates(&out), Ok((192_000, Some(192_000))));
+        // Only the scalar that differs is touched.
+        let capture_only =
+            CONFIG.replace("  chunksize:", "  capture_samplerate: 44100\n  chunksize:");
+        assert_eq!(
+            set_rates(&capture_only, 96_000).unwrap(),
+            CONFIG.replace("  chunksize:", "  capture_samplerate: 96000\n  chunksize:")
+        );
+        // A null capture rate follows `samplerate` and is left alone.
+        let null = GUI_SAVED;
+        let out = set_rates(null, 48_000).unwrap();
+        assert_eq!(
+            out,
+            GUI_SAVED.replace("  samplerate: 96000", "  samplerate: 48000")
+        );
+        assert_eq!(rates(&out), Ok((48_000, None)));
+        // The packaged speaker configuration (indentless pipeline).
+        let yaml = packaged_speaker(48_000);
+        assert_eq!(
+            set_rates(&yaml, 96_000).unwrap(),
+            yaml.replace("  samplerate: 48000\n", "  samplerate: 96000\n")
+        );
+        // What the strict reader refuses is refused here too.
+        for bad in [
+            "devices: {samplerate: 96000}\n".to_owned(),
+            CONFIG.replace("samplerate: 96000", "samplerate: *rate"),
+            CONFIG.replace("  chunksize:", "  samplerate: 48000\n  chunksize:"),
+            "pipeline: []\n".to_owned(),
+        ] {
+            assert!(set_rates(&bad, 48_000).is_err(), "{bad}");
+            assert!(rates(&bad).is_err(), "{bad}");
+        }
+        assert!(set_rates(CONFIG, 0).is_err());
     }
 
     #[test]

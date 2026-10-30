@@ -498,6 +498,7 @@ mod tests {
             locked: BTreeSet::new(),
             latency_bounds_us: [1_000, 40_000],
             allow_unsafe_latency: false,
+            latency_floor_us: 1_000,
         };
         let mut config = Config::default();
         config.network.interfaces = vec!["eth0".into()];

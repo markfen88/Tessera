@@ -394,7 +394,8 @@ The daemon currently identifies the portal process rather than individual web us
 `tessera-web.service` (`crates/tessera-web/dist/tessera-web.service`):
 `User=tessera-web`, `Restart=on-failure`, no capabilities, `PrivateDevices`,
 `ProtectSystem=strict` with `ReadWritePaths=-/run/tessera` (connecting to a
-socket needs write permission on it), `RestrictRealtime=yes`, address
+socket needs write permission on it) and `-/var/lib/tessera-rate` (the rate
+follower's file, see [Rate follower](#rate-follower)), `RestrictRealtime=yes`, address
 families `AF_UNIX AF_INET AF_INET6`, `SystemCallFilter=@system-service`. Two
 runtime worker threads.
 
@@ -413,10 +414,12 @@ configuration, not a build option.
 order: the **master card** at the top, with the amplifier's **Volume** (with
 `[appliance.volume]`) and the EQ engine's **Signal boost** (with
 `[appliance.camilladsp] enabled = true`) side by side, each a large readout
-and a large slider (see "EQ engine" below; the card is absent when neither
-is configured); the **EQ engine input rate mismatch** notice (only while the
+and a large slider (see "EQ engine" below), and under them, with
+`[appliance.rate_follow]`, the line **Sample rate follows the network device:
+<Hz>** with the follower's last problem (see "Rate follower"; the card is
+absent when none of these is configured); the **EQ engine input rate mismatch** notice (only while the
 engine's ALSA capture rate differs from the Tessera device's rate, with a
-one-click fix when the configuration allows it; see
+one-click fix when the configuration allows it and the rate follower is off; see
 [the Raspberry Pi speaker guide](raspberry-pi-speaker.md)); the **EQ engine
 output format not supported** notice (only while the engine's stop reason is
 an ALSA `snd_pcm_hw_params_set_format` failure: it quotes the engine, names
@@ -653,12 +656,18 @@ gui_url = "http://{host}:5005/gui/index.html"   # {host}: as the browser reached
 
 [appliance.volume]               # optional: the amplifier's mixer control
 card = "amp"
+
+[appliance.rate_follow]          # optional: one sample rate for the speaker chain
+enabled = true
+bus_hw_params = "/proc/asound/Loopback/pcm0p/sub0/hw_params"
+restart = ["shairport-sync"]
 ```
 
 `[appliance.camilladsp]` (`enabled`, `websocket` (a `ws://` address),
 `configs_dir`, `coeffs_dir`, `statefile`, `binary`, `gain_filter`,
 `gui_url`, `max_upload_bytes`) and `[appliance.volume]` (`card`,
-`control`, `min_db`, `max_db`, `state_file`) are described under "EQ engine"; the
+`control`, `min_db`, `max_db`, `state_file`) are described under "EQ engine",
+`[appliance.rate_follow]` under "Rate follower"; the
 commented example in `crates/tessera-web/dist/web.toml` lists the
 defaults. `tessera-web check` reports whether appliance mode is on and how
 many entries it has.
@@ -708,8 +717,12 @@ text frame with a JSON command, a bare string for a command without an
 argument (`"GetState"`, `"Reload"`, `"GetConfigFilePath"`, `"GetVersion"`,
 `"GetVolume"`) or a one-key object with it (`{"SetConfigFilePath":
 "/path"}`, `{"SetVolume": -12.0}`), and reads one reply of the form
-`{"<Command>": {"result": "Ok", "value": ...}}` (`"result": "Error"` with
-the message in `value` when the engine refuses). Every command is its own
+`{"<Command>": {"result": "Ok", "value": ...}}`. A refusal is another
+`result`: an error name (`"InvalidFaderError"`) or a one-key object with the
+message (`{"ConfigValidationError": "..."}`), as CamillaDSP 4.1.3 answers;
+`"Error"` with the message in `value` (earlier engines) reads the same. The
+rate follower also sends `"Stop"`, `"GetConfigJson"` (the running
+configuration as a JSON text) and `{"SetConfigJson": "<JSON text>"}`. Every command is its own
 short-lived connection: connect, send, read the reply (the engine's pings
 are answered meanwhile), close, with 4 s for the whole exchange (1 s for
 the reads a page render makes, so a hung engine does not hold every page)
@@ -875,7 +888,8 @@ it is not possible. A state file that exists but cannot be read stops the
 fallback.
 
 **Files and permissions.** The unit's `ProtectSystem=strict` leaves the
-portal no writable path but `/run/tessera` and its own state directory
+portal no writable path but `/run/tessera`, the rate follower's
+`/var/lib/tessera-rate` and its own state directory
 `/var/lib/tessera-web`, and its `PrivateDevices=yes` hides the sound card
 from `amixer`; the EQ pages need the two directories and the state file, the
 Volume card the card's ALSA control device. The package ships a drop-in,
@@ -922,6 +936,44 @@ sudo usermod -aG audio tessera-web && sudo systemctl restart tessera-web
 sudo runuser -u tessera-web -- touch /opt/camilladsp/configs/.probe \
   && sudo rm /opt/camilladsp/configs/.probe                          # writable: no error
 ```
+
+### Rate follower
+
+With `[appliance.rate_follow] enabled = true` (appliance mode only; off by
+default) the tessera device's sample rate is the speaker's only rate: a shared
+ALSA bus, its players and the EQ engine follow it, and the engine never keeps a
+rate of its own. The setup is in
+[raspberry-pi-speaker.md](raspberry-pi-speaker.md#shared-sources-and-one-sample-rate).
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `false` | Run the follower. |
+| `device` | the daemon's only device | The tessera device key to follow. With several devices and no key the follower does nothing and says why. |
+| `rate_file` | `/var/lib/tessera-rate/alsa.conf` | The ALSA snippet the bus reads its rate from, written as exactly `tessera.rate <Hz>` (a temporary file renamed over it, mode 0644: every ALSA client reads it). The package creates the directory (0755, owned by `tessera-web`) and seeds the file with 48000; the unit opens it (`ReadWritePaths=-/var/lib/tessera-rate`). The state directory `/var/lib/tessera-web` is 0700, so the file cannot live there. |
+| `bus_hw_params` | none | The bus's `hw_params` in `/proc/asound` (`rate: 48000 (48000/1)` while open, `closed` otherwise). Without it the bus is not watched. |
+| `restart` | `[]` | Bus clients restarted, if active, while the bus runs at another rate. Each must be an `[[appliance.service]]` unit (a member of a group counts: it is restarted alone through `tessera-web-unitfile@restart-<unit>.service`, which the generated polkit rule already allows); `tesserad` and `tessera-web` are refused. |
+
+Every 2 s, and at start, it reads the device's rate from the daemon, the rate
+file, the bus, the active configuration file and the running engine
+(`GetConfigJson`), and acts:
+
+| Observed | Done |
+|----------|------|
+| the rate file does not hold the rate | it is written |
+| the bus is open at another rate | `Stop` (the engine's capture closes, so the cable can change rate), the `restart` units that are active are restarted, and the engine is reloaded below |
+| the active file's `samplerate`, or a set `capture_samplerate`, differs | those scalars are set (nothing else in the file changes, as with the boost) and the engine reloaded (`SetConfigFilePath` first after a `Stop`) |
+| only the running engine differs (a configuration applied in the GUI, not saved) | `SetConfigJson` with the running configuration, its rates corrected |
+| the engine stopped with an error after the follower acted | `Reload` again |
+
+A new rate is acted on at once; while the chain does not settle (a card that
+refuses the rate, a player outside `restart` holding the bus) the next attempt
+waits 2 s, doubling to 60 s. Actions are logged when they first run, failures
+when they change. The engine's files are changed with the same lock as the
+boost, and only a regular file in `configs_dir`; another file is reported, not
+edited. Without the websocket, an allowlisted engine unit that runs is
+restarted; a stopped engine is left stopped and reads the file when it starts.
+Without `[appliance.camilladsp] enabled` only the rate file and the bus follow.
+While the follower runs, the capture-rate notice offers no button.
 
 ---
 

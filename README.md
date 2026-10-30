@@ -1,13 +1,17 @@
-# Tessera 0.5.0
+# Tessera 0.5.1
 
-Tessera 0.5.0 adds an opt-in native device role to the daemon (`--native-device`):
+Tessera 0.5.1 tells network controllers the device latency range a change may
+use, and the portal can make a speaker's whole audio chain (bridge, ALSA bus,
+CamillaDSP) follow the tessera device's sample rate.
+
+Tessera 0.5.0 added an opt-in native device role to the daemon (`--native-device`):
 `tesserad` itself answers a network controller, negotiates receive flows from the
 saved subscriptions and serves transmit flows, in place of the packaged
 compatibility runtime on that host. The portal's **Routing** page connects,
 replaces and disconnects inputs from either host, one transmit channel can feed
 several inputs, and a device can be locked behind a PIN. Hosts that do not
 enable the role keep the packaged compatibility runtime as their controller
-interface. See [the 0.5.0 changelog](CHANGELOG.md) for what works and what does
+interface. See [the changelog](CHANGELOG.md) for what works and what does
 not yet.
 
 Tessera is an experimental, open audio-over-IP stack for Linux, written in Rust
@@ -250,7 +254,7 @@ SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge TESSERA_DEB_REVISION=1 cargo xtask
 ```
 
 Build on the target OS/architecture. `TESSERA_DEB_REVISION` makes the package
-revision explicit in source archives. Version `0.5.0` is packaged as `0.5.0-*`. To create an
+revision explicit in source archives. Version `0.5.1` is packaged as `0.5.1-*`. To create an
 add-on bundle, use `cargo xtask build-bundle`, or its explicit Ubuntu opt-in.
 The tree contains no shell or Python scripts: packaging, bundle and test entry
 points are `cargo xtask` tasks. See [build/package options](docs/bundle.md#building).

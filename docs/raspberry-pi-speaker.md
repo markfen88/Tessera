@@ -37,7 +37,7 @@ Pick **Direct** unless the speaker must also play local sources.
 | Path | network → `tesserad` → ALSA plugin → CamillaDSP (resampler) → DAC | network → `tesserad` bridge (resampler, slow loop) → `snd-aloop` → CamillaDSP (rate adjust of the loopback) → DAC |
 | Clock crossings | one: CamillaDSP's resampler between the media clock and the DAC | two loops in series: the bridge follows the loopback, CamillaDSP keeps the loopback in step with the DAC |
 | Needs | `tessera-alsa` (the plugin) | `tesserad` built with `alsa-bridge`, `snd-aloop`, `SupplementaryGroups=audio` |
-| Local sources (AirPlay, Squeezelite, Bluetooth) | not served | intended to share the loopback through dmix (that ALSA configuration is not provided) |
+| Local sources (AirPlay, Squeezelite, Bluetooth) | not served | share the loopback through a `dmix` bus at the device's rate (see [Shared sources](#shared-sources-and-one-sample-rate)) |
 
 ---
 
@@ -176,14 +176,14 @@ Local sources cannot share this path: CamillaDSP reads only the network audio.
 
 The bridge plays the network audio into one end of an `snd-aloop` cable with a
 slow loop; CamillaDSP captures the other end with its own rate adjust (it trims
-the loopback's `PCM Rate Shift` to follow the DAC). The intent is that other
-local players write into the same loopback through an ALSA `dmix`, so
-CamillaDSP filters everything; that part is not provided (see below). This
+the loopback's `PCM Rate Shift` to follow the DAC). Other local players can
+write into the same loopback through an ALSA `dmix`, so CamillaDSP filters
+everything (see [Shared sources](#shared-sources-and-one-sample-rate)). This
 topology is experimental; validate hardware compatibility for your installation.
 
 ```text
  network ──► tesserad bridge [resampler, τ = 120 s] ──► hw:Loopback,0,0 ═══ hw:Loopback,1,0 ──► CamillaDSP ──► DAC
-                                                            ▲ (dmix: intended, not provided)   (rate adjust: PCM Rate Shift)
+                                                            ▲ (dmix bus, optional)             (rate adjust: PCM Rate Shift)
  AirPlay / Squeezelite / Bluetooth ─────────────────────────┘
 ```
 
@@ -218,11 +218,81 @@ only follows the average rate CamillaDSP settles on. The default of 120 s
 meets this for the default period; a longer `adjust_period` needs a longer
 time constant. Keep the clamp no larger than the offsets you expect.
 
-Sharing the loopback with local sources: the bridge opens `hw:Loopback,0,0`
-directly, and a loopback cable pairs playback subdevice `0,N` only with
-capture `1,N`, so local players must reach the same cable (through a `dmix`
-that the bridge's open has to fit into). A complete shared-source ALSA configuration is not provided; configure that
-separately for your sound card and applications.
+### Shared sources and one sample rate
+
+A loopback cable pairs playback subdevice `0,N` only with capture `1,N` and
+carries one rate, and a `dmix` never converts rates: it takes its rate when its
+first client opens it. So the bridge, every local player, the bus and
+CamillaDSP must run at the tessera device's rate. With the portal's **rate
+follower** that rate is the only setting: change it from the vendor controller,
+the portal or `tesseractl set-rate`, and the chain follows; CamillaDSP's own rate
+keys are overwritten.
+
+1. The bus reads its rate from a file the portal writes
+   (`/var/lib/tessera-rate/alsa.conf`, `tessera.rate <Hz>`; the `tessera-web`
+   package creates it with 48000). Each new bus reads it when it opens:
+
+   ```text
+   # /etc/asound.conf
+   pcm.speaker_dmix {
+       type dmix
+       ipc_key 2041048               # unique on the host
+       ipc_key_add_uid false         # one bus for every user
+       ipc_gid 29                    # a group every client is in (getent group audio)
+       ipc_perm 0660
+       slave {
+           pcm "hw:Loopback,0,0"
+           format S32_LE
+           channels 2
+           rate {
+               @func refer
+               file "/var/lib/tessera-rate/alsa.conf"
+               name tessera.rate
+           }
+       }
+   }
+   pcm.speaker_mix { type plug; slave.pcm "speaker_dmix"; }   # the local players
+   ```
+
+2. The bridge opens the bus itself, not the plug: through `speaker_mix` it
+   would resample into a bus left at the old rate, while on `speaker_dmix` its
+   open fails until the bus runs at the device's rate, and it retries. Leave
+   `sample_rate` out (the bridge follows the device; set, it pins the rate)
+   and keep the retry short:
+
+   ```toml
+   [[bridge]]
+   name = "speaker-playback"
+   device = "main"
+   alsa_pcm = "speaker_dmix"
+   direction = "playback"
+   channels = 2
+   error_backoff_max_ms = 2000       # back within 2 s of the bus reopening
+   ```
+
+3. CamillaDSP captures `hw:Loopback,1,0` (2 channels, `S32_LE`).
+4. The follower, in a `/etc/tessera/web.d` drop-in. `restart` lists the players
+   that may hold the bus open; each must be an `[[appliance.service]]` unit (a
+   member of a group counts):
+
+   ```toml
+   [appliance.rate_follow]
+   enabled = true
+   bus_hw_params = "/proc/asound/Loopback/pcm0p/sub0/hw_params"
+   restart = ["squeezelite", "gmediarender", "shairport-sync", "bluealsa-aplay"]
+   ```
+
+**A rate change interrupts every source for a few seconds.** Within 2 s the
+portal writes the new rate, stops CamillaDSP, restarts the listed players that
+run, sets `samplerate` (and a set `capture_samplerate`) in the active
+configuration and reloads it; the bus reopens at the new rate with its first
+client and the bridge joins at its next retry. A configuration restored or
+applied in CamillaDSP's GUI at another rate is corrected the same way. A card
+that refuses the rate stops CamillaDSP: the portal retries, waiting 2 s doubling
+to 60 s, and the Speaker page shows the error under *Sample rate follows the
+network device*; so does a bus that a player outside `restart` holds at the old
+rate. Filters must suit every rate: name FIR files with CamillaDSP's
+`$samplerate$` token ([web-portal.md](web-portal.md#rate-follower)).
 
 ## Timing and diagnostics
 
@@ -232,5 +302,5 @@ xruns/slips before lowering buffering. A downstream DSP and the hardware bridge
 can have separate rate servos; keep their time constants sufficiently separated.
 [Timing and privileges](rt-tuning.md) explains scheduling and clock-domain limits.
 
-Bluetooth routing, automatic latency calibration and a complete shared-source
-speaker configuration are outside this release.
+Bluetooth routing, automatic latency calibration and a shared-source
+configuration for each player are outside this release.

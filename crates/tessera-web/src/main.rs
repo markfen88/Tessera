@@ -174,7 +174,11 @@ fn serve(cfg: WebConfig) -> ExitCode {
         if let Some(appliance) = &state.appliance {
             // The amplifier's saved volume, set again as soon as its card is there.
             tessera_web::appliance::volume::spawn_restore(Arc::clone(appliance));
+        } else if cfg.appliance.rate_follow.enabled {
+            tracing::warn!("[appliance.rate_follow] is enabled but appliance mode is off: the rate follower does not run");
         }
+        // The speaker chain follows the device's sample rate ([appliance.rate_follow]).
+        tessera_web::appliance::rate_follow::spawn(Arc::clone(&state));
         state.hub.follow(backend, Duration::from_secs(2));
         let listener = match tokio::net::TcpListener::bind(cfg.listen).await {
             Ok(l) => l,
