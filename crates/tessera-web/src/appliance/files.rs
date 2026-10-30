@@ -278,13 +278,27 @@ fn dir_and_name(path: &Path) -> Result<(&Path, &str), String> {
 /// # Errors
 /// The I/O error, with what failed.
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+    let (dir, _) = dir_and_name(path)?;
+    let (mode, gid) = mode_and_group(path, dir);
+    write_atomic_as(path, data, mode, gid)
+}
+
+/// [`write_atomic`] with exactly `mode` (set explicitly, whatever the unit's
+/// `UMask`) and the portal's own group, whatever the replaced file had.
+///
+/// # Errors
+/// The I/O error, with what failed.
+pub fn write_atomic_mode(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+    write_atomic_as(path, data, mode, None)
+}
+
+fn write_atomic_as(path: &Path, data: &[u8], mode: u32, gid: Option<u32>) -> Result<(), String> {
     let (dir, name) = dir_and_name(path)?;
     let tmp = dir.join(format!(
         ".{name}.tmp-{}-{}",
         std::process::id(),
         TEMP_N.fetch_add(1, Ordering::SeqCst)
     ));
-    let (mode, gid) = mode_and_group(path, dir);
     let result = (|| -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)

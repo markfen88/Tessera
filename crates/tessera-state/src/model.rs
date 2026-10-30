@@ -89,6 +89,8 @@ pub struct DeviceModel {
     pub latency_bounds_us: [u32; 2],
     /// Latency below the platform floor is permitted.
     pub allow_unsafe_latency: bool,
+    /// Platform timing floor (ADR 0011), from the environment.
+    pub latency_floor_us: u32,
 }
 
 impl DeviceModel {
@@ -108,6 +110,16 @@ impl DeviceModel {
             .get(&ch)
             .cloned()
             .unwrap_or_else(|| format!("TX {ch}"))
+    }
+
+    /// The latencies `SetLatency` accepts on this device now, inclusive.
+    #[must_use]
+    pub fn latency_range_us(&self) -> [u32; 2] {
+        latency_range_us(
+            self.latency_bounds_us,
+            self.latency_floor_us,
+            self.allow_unsafe_latency,
+        )
     }
 }
 
@@ -505,13 +517,28 @@ fn reconcile_device(
         locked: dc.locked.clone(),
         latency_bounds_us: dc.latency_bounds_us,
         allow_unsafe_latency: dc.allow_unsafe_latency,
+        latency_floor_us: env.latency_floor_us,
     }
+}
+
+/// The latencies `SetLatency` accepts, inclusive: `latency_bounds_us`,
+/// raised to the platform floor unless `allow_unsafe_latency`
+/// (`device-settings.md` §4.4 item 2: one rule for the write check and the
+/// range a controller is shown).
+#[must_use]
+pub fn latency_range_us(bounds: [u32; 2], floor: u32, allow_unsafe: bool) -> [u32; 2] {
+    let [lo, hi] = bounds;
+    [if allow_unsafe { lo } else { lo.max(floor) }, hi]
 }
 
 /// Is `v` an acceptable latency for this device on this platform?
 pub(crate) fn latency_allowed(v: u32, dc: &DeviceConfig, env: &Environment) -> bool {
-    let [lo, hi] = dc.latency_bounds_us;
-    v >= lo && v <= hi && (v >= env.latency_floor_us || dc.allow_unsafe_latency)
+    let [lo, hi] = latency_range_us(
+        dc.latency_bounds_us,
+        env.latency_floor_us,
+        dc.allow_unsafe_latency,
+    );
+    (lo..=hi).contains(&v)
 }
 
 /// Apply the ADR 0008 precedence: for each value, the persisted one if it is

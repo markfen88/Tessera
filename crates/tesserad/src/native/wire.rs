@@ -790,8 +790,8 @@ fn clock_status(me: &Identity) -> Vec<u8> {
     c
 }
 
-/// Device properties answered on ARC 0x1100, all read-only for now
-/// (`device-settings.md` §§4.2, 5; `interop-fixes.md` F8). Latencies in ns.
+/// Device properties answered on ARC 0x1100 (`device-settings.md` §§4.2,
+/// 4.4, 5; `interop-fixes.md` F8). Latencies in ns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Properties {
     /// Default receive latency (id 0x8204): the configured latency, the
@@ -800,19 +800,27 @@ pub struct Properties {
     pub default_latency_ns: u32,
     /// Configured and active receive latency (ids 0x8205, 0x8301).
     pub latency_ns: u32,
+    /// The smallest and largest latency a write accepts (ids 0x8306,
+    /// 0x8302; `device-settings.md` §4.4 item 2).
+    pub latency_range_ns: [u32; 2],
+    /// A latency write can succeed: the device's configuration does not
+    /// lock it (§4.4 item 1).
+    pub latency_writable: bool,
 }
 
-const PROPERTY_IDS: [u16; 3] = [0x8204, 0x8205, 0x8301];
+const PROPERTY_IDS: [u16; 5] = [0x8204, 0x8205, 0x8301, 0x8302, 0x8306];
 
 /// 0x1102: the property directory, (id, access) pairs; access 1 = read
-/// only, 3 = writable (the configured latency, `device-settings.md` §12.1).
+/// only, 3 = writable (the latency setting and its active value while a
+/// write can succeed, `device-settings.md` §4.4 item 1).
 #[must_use]
-pub fn property_directory() -> Vec<u8> {
+pub fn property_directory(p: &Properties) -> Vec<u8> {
     let mut c = Content::new();
     c.u16(PROPERTY_IDS.len() as u16);
     for id in PROPERTY_IDS {
         c.u16(id);
-        c.u16(if id == 0x8205 { 3 } else { 1 });
+        let writable = p.latency_writable && matches!(id, 0x8205 | 0x8301);
+        c.u16(if writable { 3 } else { 1 });
     }
     c.0
 }
@@ -867,6 +875,8 @@ pub fn property_list(ids: &[u16], p: &Properties) -> Vec<u8> {
         let value = match id {
             0x8204 => Some(p.default_latency_ns),
             0x8205 | 0x8301 => Some(p.latency_ns),
+            0x8302 => Some(p.latency_range_ns[1]),
+            0x8306 => Some(p.latency_range_ns[0]),
             _ => None,
         };
         let at = entries + 4 * n;

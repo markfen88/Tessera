@@ -66,7 +66,7 @@ pub(super) async fn serve(
 
 /// Requests answered "unsupported" (0x0030), logged at info level with
 /// their bytes so that a write form tessera does not know leaves a trace
-/// (`device-settings.md` §4.4 item 4): every refused latency write (0x1101),
+/// (`device-settings.md` §4.4 items 3 and 6): every refused latency write (0x1101),
 /// any other opcode once a minute at most, with the number left out since
 /// the previous line.
 #[derive(Debug, Default)]
@@ -132,12 +132,11 @@ async fn answer(
         )),
         0x1100 => ok(&wire::property_values(
             content,
-            &wire::Properties {
-                default_latency_ns: super::default_latency_ns(engine, &model).await,
-                latency_ns: model.latency_us.saturating_mul(1000),
-            },
+            &super::latency_properties(engine, &model).await,
         )),
-        0x1102 => ok(&wire::property_directory()),
+        0x1102 => ok(&wire::property_directory(
+            &super::latency_properties(engine, &model).await,
+        )),
         0x2000 | 0x2010 => match wire::page_start(content) {
             Some(first) => paged(wire::tx_list(&view, first, h.opcode == 0x2010)),
             None => Some(wire::reply(h, wire::FAILURE, &[])),
@@ -195,12 +194,15 @@ async fn answer(
                 Some(wire::reply(h, wire::FAILURE, &[]))
             }
         }
-        // Device latency (`device-settings.md` §12.1): 0x8205 is the setting;
-        // 0x8301 (the active value) may accompany it only with the same value.
+        // Device latency (`device-settings.md` §4.4 item 3): 0x8205 (the
+        // setting) and 0x8301 (the active value) name one command; either
+        // sets it, and together they must agree. The range check is the
+        // command's own (`DeviceModel::latency_range_us`, answered as 0x8306
+        // and 0x8302).
         0x1101 => {
             let items = wire::property_writes(content);
             let find = |id: u16| items.iter().find(|(i, _)| *i == id).map(|(_, v)| *v);
-            let Some(ns) = find(0x8205) else {
+            let Some(ns) = find(0x8205).or_else(|| find(0x8301)) else {
                 return Some(wire::reply(h, wire::UNIMPLEMENTED, &[]));
             };
             if find(0x8301).is_some_and(|active| active != ns) {
@@ -219,13 +221,22 @@ async fn answer(
                     .or_else(|| Some(wire::reply(h, wire::UNIMPLEMENTED, &[])));
             }
             let (_, after) = super::device(engine).await.ok()?;
+            // §4.4 item 3: every accepted write leaves its form in the log.
+            let written: Vec<String> = items
+                .iter()
+                .map(|(id, v)| format!("{id:#06x}={v}"))
+                .collect();
+            tracing::info!(
+                "native ARC latency write from {peer} (start {:#06x}): {}: {} -> {} us",
+                h.start,
+                written.join(" "),
+                model.latency_us,
+                after.latency_us
+            );
             let ids: Vec<u16> = items.iter().map(|(id, _)| *id).collect();
             ok(&wire::property_list(
                 &ids,
-                &wire::Properties {
-                    default_latency_ns: super::default_latency_ns(engine, &after).await,
-                    latency_ns: after.latency_us.saturating_mul(1000),
-                },
+                &super::latency_properties(engine, &after).await,
             ))
         }
         // Device rename (`device-settings.md` §12.7).

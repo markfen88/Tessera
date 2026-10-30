@@ -347,10 +347,10 @@ unsupported: ...`, once a minute per request type). After a rate change,
 receivers of this device that run at the old rate stop receiving until they
 change too: that is expected.
 
-Known open issue in 0.5.0: in one setup the vendor's controller could not change
-a native device's sample rate; the cause is still being investigated. If that happens, the log above shows whether the
-write reached the device and what was answered; meanwhile change the rate with
-`tesseractl set-rate` or the portal. Some third-party tools refuse a
+If the vendor's controller offers only one rate, the device is pinned:
+`tesseractl status` names the bridge whose `sample_rate` fixes it (leave that key
+out to let the card follow the device) or the configuration lock. Otherwise the
+log above shows whether a write reached the device and what was answered. Some third-party tools refuse a
 sample-rate change in their own checks because the device does not answer the
 newer flow-list queries; that refusal never reaches the device.
 

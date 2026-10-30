@@ -21,11 +21,12 @@ pub mod capture_rate;
 pub mod files;
 pub mod host;
 pub mod pages;
+pub mod rate_follow;
 pub mod services;
 pub mod volume;
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -50,6 +51,9 @@ pub struct Appliance {
     /// start sets again once the card is there must stand down
     /// ([`volume::restore`]).
     pub volume_touched: AtomicBool,
+    /// What the rate follower last saw, for the Speaker page
+    /// ([`rate_follow`]).
+    pub rate_follow: Mutex<rate_follow::Report>,
 }
 
 impl Appliance {
@@ -62,6 +66,7 @@ impl Appliance {
             runner,
             eq_lock: Arc::new(tokio::sync::Mutex::new(())),
             volume_touched: AtomicBool::new(false),
+            rate_follow: Mutex::new(rate_follow::Report::default()),
         }
     }
 }

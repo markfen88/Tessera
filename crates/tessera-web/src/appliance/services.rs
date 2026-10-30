@@ -731,6 +731,45 @@ pub async fn perform(
     Ok(())
 }
 
+/// `systemctl is-active <unit>` (no privilege): `Ok(true)` unless the unit
+/// is `inactive`, `failed` or unknown. A unit that is `activating`,
+/// `deactivating`, `reloading` or `refreshing` counts as running (the exit
+/// code is non-zero then, the word is on standard output).
+///
+/// # Errors
+/// `systemctl` could not be run.
+pub async fn is_active(r: &dyn Runner, unit: &str) -> Result<bool, String> {
+    let args = vec!["is-active".to_owned(), canonical_unit(unit)];
+    match r.run(SYSTEMCTL, &args).await {
+        Ok(o) if o.success() => Ok(true),
+        Ok(o) => Ok(!matches!(o.stdout.trim(), "inactive" | "failed" | "")),
+        Err(e) => Err(format!("cannot tell whether {unit} runs: {e}")),
+    }
+}
+
+/// Restart one unit of the allowlist, a member of a group included, through
+/// the same root helper as the Services card
+/// (`tessera-web-unitfile@restart-<unit>.service`; the helper checks the
+/// allowlist again, and the polkit rule lists every member's instances).
+/// The portal's own unit is refused: the caller would not see the end.
+///
+/// # Errors
+/// The unit is not allowlisted or is the portal's own, or the restart failed
+/// (the message of [`perform`]).
+pub async fn restart_unit(r: &dyn Runner, cfg: &ApplianceConfig, unit: &str) -> Result<(), String> {
+    if is_own_unit(unit) {
+        return Err(format!("{unit} is this portal's own unit"));
+    }
+    let Some(entry) = cfg.services.iter().find(|e| e.has_unit(unit)) else {
+        return Err(format!("`{unit}` is not an [[appliance.service]] unit"));
+    };
+    let one = ServiceEntry {
+        units: vec![canonical_unit(unit)],
+        ..entry.clone()
+    };
+    perform(r, &one, Action::Restart, None).await
+}
+
 /// At most [`STDERR_MAX`] characters, then `…`.
 fn bounded(mut s: String) -> String {
     if s.chars().count() > STDERR_MAX {
@@ -1371,6 +1410,90 @@ mod tests {
             e,
             "systemctl restart a.service: the portal stopped waiting after 10 s; the action may still complete (details: journalctl -u tessera-web-unitfile@restart-a.service)"
         );
+    }
+
+    #[tokio::test]
+    async fn one_member_of_a_group_is_restarted_alone_through_the_helper() {
+        let c = cfg(vec![
+            entry(&["tessera-web"], true),
+            entry(&["bluealsa", "bluealsa-aplay"], false),
+        ]);
+        let r = FakeRunner::default();
+        let helper = "tessera-web-unitfile@restart-bluealsa-aplay.service";
+        r.script(&[SYSTEMCTL, "start", helper], Output::ok(""));
+        assert_eq!(restart_unit(&r, &c, "bluealsa-aplay").await, Ok(()));
+        assert_eq!(r.calls(), [argv(&[SYSTEMCTL, "start", helper])]);
+        // The helper accepts that instance: the member is in the allowlist.
+        let h = FakeRunner::default();
+        h.script(
+            &[SYSTEMCTL, "restart", "bluealsa-aplay.service"],
+            Output::ok(""),
+        );
+        assert_eq!(run_unitfile(&h, &c, "restart-bluealsa-aplay").await, Ok(0));
+        assert!(polkit_rules(&c).contains(&format!("\"{helper}\"")));
+        // Not listed, or the portal itself: nothing runs.
+        r.clear_calls();
+        assert!(
+            restart_unit(&r, &c, "cron")
+                .await
+                .unwrap_err()
+                .contains("not an [[appliance.service]] unit")
+        );
+        assert!(restart_unit(&r, &c, "tessera-web").await.is_err());
+        assert!(r.calls().is_empty());
+        // A failed restart says so, with the helper's journal.
+        r.script(
+            &[SYSTEMCTL, "start", helper],
+            Output::fail(1, "Job failed.\n"),
+        );
+        let e = restart_unit(&r, &c, "bluealsa-aplay.service")
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("Job failed.") && e.contains("journalctl -u"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_active_reads_the_word_not_only_the_exit_code() {
+        let r = FakeRunner::default();
+        let ask = |u: &str| argv(&[SYSTEMCTL, "is-active", u]);
+        r.script(
+            &[SYSTEMCTL, "is-active", "a.service"],
+            Output::ok("active\n"),
+        );
+        r.script(
+            &[SYSTEMCTL, "is-active", "b.service"],
+            Output {
+                code: Some(3),
+                stdout: "inactive\n".into(),
+                stderr: String::new(),
+            },
+        );
+        r.script(
+            &[SYSTEMCTL, "is-active", "c.service"],
+            Output {
+                code: Some(3),
+                stdout: "activating\n".into(),
+                stderr: String::new(),
+            },
+        );
+        r.script(
+            &[SYSTEMCTL, "is-active", "d.service"],
+            Output {
+                code: Some(3),
+                stdout: "failed\n".into(),
+                stderr: String::new(),
+            },
+        );
+        r.script_error(&[SYSTEMCTL, "is-active", "e.service"], RunError::Timeout);
+        assert_eq!(is_active(&r, "a").await, Ok(true));
+        assert_eq!(is_active(&r, "b").await, Ok(false));
+        assert_eq!(is_active(&r, "c.service").await, Ok(true));
+        assert_eq!(is_active(&r, "d").await, Ok(false));
+        assert!(is_active(&r, "e").await.is_err());
+        assert_eq!(r.calls()[0], ask("a.service"));
     }
 
     #[test]

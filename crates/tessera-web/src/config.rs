@@ -66,6 +66,9 @@ pub struct ApplianceConfig {
     /// `[appliance.volume]`: the amplifier's mixer control. `None`: no
     /// Volume card.
     pub volume: Option<VolumeConfig>,
+    /// `[appliance.rate_follow]`: the speaker chain follows the tessera
+    /// device's sample rate (off by default).
+    pub rate_follow: RateFollowConfig,
 }
 
 impl Default for ApplianceConfig {
@@ -105,6 +108,45 @@ impl Default for ApplianceConfig {
             .collect(),
             camilladsp: CamillaDspConfig::default(),
             volume: None,
+            rate_follow: RateFollowConfig::default(),
+        }
+    }
+}
+
+/// `[appliance.rate_follow]`: one sample rate for the whole speaker chain,
+/// the tessera device's ([`crate::appliance::rate_follow`]). The portal
+/// writes the rate into an ALSA snippet the shared bus reads when it opens,
+/// reopens the bus when it runs at another rate, and keeps the EQ engine's
+/// own rate keys at the device's rate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateFollowConfig {
+    /// The follower runs (appliance mode only).
+    pub enabled: bool,
+    /// The tessera device key to follow; `None`: the daemon's only device.
+    pub device: Option<String>,
+    /// The ALSA snippet the bus reads its rate from: `tessera.rate <Hz>`.
+    pub rate_file: PathBuf,
+    /// The bus's `hw_params` in `/proc/asound`: where its live rate is read.
+    /// `None`: the bus is not watched.
+    pub bus_hw_params: Option<PathBuf>,
+    /// Bus clients restarted, if active, while the bus runs at another
+    /// rate (each an `[[appliance.service]]` unit), in this order.
+    pub restart: Vec<String>,
+}
+
+impl RateFollowConfig {
+    /// The default `rate_file` (created by the package's tmpfiles entry).
+    pub const DEFAULT_RATE_FILE: &'static str = "/var/lib/tessera-rate/alsa.conf";
+}
+
+impl Default for RateFollowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device: None,
+            rate_file: Self::DEFAULT_RATE_FILE.into(),
+            bus_hw_params: None,
+            restart: Vec::new(),
         }
     }
 }
@@ -333,6 +375,74 @@ struct ApplianceFile {
     services: Option<Vec<ServiceFile>>,
     camilladsp: Option<CamillaFile>,
     volume: Option<VolumeFile>,
+    rate_follow: Option<RateFollowFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RateFollowFile {
+    enabled: Option<bool>,
+    device: Option<String>,
+    rate_file: Option<PathBuf>,
+    bus_hw_params: Option<PathBuf>,
+    restart: Option<Vec<String>>,
+}
+
+impl RateFollowConfig {
+    /// `services` is the final service list: every `restart` unit must be
+    /// in it, so the root helper and the polkit rule already allow it.
+    fn from_file(f: RateFollowFile, services: &[ServiceEntry]) -> Result<Self, String> {
+        let d = Self::default();
+        let device = match f.device.map(|k| k.trim().to_owned()) {
+            Some(k) if k.is_empty() => {
+                return Err("`appliance.rate_follow.device` must not be empty (leave it out to follow the only device)".into());
+            }
+            other => other,
+        };
+        let rate_file = f.rate_file.unwrap_or(d.rate_file);
+        if !rate_file.is_absolute() || rate_file.file_name().is_none() {
+            return Err(format!(
+                "`appliance.rate_follow.rate_file`: `{}` is not an absolute file path",
+                rate_file.display()
+            ));
+        }
+        if let Some(p) = &f.bus_hw_params {
+            if !p.is_absolute() || p.file_name().is_none() {
+                return Err(format!(
+                    "`appliance.rate_follow.bus_hw_params`: `{}` is not an absolute file path",
+                    p.display()
+                ));
+            }
+        }
+        let restart = f.restart.unwrap_or_default();
+        for (i, u) in restart.iter().enumerate() {
+            let at = format!("`appliance.rate_follow.restart[{i}]`");
+            if !valid_unit_name(u) {
+                return Err(format!("{at}: `{u}` is not a service name"));
+            }
+            if is_own_unit(u) || canonical_unit(u) == "tesserad.service" {
+                return Err(format!(
+                    "{at}: `{u}` cannot be restarted by the follower (the portal itself, or the daemon, which restarts its bridge on a rate change)"
+                ));
+            }
+            if !services.iter().any(|e| e.has_unit(u)) {
+                return Err(format!(
+                    "{at}: `{u}` is not an [[appliance.service]] unit (only listed units may be restarted)"
+                ));
+            }
+            let c = canonical_unit(u);
+            if restart.iter().filter(|x| canonical_unit(x) == c).count() > 1 {
+                return Err(format!("{at}: `{u}` is listed twice"));
+            }
+        }
+        Ok(Self {
+            enabled: f.enabled.unwrap_or(d.enabled),
+            device,
+            rate_file,
+            bus_hw_params: f.bus_hw_params,
+            restart,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,19 +646,25 @@ impl ApplianceConfig {
                 }
             }
         };
+        let services = if use_defaults {
+            Self::default().services
+        } else {
+            services
+        };
+        let rate_follow = match f.rate_follow {
+            Some(r) => RateFollowConfig::from_file(r, &services)?,
+            None => RateFollowConfig::default(),
+        };
         Ok(Self {
             enabled: f.enabled.unwrap_or(false),
             hostname_label: f
                 .hostname_label
                 .map(|h| h.trim().to_owned())
                 .filter(|h| !h.is_empty()),
-            services: if use_defaults {
-                Self::default().services
-            } else {
-                services
-            },
+            services,
             camilladsp,
             volume: f.volume.map(VolumeConfig::from_file).transpose()?,
+            rate_follow,
         })
     }
 }
@@ -843,6 +959,73 @@ max_upload_bytes = 1024
     }
 
     #[test]
+    fn rate_follow_is_off_by_default_and_validated() {
+        let c = WebConfig::parse("").unwrap().appliance.rate_follow;
+        assert_eq!(c, RateFollowConfig::default());
+        assert!(!c.enabled && c.device.is_none() && c.restart.is_empty());
+        assert_eq!(
+            c.rate_file,
+            Path::new("/var/lib/tessera-rate/alsa.conf"),
+            "the package's tmpfiles entry seeds this file"
+        );
+        // A group member is a unit of its own for the follower.
+        let services = "[[appliance.service]]\nunit = \"tesserad\"\nlabel = \"a\"\n\
+                        [[appliance.service]]\nunit = \"squeezelite\"\nlabel = \"b\"\n\
+                        [[appliance.service]]\nunits = [\"bluealsa\", \"bluealsa-aplay\"]\nlabel = \"c\"\n";
+        let c = WebConfig::parse(&format!(
+            "{services}[appliance.rate_follow]\nenabled = true\ndevice = \" main \"\nrate_file = \"/run/x/rate.conf\"\n\
+             bus_hw_params = \"/proc/asound/Loopback/pcm0p/sub0/hw_params\"\nrestart = [\"squeezelite\", \"bluealsa-aplay.service\"]\n"
+        ))
+        .unwrap()
+        .appliance
+        .rate_follow;
+        assert!(c.enabled);
+        assert_eq!(c.device.as_deref(), Some("main"));
+        assert_eq!(c.rate_file, Path::new("/run/x/rate.conf"));
+        assert_eq!(
+            c.bus_hw_params.as_deref(),
+            Some(Path::new("/proc/asound/Loopback/pcm0p/sub0/hw_params"))
+        );
+        assert_eq!(c.restart, ["squeezelite", "bluealsa-aplay.service"]);
+        for (bad, why) in [
+            (
+                "restart = [\"cron\"]",
+                "is not an [[appliance.service]] unit",
+            ),
+            (
+                "restart = [\"tesserad\"]",
+                "cannot be restarted by the follower",
+            ),
+            (
+                "restart = [\"tessera-web\"]",
+                "cannot be restarted by the follower",
+            ),
+            ("restart = [\"a b\"]", "is not a service name"),
+            (
+                "restart = [\"squeezelite\", \"squeezelite.service\"]",
+                "listed twice",
+            ),
+            ("rate_file = \"alsa.conf\"", "not an absolute file path"),
+            ("rate_file = \"/\"", "not an absolute file path"),
+            ("bus_hw_params = \"hw_params\"", "not an absolute file path"),
+            ("device = \"  \"", "must not be empty"),
+            ("colour = 1", "colour"),
+        ] {
+            let e = err(&format!("{services}[appliance.rate_follow]\n{bad}\n"));
+            assert!(e.contains(why), "{bad}: {e}");
+            if !bad.starts_with("colour") {
+                assert!(e.starts_with("`appliance.rate_follow."), "{bad}: {e}");
+            }
+        }
+        // The default service list counts too: its units may be listed.
+        let c = WebConfig::parse("[appliance.rate_follow]\nrestart = [\"avahi-daemon\"]\n")
+            .unwrap()
+            .appliance
+            .rate_follow;
+        assert_eq!(c.restart, ["avahi-daemon"]);
+    }
+
+    #[test]
     fn service_entries_are_validated_and_errors_name_the_key() {
         let e = err("[[appliance.service]]\nlabel = \"x\"\nunit = \"a\"\nunits = [\"b\"]\n");
         assert!(
@@ -967,6 +1150,10 @@ max_upload_bytes = 1024
         assert!(c.appliance.services[0].essential);
         assert!(c.appliance.services[4].is_group());
         assert!(c.appliance.camilladsp.gui_url.is_some());
+        let r = &c.appliance.rate_follow;
+        assert!(!r.enabled, "the example keeps the rate follower off");
+        assert_eq!(r.rate_file, RateFollowConfig::default().rate_file);
+        assert!(r.bus_hw_params.is_some() && r.restart == ["shairport-sync"]);
     }
 
     #[test]

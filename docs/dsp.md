@@ -155,7 +155,12 @@ engine's spelling: `S32_LE`, `S24_3_LE`, `S24_4_LE` or `S16_LE`), activate it in
   configuration does; if they ever differ the engine cannot start and the speaker stays silent. The
   Speaker page then shows an *EQ engine input rate mismatch* notice with both rates and, when the
   configuration has a resampler, a button that sets only `capture_samplerate` and reloads the engine
-  ([raspberry-pi-speaker.md](raspberry-pi-speaker.md)).
+  ([raspberry-pi-speaker.md](raspberry-pi-speaker.md)). With the portal's rate follower
+  (`[appliance.rate_follow]`, off by default) tessera dictates the rate: the engine's `samplerate`
+  and a set `capture_samplerate` are overwritten with the device's rate, in the active configuration
+  and in the running engine, whenever they differ (a configuration restored or applied in the GUI
+  included), and the notice offers no button
+  ([raspberry-pi-speaker.md](raspberry-pi-speaker.md#shared-sources-and-one-sample-rate)).
 
 - **Format.** The seeded configuration plays in the first of `S32_LE`, `S24_3_LE` (ALSA's
   `S24_3LE`), `S24_4_LE` (ALSA's `S24_LE`) and `S16_LE` that the sound card accepts; the names are

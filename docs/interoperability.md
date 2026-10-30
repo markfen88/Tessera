@@ -5,7 +5,7 @@ flows and, with the opt-in native device role, the device side of the vendor's
 control protocols. The project targets interoperability with Dante® media
 networks; it is not vendor-certified, affiliated with or endorsed by Audinate.
 
-| Capability | Status in 0.5.0 |
+| Capability | Status in 0.5.1 |
 |---|---|
 | PTPv1 follower/leader and holdover | Implemented; drives media time, never the host's wall clock |
 | PTPv1 election with Preferred Leader | Implemented: lower MAC decides between preferred leaders, stratum 0x2A to 0x2D, Sync every 250 ms, warning on a rival preferred leader; provisional values |

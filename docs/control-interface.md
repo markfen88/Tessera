@@ -36,7 +36,7 @@ configuration files are the other input: a reload is itself a command
 
 ## Stability
 
-`tessera-control-types` (`crates/tessera-control-types`, version 0.5.0) is the
+`tessera-control-types` (`crates/tessera-control-types`, version 0.5.1) is the
 typed public integration contract. Its rules:
 
 - Changes are **additive**. Most enums and structs are `#[non_exhaustive]`

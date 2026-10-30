@@ -1,5 +1,60 @@
 # Tessera changelog
 
+## 0.5.1
+
+Tessera 0.5.1 answers a controller's question for the device latency range, and
+lets a speaker's whole audio chain follow the tessera device's sample rate. It
+is interoperable with Dante® in the areas listed in 0.5.0; it is not certified.
+
+### Native device role
+
+- Device latency: the device now tells a controller the range a latency change
+  may use (smallest and largest value, from `latency_bounds_us` raised to the
+  platform's timing floor unless `allow_unsafe_latency`), and both the
+  configured and the active latency are writable, as the compatibility runtime
+  answered when the vendor's controller offered its Device Latency control.
+  The same rule checks every latency write. A write may name either latency
+  value (both must agree), and every accepted write is logged with its form.
+  Whether the vendor's controller now enables its Device Latency control has not
+  been verified yet.
+- A latency the configuration locks (`locked = ["latency"]`) is shown as
+  read-only to controllers.
+
+### Portal
+
+- Rate follower (`[appliance.rate_follow]`, appliance mode, off by default):
+  on a speaker whose sources share an ALSA `dmix` bus in front of CamillaDSP,
+  the tessera device's sample rate (set from the vendor controller, the portal
+  or `tesseractl set-rate`) is the only rate. Every 2 s the portal writes it
+  into `/var/lib/tessera-rate/alsa.conf` (`tessera.rate <Hz>`, which the bus
+  reads when it opens); while the bus runs at another rate it stops CamillaDSP
+  and restarts the listed players so the bus reopens; and it keeps CamillaDSP's
+  `samplerate` and a set `capture_samplerate` at the device's rate, in the
+  active configuration (only those values change) and in the running engine. A
+  restored or GUI-applied configuration at another rate is corrected the same
+  way. A rate change interrupts every source for a few seconds. Failures are
+  retried after 2 s, doubling to 60 s, and shown on the Speaker page under
+  *Sample rate follows the network device*; the capture-rate notice offers no
+  button while the follower runs.
+  [Setup](docs/raspberry-pi-speaker.md#shared-sources-and-one-sample-rate),
+  [keys](docs/web-portal.md#rate-follower).
+- `tessera-web` creates `/var/lib/tessera-rate` (0755, `tessera-web`) with the
+  file at 48000, and its unit may write there.
+- CamillaDSP 4.x refusals (`"result": {"ConfigValidationError": "..."}` or an
+  error name) are reported as the engine's refusal with its message, not as a
+  protocol error (after which the boost and the capture-rate fix restarted the
+  engine).
+
+### Limits
+
+- The 0.5.0 limit "the vendor's controller could not change a native device's
+  sample rate in one setup": that device had a bridge with `sample_rate` set,
+  which pins the device rate (`tesseractl status` and the portal name the
+  bridge). Without such a bridge the controller offers the rate. Leave
+  `sample_rate` out of a bridge whose card can follow the device, as the rate
+  follower requires.
+- The 0.5.0 limits otherwise still apply.
+
 ## 0.5.0
 
 Tessera 0.5.0 lets `tesserad` serve the device role itself. A host that enables

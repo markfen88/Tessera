@@ -5,8 +5,12 @@
 //! The protocol (CamillaDSP 4.x): a plain `ws://` socket; one text frame
 //! carrying JSON: a bare string for a command without an argument
 //! (`"GetState"`) or a one-key object with it (`{"SetVolume": -12.0}`); the
-//! reply is `{"<Command>": {"result": "Ok", "value": ...}}`, or `"Error"`
-//! with the message in `value`. The server pings; the websocket library
+//! reply is `{"<Command>": {"result": "Ok", "value": ...}}`. A refusal is
+//! another `result`: the name of the error (`"InvalidFaderError"`), or a
+//! one-key object with the name and the message
+//! (`{"ConfigValidationError": "..."}`), as 4.1.3's `websocket.md` documents;
+//! earlier engines answer `"Error"` with the message in `value`, which is
+//! read the same way. The server pings; the websocket library
 //! answers them. Every call is one short-lived connection with an overall
 //! timeout and a bound on the message and frame sizes. Only what the page
 //! needs is implemented.
@@ -44,8 +48,8 @@ use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use crate::Shared;
 use crate::appliance::capture_rate;
 use crate::appliance::files::{self, Kind, is_regular, write_atomic, write_in_place};
-use crate::appliance::services::{Action, Runner, SYSTEMCTL};
-use crate::config::{ApplianceConfig, CamillaDspConfig, GUI_HOST_PLACEHOLDER, canonical_unit};
+use crate::appliance::services::{Action, Runner};
+use crate::config::{ApplianceConfig, CamillaDspConfig, GUI_HOST_PLACEHOLDER};
 use crate::pages::{is_live, khz, live_answer, need_post, status_of};
 
 /// The whole exchange (connect, send, reply, close) must finish in this.
@@ -114,6 +118,14 @@ pub enum Command {
     SetConfigFilePath(String),
     /// The engine's version.
     GetVersion,
+    /// Stop processing (the capture and playback devices close) and wait
+    /// for a configuration (`SetConfigFilePath` and `Reload`, or
+    /// `SetConfigJson`).
+    Stop,
+    /// The running configuration, as a JSON text (`null` without one).
+    GetConfigJson,
+    /// Run this configuration (a JSON text) now; the file is not touched.
+    SetConfigJson(String),
 }
 
 impl Command {
@@ -129,6 +141,9 @@ impl Command {
             Self::GetConfigFilePath => "GetConfigFilePath",
             Self::SetConfigFilePath(_) => "SetConfigFilePath",
             Self::GetVersion => "GetVersion",
+            Self::Stop => "Stop",
+            Self::GetConfigJson => "GetConfigJson",
+            Self::SetConfigJson(_) => "SetConfigJson",
         }
     }
 
@@ -137,7 +152,9 @@ impl Command {
     pub fn json(&self) -> String {
         let v = match self {
             Self::SetVolume(db) => serde_json::json!({ self.name(): db }),
-            Self::SetConfigFilePath(p) => serde_json::json!({ self.name(): p }),
+            Self::SetConfigFilePath(p) | Self::SetConfigJson(p) => {
+                serde_json::json!({ self.name(): p })
+            }
             _ => Value::String(self.name().to_owned()),
         };
         v.to_string()
@@ -147,8 +164,10 @@ impl Command {
 /// Parse the reply to `cmd`: the `value` of an `Ok` result.
 ///
 /// # Errors
-/// [`WsError::Rejected`] for `result: Error`; [`WsError::Protocol`] for
-/// anything else than the documented shape.
+/// [`WsError::Rejected`] for any other `result` string (`Error` with the
+/// message in `value`, or a 4.x error name) or a one-key error object
+/// (`{"ConfigValidationError": "..."}`, given as `name: message`);
+/// [`WsError::Protocol`] for anything else than the documented shape.
 pub fn parse_reply(cmd: &str, text: &str) -> Result<Value, WsError> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| WsError::Protocol(format!("bad JSON: {e}")))?;
@@ -161,15 +180,23 @@ pub fn parse_reply(cmd: &str, text: &str) -> Result<Value, WsError> {
             "reply to {cmd} has keys {keys:?}"
         )));
     };
-    let result = inner.get("result").and_then(Value::as_str);
     let value = inner.get("value").cloned().unwrap_or(Value::Null);
-    match result {
-        Some("Ok") => Ok(value),
-        Some("Error") => Err(WsError::Rejected(match &value {
-            Value::String(s) => s.clone(),
-            Value::Null => "no message".into(),
-            other => other.to_string(),
+    let message = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "no message".into(),
+        other => other.to_string(),
+    };
+    match inner.get("result") {
+        Some(Value::String(r)) if r == "Ok" => Ok(value),
+        Some(Value::String(r)) if r == "Error" => Err(WsError::Rejected(message(&value))),
+        Some(Value::String(r)) if !r.is_empty() => Err(WsError::Rejected(match &value {
+            Value::String(s) => format!("{r}: {s}"),
+            _ => r.clone(),
         })),
+        Some(Value::Object(o)) if o.len() == 1 => {
+            let (name, why) = o.iter().next().map_or(("", &Value::Null), |(k, v)| (k, v));
+            Err(WsError::Rejected(format!("{name}: {}", message(why))))
+        }
         other => Err(WsError::Protocol(format!("result is {other:?}"))),
     }
 }
@@ -358,6 +385,38 @@ impl Client {
     /// [`WsError`].
     pub async fn get_version(&self) -> Result<String, WsError> {
         expect_string(self.call(&Command::GetVersion).await?)
+    }
+
+    /// `Stop`.
+    ///
+    /// # Errors
+    /// [`WsError`].
+    pub async fn stop(&self) -> Result<(), WsError> {
+        self.call(&Command::Stop).await.map(|_| ())
+    }
+
+    /// `GetConfigJson`: the running configuration, `None` without one. The
+    /// value is a JSON text (4.x); an object is taken as it is.
+    ///
+    /// # Errors
+    /// [`WsError`]; a text that is not JSON is a protocol error.
+    pub async fn get_config_json(&self) -> Result<Option<Value>, WsError> {
+        let v = match self.call(&Command::GetConfigJson).await? {
+            Value::String(s) => serde_json::from_str(&s)
+                .map_err(|e| WsError::Protocol(format!("GetConfigJson value is not JSON: {e}")))?,
+            other => other,
+        };
+        Ok((!v.is_null()).then_some(v))
+    }
+
+    /// `SetConfigJson` with `config` (sent as a JSON text).
+    ///
+    /// # Errors
+    /// [`WsError`].
+    pub async fn set_config_json(&self, config: &Value) -> Result<(), WsError> {
+        self.call(&Command::SetConfigJson(config.to_string()))
+            .await
+            .map(|_| ())
     }
 }
 
@@ -869,6 +928,26 @@ async fn restart(
         .map(|()| Applied::Restarted)
 }
 
+/// The active configuration `path` as the portal may edit it: a regular
+/// file directly in `configs_dir` under an accepted name. Its path there
+/// and its name.
+///
+/// # Errors
+/// Outside `configs_dir`, or not such a file.
+pub(super) fn editable(c: &CamillaDspConfig, path: &Path) -> Result<(PathBuf, String), String> {
+    let name = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(n)) if dir == c.configs_dir => n.to_owned(),
+        _ => {
+            return Err(format!(
+                "the active configuration `{}` is outside {}; the portal edits only files there",
+                path.display(),
+                c.configs_dir.display()
+            ));
+        }
+    };
+    Ok((config_file(c, &name)?, name))
+}
+
 /// The path of `name` in `configs_dir` when it is a regular file there
 /// (no symlink, no name outside the rules).
 fn config_file(cfg: &CamillaDspConfig, name: &str) -> Result<PathBuf, String> {
@@ -905,20 +984,12 @@ pub async fn activate(
     switch(cfg, runner, name, &path).await
 }
 
-/// `systemctl is-active <unit>` (no privilege): `Ok(true)` unless the
-/// unit is `inactive`, `failed` or unknown. A unit that is `activating`,
-/// `deactivating`, `reloading` or `refreshing` counts as running (exit
-/// code is non-zero then, the word is on standard output).
+/// Is the engine's unit running ([`crate::appliance::services::is_active`])?
 ///
 /// # Errors
 /// `systemctl` could not be run.
-async fn unit_active(runner: &dyn Runner) -> Result<bool, String> {
-    let args = vec!["is-active".to_owned(), canonical_unit(UNIT)];
-    match runner.run(SYSTEMCTL, &args).await {
-        Ok(o) if o.success() => Ok(true),
-        Ok(o) => Ok(!matches!(o.stdout.trim(), "inactive" | "failed" | "")),
-        Err(e) => Err(format!("cannot tell whether the EQ engine runs: {e}")),
-    }
+pub(super) async fn unit_active(runner: &dyn Runner) -> Result<bool, String> {
+    crate::appliance::services::is_active(runner, UNIT).await
 }
 
 async fn switch(
@@ -998,18 +1069,7 @@ pub async fn set_boost(
     let Some(path) = active.path else {
         return Err("the EQ engine has no active configuration".into());
     };
-    // Only a regular file in the configuration directory is edited.
-    let name = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
-        (Some(dir), Some(n)) if dir == c.configs_dir => n.to_owned(),
-        _ => {
-            return Err(format!(
-                "the active configuration `{}` is outside {}; the portal edits only files there",
-                path.display(),
-                c.configs_dir.display()
-            ));
-        }
-    };
-    let path = config_file(c, &name)?;
+    let (path, _) = editable(c, &path)?;
     let yaml = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| format!("cannot read the active EQ configuration: {e}"))?;
@@ -1044,17 +1104,7 @@ pub async fn set_capture_rate(
     let path = active
         .path
         .ok_or_else(|| "the EQ engine has no active configuration".to_owned())?;
-    let name = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
-        (Some(dir), Some(n)) if dir == c.configs_dir => n.to_owned(),
-        _ => {
-            return Err(format!(
-                "the active configuration `{}` is outside {}; the portal edits only files there",
-                path.display(),
-                c.configs_dir.display()
-            ));
-        }
-    };
-    let path = config_file(c, &name)?;
+    let (path, name) = editable(c, &path)?;
     let yaml = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| format!("cannot read the active EQ configuration: {e}"))?;
@@ -1513,6 +1563,13 @@ pipeline:
             "{\"SetConfigFilePath\":\"/x/a.yml\"}"
         );
         assert_eq!(Command::GetVersion.name(), "GetVersion");
+        assert_eq!(Command::Stop.json(), "\"Stop\"");
+        assert_eq!(Command::GetConfigJson.json(), "\"GetConfigJson\"");
+        // The configuration travels as a JSON text, not as an object.
+        assert_eq!(
+            Command::SetConfigJson("{\"devices\":{\"samplerate\":96000}}".into()).json(),
+            "{\"SetConfigJson\":\"{\\\"devices\\\":{\\\"samplerate\\\":96000}}\"}"
+        );
     }
 
     #[test]
@@ -1535,11 +1592,32 @@ pipeline:
             ),
             Err(WsError::Rejected("no such file".into()))
         );
+        // CamillaDSP 4.x: the error is the `result` itself, a name or a
+        // one-key object with the message.
+        assert_eq!(
+            parse_reply(
+                "SetConfigJson",
+                "{\"SetConfigJson\":{\"result\":{\"ConfigValidationError\":\"bad samplerate\"}}}"
+            ),
+            Err(WsError::Rejected(
+                "ConfigValidationError: bad samplerate".into()
+            ))
+        );
+        assert_eq!(
+            parse_reply(
+                "Stop",
+                "{\"Stop\":{\"result\":\"ShutdownInProgressError\"}}"
+            ),
+            Err(WsError::Rejected("ShutdownInProgressError".into()))
+        );
         for bad in [
             "{\"GetVolume\":{\"result\":\"Ok\"}}",
             "nope",
             "[1]",
-            "{\"GetState\":{\"result\":\"Maybe\"}}",
+            "{\"GetState\":{\"result\":7}}",
+            "{\"GetState\":{\"result\":\"\"}}",
+            "{\"GetState\":{\"result\":{}}}",
+            "{\"GetState\":{\"value\":\"Running\"}}",
         ] {
             assert!(
                 matches!(parse_reply("GetState", bad), Err(WsError::Protocol(_))),

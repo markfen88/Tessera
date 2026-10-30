@@ -45,6 +45,10 @@ PrivateDevices=yes
 # ([appliance.camilladsp] configs_dir, coeffs_dir, statefile).
 ReadWritePaths=-/run/tessera
 ReadWritePaths=-/run/tessera-network
+# The rate follower's ALSA snippet ([appliance.rate_follow] rate_file, from
+# the package's tmpfiles entry): world-readable, unlike the state directory,
+# because every ALSA client of the speaker's bus reads it.
+ReadWritePaths=-/var/lib/tessera-rate
 # The portal's own state: the amplifier volume it sets again at start
 # (/var/lib/tessera-web/volume.json). systemd creates the directory, owned by
 # the portal's user, and makes it writable under ProtectSystem=strict.

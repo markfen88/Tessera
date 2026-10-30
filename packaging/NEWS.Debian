@@ -1,3 +1,22 @@
+tessera (0.5.1-1) unstable; urgency=medium
+
+  A running tesserad is not restarted by the upgrade: restart it when an
+  audio interruption is acceptable. Upgrade tessera and tessera-web
+  together.
+
+  With the native device role, a controller is now told the device latency
+  range (from latency_bounds_us and the platform's timing floor) and may
+  write the configured or the active latency. Nothing to do on upgrade.
+
+  tessera-web: the rate follower ([appliance.rate_follow], off by
+  default) makes the tessera device's sample rate the only rate of a
+  speaker whose sources share a dmix bus in front of CamillaDSP. The
+  package creates /var/lib/tessera-rate/alsa.conf (tessera.rate 48000);
+  the bus and the bridge need configuration changes before it is enabled:
+  docs/raspberry-pi-speaker.md, "Shared sources and one sample rate".
+
+ -- tessera maintainers <tessera@invalid>  Fri, 30 Oct 2026 12:00:00 +0000
+
 tessera (0.5.0-1) unstable; urgency=medium
 
   A running tesserad is not restarted by the upgrade: restart it when an

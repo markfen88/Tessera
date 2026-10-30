@@ -273,13 +273,14 @@ fn gateway(interface: &str) -> Option<Ipv4Addr> {
     })
 }
 
-/// The configured latency of `model` in ns, reported as its default receive
-/// latency (ARC 0x8204, `device-settings.md` §4.2); the active latency when
+/// The latency properties of `model` (ARC 0x1100/0x1102,
+/// `device-settings.md` §§4.2, 4.4). The configured latency is reported as
+/// the default receive latency (0x8204); the active latency stands in when
 /// the configuration cannot be read.
-async fn default_latency_ns(
+async fn latency_properties(
     engine: &EngineHandle,
     model: &tessera_state::model::DeviceModel,
-) -> u32 {
+) -> wire::Properties {
     let configured = engine.runtime_plan().await.ok().and_then(|rp| {
         rp.config
             .devices
@@ -287,7 +288,16 @@ async fn default_latency_ns(
             .find(|d| d.id == model.key.0)
             .map(|d| d.latency_us)
     });
-    configured.unwrap_or(model.latency_us).saturating_mul(1000)
+    let ns = |us: u32| us.saturating_mul(1000);
+    let [lo, hi] = model.latency_range_us();
+    wire::Properties {
+        default_latency_ns: ns(configured.unwrap_or(model.latency_us)),
+        latency_ns: ns(model.latency_us),
+        latency_range_ns: [ns(lo), ns(hi)],
+        latency_writable: !model
+            .locked
+            .contains(&tessera_state::config::DeviceLock::Latency),
+    }
 }
 
 /// The ARC view of the first device and its model, read fresh.
