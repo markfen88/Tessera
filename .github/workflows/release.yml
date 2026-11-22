@@ -120,6 +120,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -166,7 +167,7 @@ jobs:
           # Verified with the key compiled into this release's installer.
           cargo xtask verify-release --version "$version" --dir release
           ls -l release
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest@v4
         with:
           subject-path: release/*
       - name: Publish the GitHub release
