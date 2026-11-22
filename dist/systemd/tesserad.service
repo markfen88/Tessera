@@ -25,6 +25,9 @@ ReloadSignal=SIGHUP
 NotifyAccess=main
 User=tessera
 Group=tessera
+# Group audio: /dev/snd/* (sound cards of card bridges, MIDI ports of
+# MIDI surfaces) is root:audio 0660.
+SupplementaryGroups=audio
 Slice=tesseraaudio.slice
 ExecStart=/usr/bin/tesserad
 Restart=on-failure
@@ -77,10 +80,17 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# Devices: ALSA cards (hardware bridge) and PTP hardware clocks only.
+# Devices: ALSA cards (hardware bridge) and MIDI ports of MIDI surfaces
+# (/dev/snd/midiC*D*, opened read-write: char-alsa is the whole ALSA major,
+# PCM, control and rawmidi nodes alike), PTP hardware clocks, and HID
+# interfaces read by control surfaces ([[surface]], read only; a udev rule
+# such as dist/udev/70-tessera-surfaces.rules gives group tessera read
+# access to the surface's /dev/hidraw node). This only lets the cgroup
+# through: the nodes' own permissions still apply (group audio above).
 DevicePolicy=closed
 DeviceAllow=char-alsa rw
 DeviceAllow=char-ptp rw
+DeviceAllow=char-hidraw r
 
 [Install]
 WantedBy=multi-user.target

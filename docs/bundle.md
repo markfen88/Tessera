@@ -316,7 +316,7 @@ The files of a GitHub release come from the release workflow
 and arm64 in `debian:trixie` containers, the Ubuntu 24.04 arm64 bundle on an
 Ubuntu runner, all from the `v*` tag. It then signs them, records GitHub build
 provenance (`gh attestation verify <file> --repo markfen88/Tessera`) and
-publishes them once a maintainer approves.
+publishes them: pushing the tag is the decision to publish.
 
 Package files appear in target/deb; bundles appear in target/bundle. A build
 produces artifacts and does not install them or restart services. On amd64 and arm64

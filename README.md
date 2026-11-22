@@ -1,22 +1,39 @@
-# Tessera 0.5.2
+# Tessera 0.6.0
 
-Tessera 0.5.2 is a packaging release: the software of 0.5.1, published as signed
-Debian 13 packages and bundles built by the public release workflow, with the
-project's release key built into the bundle installer.
+Tessera 0.6.0 turns Tessera into a full host audio router with custom mixing
+panels, hardware control surfaces, and daemon-owned speaker volume:
 
-Tessera 0.5.1 told network controllers the device latency range a change may
-use, and let the portal make a speaker's whole audio chain (bridge, ALSA bus,
-CamillaDSP) follow the tessera device's sample rate.
+- **Host audio router (`/router`, `tesseractl router`).** Two layers separate
+  what the network sees (one logical network device's RX and TX channels) from
+  local I/O (sound cards/DACs/USB mixers, local apps, and speaker outputs).
+  Local I/O stays local until patched. Destinations sum every crosspoint that
+  feeds them with per-crosspoint gain and mute, port levels and labels, and
+  one-click **Patch cards to the network**. The default grid reproduces 0.5
+  behaviour until edited.
+- **Sound-card bridges (`/audio`, `tesseractl bridge`).** Bridge any ALSA card
+  or a channel slice (`card_first_channel`, such as an Allen & Heath CQ's Main
+  L/R on USB 15–16), with `local_only` routing, low-latency periods and drift
+  compensation. `tesserad` now runs with group `audio` out of the box.
+- **Levels and host volume (`[host_volume]`, `tesseractl volume`).** Channel
+  input gain/mute, post-mix output stage, router port/crosspoint levels, and
+  daemon-owned speaker amplifier volume over the ALSA mixer API.
+- **Control surfaces (`/surfaces`, `tesseractl surface`).** Connect out to USB
+  HID, USB MIDI (`rawmidi`), and MIDI-over-TCP desks (such as the Allen & Heath
+  CQ on port `51325`); apply or share strict-key TOML/JSON
+  [surface profiles](docs/surface-profiles.md), **Learn** controls, drive
+  channels, host volume, router ports, crosspoints or **Follow** another
+  surface's control.
+- **Mixer panels (`/mixer`, `tesseractl mixer`).** A default desk of active
+  channels plus a panel editor to build custom fader/button desks, link strips
+  to hardware controls, and mix from a phone.
+- **Network routing fixes (`/routing`).** Static `[[flow]]` entries appear as
+  receiving, only enabled bridges annotate channels, every local RX input is
+  listed, and plain reasons explain when routes cannot be changed.
 
-Tessera 0.5.0 added an opt-in native device role to the daemon (`--native-device`):
-`tesserad` itself answers a network controller, negotiates receive flows from the
-saved subscriptions and serves transmit flows, in place of the packaged
-compatibility runtime on that host. The portal's **Routing** page connects,
-replaces and disconnects inputs from either host, one transmit channel can feed
-several inputs, and a device can be locked behind a PIN. Hosts that do not
-enable the role keep the packaged compatibility runtime as their controller
-interface. See [the changelog](CHANGELOG.md) for what works and what does
-not yet.
+Tessera 0.5.0–0.5.2 added the opt-in native device role (`--native-device`),
+the **Network routing** matrix, device access lock PINs, speaker rate
+following, and signed Debian 13 packages and bundles. See
+[the changelog](CHANGELOG.md) for the full list of changes and upgrade notes.
 
 Tessera is an experimental, open audio-over-IP stack for Linux, written in Rust
 and licensed under MPL-2.0. It provides a PTPv1 media clock, UDP audio flows,
@@ -39,14 +56,20 @@ affiliated with or endorsed by Audinate.
 
 ## What it provides
 
-- `tesserad`: multiple logical devices, RX/TX channels, static unicast/multicast
-  flows and a virtual media clock. PTP never changes the host's wall clock.
+- `tesserad`: logical devices, a real-time host audio router between local I/O
+  and network channels, RX/TX channels with per-channel and post-mix levels,
+  daemon-owned `[host_volume]` over ALSA mixer, outbound USB HID / USB MIDI /
+  MIDI-over-TCP control surfaces, static and native flows, and a virtual PTPv1
+  media clock. PTP never changes the host's wall clock.
 - `tesseractl`: status, devices, names/channels, rate/encoding/latency, clock,
-  configuration and typed control commands.
+  host router, host volume, bridges, local monitoring, control surfaces, mixer
+  panels, network routing, configuration and typed control commands.
 - `tessera-web`: authenticated server-rendered controls with live updates,
-  light/dark appearance, metrics, events and optional speaker/service/EQ controls.
-- ALSA PCM capture/playback, a PipeWire client and an optional in-daemon sound-card
-  bridge with drift compensation.
+  light/dark appearance, **Mixer**, **Router**, **Audio**, **Surfaces**,
+  **Network routing**, metrics, events and optional speaker/service/EQ controls.
+- ALSA PCM capture/playback, a PipeWire client and an optional in-daemon
+  sound-card bridge with channel slicing (`card_first_channel`), `local_only`
+  routing and drift compensation.
 - `tessera-network`: a separate privileged helper for standalone management/audio
   VLANs, recoverable apply and traffic isolation, on systemd-networkd, Netplan,
   NetworkManager or ifupdown. The audio daemon stays unprivileged.
@@ -261,7 +284,7 @@ SKIP_PW=1 TESSERA_DAEMON_FEATURES=alsa-bridge TESSERA_DEB_REVISION=1 cargo xtask
 ```
 
 Build on the target OS/architecture. `TESSERA_DEB_REVISION` makes the package
-revision explicit in source archives. Version `0.5.2` is packaged as `0.5.2-*`. To create an
+revision explicit in source archives. Version `0.6.0` is packaged as `0.6.0-*`. To create an
 add-on bundle, use `cargo xtask build-bundle`, or its explicit Ubuntu opt-in.
 The tree contains no shell or Python scripts: packaging, bundle and test entry
 points are `cargo xtask` tasks. See [build/package options](docs/bundle.md#building).
@@ -290,8 +313,9 @@ access lock but not set it, the newer flow-list queries of current controllers
 are not answered (some tools refuse some operations because of that), and
 interface statistics are not reported; see
 [interoperability](docs/interoperability.md). Nothing in this release is certified.
-AES67, JACK, Bluetooth latency calibration, ARC/eARC capture and automatic lip-sync
-are not implemented.
+AES67, JACK, Bluetooth latency calibration, ARC/eARC capture, automatic lip-sync,
+and exposing an inbound MIDI port on Tessera for external software to control it
+are not implemented in 0.6.0 (Tessera connects out to control surfaces only).
 Static flow and packet settings remain provisional for external hardware.
 Standalone VLAN changes support one wired port on systemd-networkd, Netplan/networkd,
 NetworkManager and ifupdown (the last two are new and not yet accepted on live

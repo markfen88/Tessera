@@ -12,7 +12,30 @@
  * the page, asking in the row first for an essential entry. Elements
  * marked data-live-local belong to this script: the background refresh
  * never writes or removes them. Without this script every form still has
- * its Apply button and the server's confirmation page. */
+ * its Apply button and the server's confirmation page.
+ *
+ * The Device page's channel gain sliders work like the boost slider (one
+ * commit on release); its mute toggles and a surface's enabled switch
+ * (data-live-post) post in place. A refused gain (a surface fader owns it)
+ * hands the slider back to the refresh, which shows the owner. Learning a
+ * surface control shows a hands-off pause, then a countdown, while the
+ * server waits for the control to move. In a mapping form, ticking a
+ * channel chooses its RX/TX group, and a control form shows the options
+ * that fit the kind chosen.
+ *
+ * The Mixer page's faders (data-live-slider="fader") post throttled values
+ * while they move and one more on release, like the volume slider; its
+ * momentary buttons (data-momentary) post on press and again on release.
+ * An in-place post carries the form's own fields (its hidden inputs:
+ * the output stage, router ports, crosspoints), repeated names included.
+ *
+ * The Router page's grid moves focus between crosspoints with the arrow
+ * keys; its patches post in place and its editors open in a dialog on the
+ * page. Pickers marked data-actions (the mixer editor) or data-what (a
+ * surface mapping) show only the targets the chosen action needs; without
+ * this script every picker is shown and the server uses the right one. A
+ * surface's control filter acts in place (without the script it is a GET
+ * the server applies). */
 (() => {
   "use strict";
   // Lets the stylesheet hide the Apply buttons the sliders replace.
@@ -23,6 +46,9 @@
   const status = document.querySelector("[data-live-status]");
   const normalStatus = status?.textContent ?? "";
   const dirty = new WeakSet<HTMLFormElement>();
+  // Forms the next read updates even while focused: a slider whose change
+  // the server refused shows the server's value (and its owner) again.
+  const forced = new WeakSet<HTMLFormElement>();
   let timer: number | undefined;
   let request: AbortController | null = null;
   let stopped = false, submitting = false, pointerDown = false;
@@ -36,7 +62,7 @@
   for (const event of ["input", "change"]) {
     document.addEventListener(event, e => {
       const form = formOf(e.target);
-      if (form) dirty.add(form);
+      if (form) { dirty.add(form); forced.delete(form); }
     });
   }
   document.addEventListener("reset", e => {
@@ -105,7 +131,10 @@
     // server's to update.
     if (local(current)) return;
     // Keep the whole form coherent while the operator edits or focuses it.
-    if (current.matches("form") && protectedNode(current)) return;
+    if (current instanceof HTMLFormElement) {
+      if (forced.has(current)) forced.delete(current);
+      else if (protectedNode(current)) return;
+    }
     for (const attr of [...current.attributes]) {
       if (current.matches("details") && attr.name === "open") continue;
       if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
@@ -244,10 +273,13 @@
   type FormFields = Record<string, string>;
   type PostResult = { ok: boolean; text: string; db?: number };
 
-  async function post(form: HTMLFormElement, fields: FormFields): Promise<PostResult> {
+  // `entries` are the form's own fields (repeated names kept); `fields`
+  // replace any of the same name.
+  async function post(form: HTMLFormElement, fields: FormFields, entries: [string, string][] = []): Promise<PostResult> {
     const body = new URLSearchParams();
     const csrf = form.elements.namedItem("csrf") as HTMLInputElement | null;
     if (csrf) body.set("csrf", csrf.value);
+    for (const [k, v] of entries) if (k !== "csrf" && !(k in fields)) body.append(k, v);
     for (const [k, v] of Object.entries(fields)) body.set(k, String(v));
     busy++;
     changes++;
@@ -272,6 +304,20 @@
       busy--;
       changes++;
     }
+  }
+
+  // The form's hidden fields: what a slider's post needs besides its value.
+  function hiddenEntries(form: HTMLFormElement): [string, string][] {
+    return [...form.querySelectorAll<HTMLInputElement>('input[type="hidden"]')]
+      .filter(input => input.name && input.name !== "csrf")
+      .map(input => [input.name, input.value]);
+  }
+
+  // Every string field of a form (and the button that submitted it).
+  function formEntries(form: HTMLFormElement, submitter?: HTMLElement | null): [string, string][] {
+    const out: [string, string][] = [];
+    for (const [k, v] of new FormData(form, submitter ?? undefined)) if (typeof v === "string" && k !== "csrf") out.push([k, v]);
+    return out;
   }
 
   const noteTimers = new WeakMap<HTMLElement, number>();
@@ -304,12 +350,19 @@
     return `fill-${Math.round(f * 20) * 5}`;
   }
 
-  // Readout, fill and warning state follow the thumb.
+  // Readout, fill and warning state follow the thumb. A channel gain
+  // slider (data-live-slider="gain", or a mixer "fader") reads "off" at the
+  // bottom of its travel and has its readout in an element marked
+  // data-readout.
   function paint(form: HTMLFormElement, input: HTMLInputElement, v: number): void {
+    const gain = form.dataset.liveSlider === "gain" || form.dataset.liveSlider === "fader";
+    const text = gain && v <= Number(input.min) ? "off" : `${signed(v)} dB`;
+    const readout = form.querySelector("[data-readout]");
+    if (readout) readout.textContent = text;
     const big = form.querySelector(".big");
     if (big && big.firstChild && big.firstChild.nodeType === Node.TEXT_NODE) big.firstChild.nodeValue = signed(v);
     input.className = fillClass(v, Number(input.min), Number(input.max));
-    input.setAttribute("aria-valuetext", `${signed(v)} dB`);
+    input.setAttribute("aria-valuetext", text);
     if (form.dataset.liveSlider === "boost") form.classList.toggle("hot", v > BOOST_HOT);
   }
 
@@ -340,7 +393,7 @@
     s.timer = undefined;
     const kind = form.dataset.liveSlider;
     if (s.pending.commit) {
-      if (kind === "boost") s.timer = setTimeout(() => pump(form), COMMIT_SETTLE);
+      if (kind === "boost" || kind === "gain") s.timer = setTimeout(() => pump(form), COMMIT_SETTLE);
       else pump(form);
       return;
     }
@@ -360,10 +413,21 @@
     if (commit) note(form, "busy", "applying…");
     const fields: FormFields = { db: value.toFixed(1) };
     if (kind === "volume") fields.commit = commit ? "1" : "0";
-    const r = await post(form, fields);
+    const r = await post(form, fields, hiddenEntries(form));
     s.inflight = false;
     if (!r.ok) {
       note(form, "bad", `failed: ${r.text}`);
+      if (!s.pending) {
+        // The server kept its own value (for example a gain a surface fader
+        // owns, HTTP 409): the slider is no longer the operator's edit. The
+        // next read shows the server's value, locked with its owner if so;
+        // the answer takes the focus, so it is announced.
+        dirty.delete(form);
+        forced.add(form);
+        const n = form.querySelector<HTMLElement>(".note[data-live-local]");
+        if (n && form.contains(document.activeElement)) { n.tabIndex = -1; n.focus(); }
+        refreshSoon();
+      }
     } else if (commit) {
       note(form, "ok", "applied");
       // The server's view is now the form's: let the refresh show other
@@ -391,7 +455,9 @@
     const t = sliderOf(e);
     if (!t) return;
     paint(t.form, t.input, t.value);
-    if (t.form.dataset.liveSlider === "volume") queue(t.form, t.value, false);
+    // Volume and mixer faders apply while they move (throttled previews).
+    const kind = t.form.dataset.liveSlider;
+    if (kind === "volume" || kind === "fader") queue(t.form, t.value, false);
   });
   document.addEventListener("change", e => {
     const t = sliderOf(e);
@@ -486,6 +552,186 @@
     const confirm = form.getAttribute("data-confirm");
     if (confirm) ask(row, form, button, confirm);
     else act(row, form, button, { unit, action });
+  });
+
+  /* ---- small forms posted in place ---------------------------------------- */
+  // Forms marked data-live-post (channel mute toggles, a surface's enabled
+  // switch) post their own fields in place. The answer shows in the note
+  // beside the form, which takes the focus (it is announced), so the
+  // refresh that follows may update the form itself. Without this script
+  // they post normally and the server redirects back.
+
+  document.addEventListener("submit", async e => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute("data-live-post")) return;
+    e.preventDefault();
+    // A momentary button acts on press and release, not on the click.
+    if (form.hasAttribute("data-momentary")) return;
+    const entries = formEntries(form, (e as SubmitEvent).submitter);
+    const scope = form.parentElement ?? form;
+    const buttons = [...form.querySelectorAll("button")];
+    for (const b of buttons) { b.disabled = true; b.setAttribute("aria-busy", "true"); }
+    note(scope, "busy", "applying…");
+    const r = await post(form, {}, entries);
+    for (const b of buttons) { b.disabled = false; b.removeAttribute("aria-busy"); }
+    dirty.delete(form);
+    if (r.ok) {
+      note(scope, "ok", r.text);
+      const n = scope.querySelector<HTMLElement>(".note[data-live-local]");
+      if (n && form.contains(document.activeElement)) { n.tabIndex = -1; n.focus(); }
+      refreshSoon();
+    } else {
+      note(scope, "bad", `failed: ${r.text}`);
+    }
+    // Others (the Router's editor dialog) may show the change too.
+    document.dispatchEvent(new CustomEvent("tessera:posted", { detail: { form, ok: r.ok, text: r.text } }));
+  });
+
+  /* ---- momentary buttons -------------------------------------------------- */
+  // A form marked data-momentary="<value>" (a mixer button in momentary mode)
+  // posts its fields with muted=<value> while the button is pressed (pointer,
+  // or Space/Enter held) and the opposite on release; the posts of one form
+  // go in order. Without this script the form posts once, like a toggle.
+
+  const chains = new WeakMap<HTMLFormElement, Promise<unknown>>();
+  let heldButton: { form: HTMLFormElement; button: HTMLButtonElement } | null = null;
+
+  function momentaryOf(target: EventTarget | null) {
+    const button = target instanceof Element ? target.closest("button") : null;
+    const form = button?.form;
+    if (!button || !form || button.disabled || !form.hasAttribute("data-momentary")) return null;
+    return { form, button };
+  }
+
+  function hold(form: HTMLFormElement, button: HTMLButtonElement, press: boolean): void {
+    const pressed = form.dataset.momentary === "false" ? "false" : "true";
+    const value = press ? pressed : (pressed === "true" ? "false" : "true");
+    button.classList.toggle("held", press);
+    const entries = formEntries(form);
+    const fields: FormFields = { muted: value };
+    const scope = form.parentElement ?? form;
+    if (press) dirty.add(form);
+    const next = (chains.get(form) ?? Promise.resolve()).then(async () => {
+      const r = await post(form, fields, entries);
+      if (!r.ok) note(scope, "bad", `failed: ${r.text}`);
+      else if (!press) {
+        note(scope, "ok", r.text);
+        dirty.delete(form);
+        refreshSoon();
+      }
+    });
+    chains.set(form, next);
+  }
+
+  function release(): void {
+    if (!heldButton) return;
+    const { form, button } = heldButton;
+    heldButton = null;
+    hold(form, button, false);
+  }
+
+  document.addEventListener("pointerdown", e => {
+    const t = momentaryOf(e.target);
+    if (!t || heldButton) return;
+    e.preventDefault();
+    heldButton = t;
+    hold(t.form, t.button, true);
+  });
+  for (const event of ["pointerup", "pointercancel"]) document.addEventListener(event, release);
+  window.addEventListener("blur", release);
+  document.addEventListener("keydown", e => {
+    if ((e.key !== " " && e.key !== "Enter") || e.repeat) return;
+    const t = momentaryOf(e.target);
+    if (!t) return;
+    e.preventDefault();
+    if (heldButton) return;
+    heldButton = t;
+    hold(t.form, t.button, true);
+  });
+  document.addEventListener("keyup", e => {
+    if (e.key !== " " && e.key !== "Enter") return;
+    if (!momentaryOf(e.target)) return;
+    e.preventDefault();
+    release();
+  });
+  document.addEventListener("focusout", e => {
+    if (heldButton && e.target === heldButton.button) release();
+  });
+
+  /* ---- learning a surface control ----------------------------------------- */
+  // The learn form (data-learn="<seconds>") posts normally: the server
+  // answers once the control moved or the time ran out. Meanwhile its note
+  // asks for hands off first (the daemon reads the first second as the
+  // device at rest), then says what to do and counts down; a second click
+  // does not start a second learn.
+  const HANDS_OFF = 2;   // seconds of "hands off" before "now"
+  let learnTimer: number | undefined;
+  document.addEventListener("submit", e => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute("data-learn")) return;
+    if (form.dataset.learning) { e.preventDefault(); return; }
+    form.dataset.learning = "1";
+    form.querySelector("button[type=submit]")?.setAttribute("aria-busy", "true");
+    const hint = form.elements.namedItem("hint") as RadioNodeList | null;
+    const what = hint?.value === "fader"
+      ? "move the fader from the bottom all the way up"
+      : "press the button once";
+    const n = form.querySelector<HTMLElement>(".note[data-live-local]");
+    const total = Number(form.dataset.learn) || 15;
+    let elapsed = 0;
+    const tick = () => {
+      if (n) {
+        const left = total - elapsed;
+        n.className = "note busy";
+        n.textContent = elapsed < HANDS_OFF ? "Hands off for a second…"
+          : left > 0 ? `Now ${what}… ${left} s` : "Waiting for the answer…";
+      }
+      elapsed++;
+    };
+    tick();
+    clearInterval(learnTimer);
+    learnTimer = setInterval(tick, 1000);
+  });
+  window.addEventListener("pageshow", () => {
+    // Back from the answer page (or a cached page): ready to learn again.
+    clearInterval(learnTimer);
+    for (const form of document.querySelectorAll<HTMLFormElement>("form[data-learning]")) {
+      delete form.dataset.learning;
+      form.querySelector("button[type=submit]")?.removeAttribute("aria-busy");
+      note(form, "ok", "");
+    }
+  });
+
+  /* ---- mapping and control forms ----------------------------------------- */
+  // A mapping's channels are boxes under one RX/TX radio per device and
+  // direction, and only the chosen group's ticks count. Ticking a box
+  // chooses its group; choosing a group clears the ticks of the others, so
+  // no tick is left out unseen. (Without this script the page fades the
+  // other groups and the server refuses ticks outside the chosen one.)
+  document.addEventListener("change", e => {
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement) || !t.form) return;
+    let group: string;
+    if (t.type === "checkbox" && t.name.startsWith("ch:")) {
+      if (!t.checked) return;
+      group = t.name.slice(3);
+      const radio = [...t.form.querySelectorAll<HTMLInputElement>('input[type="radio"][name="target"]')]
+        .find(r => r.value === group);
+      if (radio) radio.checked = true;
+    } else if (t.type === "radio" && t.name === "target") {
+      group = t.value;
+    } else return;
+    for (const box of t.form.querySelectorAll<HTMLInputElement>('input[type="checkbox"][name^="ch:"]'))
+      if (box.name !== `ch:${group}`) box.checked = false;
+  });
+
+  // A control form shows the options (and mapping parts) that fit the kind
+  // chosen: elements list their kinds in data-kinds.
+  document.addEventListener("change", e => {
+    const t = e.target;
+    if (!(t instanceof HTMLSelectElement) || t.name !== "kind" || !t.form) return;
+    for (const el of t.form.querySelectorAll<HTMLElement>("[data-kinds]"))
+      el.hidden = !(el.dataset.kinds ?? "").split(" ").includes(t.value);
   });
 
   /* ---- routing crosspoints ------------------------------------------------ */
@@ -725,5 +971,247 @@
       }
       routingLayout();
     }
+  });
+
+  /* ---- target pickers ----------------------------------------------------- */
+  // The mixer editor's "Add a strip" (data-strip-form: a select named
+  // action, pickers marked data-actions="<action> …") and a surface mapping
+  // (radios named what, pickers marked data-what="<what>") show only the
+  // pickers the choice needs. The page's refresh writes the server's markup
+  // (every picker shown) back, so the choice is applied again after it.
+  function pickers(form: HTMLFormElement): void {
+    const action = form.elements.namedItem("action");
+    if (action instanceof HTMLSelectElement) {
+      for (const el of form.querySelectorAll<HTMLElement>("[data-actions]"))
+        el.hidden = !(el.dataset.actions ?? "").split(" ").includes(action.value);
+    }
+    const what = form.querySelector<HTMLInputElement>('input[type="radio"][name="what"]:checked');
+    if (what) {
+      for (const el of form.querySelectorAll<HTMLElement>("[data-what]")) el.hidden = el.dataset.what !== what.value;
+    }
+  }
+  function allPickers(): void {
+    for (const form of document.querySelectorAll<HTMLFormElement>("form")) {
+      if (form.querySelector("[data-actions], [data-what]")) pickers(form);
+    }
+  }
+  document.addEventListener("change", e => {
+    const t = e.target;
+    if (!(t instanceof HTMLSelectElement || t instanceof HTMLInputElement) || !t.form) return;
+    if (t.name === "action" || t.name === "what") pickers(t.form);
+  });
+  document.addEventListener("tessera:refreshed", allPickers);
+  allPickers();
+
+
+  /* ---- surface control filters ------------------------------------------- */
+  // A surface's filter (form[data-controls-filter]: words and "mapped only
+  // / all") hides the controls that do not match, in place; the refresh
+  // writes the server's markup back, so the filter is applied again after
+  // it. Without this script the form is a GET and the server filters.
+  function controlsFilter(form: HTMLFormElement): void {
+    const card = form.closest("section");
+    if (!card) return;
+    const q = (form.elements.namedItem("q") as HTMLInputElement | null)?.value.trim().toLocaleLowerCase() ?? "";
+    const mapped = (form.querySelector<HTMLInputElement>('input[name="show"]:checked')?.value ?? "all") === "mapped";
+    const controls = [...card.querySelectorAll<HTMLElement>(".controls > article.control")];
+    let shown = 0;
+    for (const c of controls) {
+      const ok = (!mapped || c.dataset.mapped === "true") && (q === "" || (c.dataset.search ?? "").toLocaleLowerCase().includes(q));
+      // A control whose form is open stays: hiding it would lose the edit.
+      const keep = c.querySelector("details[open]") !== null || c.contains(document.activeElement);
+      c.hidden = !ok && !keep;
+      if (!c.hidden) shown++;
+    }
+    const count = form.querySelector<HTMLElement>("[data-controls-count]");
+    if (count) count.textContent = `Showing ${shown} of ${controls.length} controls`;
+    const none = card.querySelector<HTMLElement>("[data-controls-none]");
+    if (none) none.hidden = shown > 0;
+  }
+  function allControlsFilters(): void {
+    for (const form of document.querySelectorAll<HTMLFormElement>("form[data-controls-filter]")) controlsFilter(form);
+  }
+  for (const event of ["input", "change"]) {
+    document.addEventListener(event, e => {
+      const form = e.target instanceof Element ? e.target.closest<HTMLFormElement>("form[data-controls-filter]") : null;
+      if (form) controlsFilter(form);
+    });
+  }
+  document.addEventListener("submit", e => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute("data-controls-filter")) return;
+    e.preventDefault();
+    controlsFilter(form);
+  });
+  document.addEventListener("tessera:refreshed", allControlsFilters);
+
+  /* ---- router: patches and editors in place ------------------------------- */
+  // An empty crosspoint (and a phone row's Add source and Remove) is a form
+  // marked data-router-patch: posted in place, its answer shown in the
+  // page's note (or the editor dialog's), and the grid read again; the
+  // focus returns to the same cell. A patched crosspoint, a port header or
+  // a phone row's Edit (links marked data-router-open) opens its editor in
+  // the page's dialog: the same server-rendered editor, whose forms post in
+  // place as they do on its own page. Without this script the forms post
+  // and the links open the editor pages.
+  const routerDialog = () => document.querySelector<HTMLDialogElement>("#router-dialog");
+  let routerOrigin: { id: string; el: Element } | null = null;
+  let routerFocus: string | null = null;
+  let routerUrl: string | null = null;
+
+  function routerNote(scope: Element | null, state: "ok" | "bad" | "busy", text: string): HTMLElement | null {
+    const n = scope?.closest("#router-dialog")
+      ? scope.closest("#router-dialog")!.querySelector<HTMLElement>(".dialog-note[data-live-local]")
+      : document.querySelector<HTMLElement>(".router-note[data-live-local]");
+    if (!n) return null;
+    const base = n.classList.contains("dialog-note") ? "dialog-note" : "router-note";
+    clearTimeout(noteTimers.get(n));
+    n.textContent = text;
+    n.className = `note ${base} ${state}`;
+    if (state === "ok") noteTimers.set(n, setTimeout(() => { n.textContent = ""; n.className = `note ${base}`; }, 4000));
+    return n;
+  }
+
+  /** The id of the cell, header or phone section an element is in. */
+  function anchorOf(el: Element): string {
+    return el.closest<HTMLElement>("td[id], th[id], section[id]")?.id ?? "";
+  }
+
+  document.addEventListener("submit", async e => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute("data-router-patch")) return;
+    e.preventDefault();
+    const inDialog = Boolean(form.closest("#router-dialog"));
+    const entries = formEntries(form, (e as SubmitEvent).submitter);
+    const buttons = [...form.querySelectorAll("button")];
+    for (const b of buttons) { b.disabled = true; b.setAttribute("aria-busy", "true"); }
+    routerFocus = inDialog ? null : anchorOf(form);
+    const n = routerNote(form, "busy", "applying…");
+    // The cell is replaced by the next read: the answer takes the focus
+    // (it is announced) and gives it back to the cell afterwards.
+    if (n && form.contains(document.activeElement)) { n.tabIndex = -1; n.focus(); }
+    const r = await post(form, {}, entries);
+    for (const b of buttons) { b.disabled = false; b.removeAttribute("aria-busy"); }
+    if (r.ok) {
+      routerNote(inDialog ? null : form, "ok", r.text);
+      if (inDialog && form.dataset.routerPatch === "remove") closeRouterDialog();
+      refreshSoon();
+    } else {
+      routerFocus = null;
+      routerNote(form, "bad", `failed: ${r.text}`);
+    }
+  });
+
+  document.addEventListener("tessera:refreshed", () => {
+    if (!routerFocus) return;
+    const target = document.getElementById(routerFocus)?.querySelector<HTMLElement>("a, button:not([disabled]), select");
+    routerFocus = null;
+    const at = document.activeElement;
+    if (target && (!at || at === document.body || at.matches(".router-note"))) target.focus();
+  });
+
+  async function openRouterEditor(url: string): Promise<void> {
+    const dialog = routerDialog();
+    const slot = dialog?.querySelector<HTMLElement>("[data-router-dialog-content]");
+    const title = dialog?.querySelector<HTMLElement>("#router-dialog-title");
+    if (!dialog || !slot || !title) return;
+    routerUrl = url;
+    const reload = dialog.hasAttribute("open");
+    if (!reload) {
+      slot.textContent = "Reading…";
+      dialog.showModal();
+    }
+    try {
+      const page = await routingDocument(url, { headers: { "X-Tessera-Live": "1" } });
+      const editor = page.querySelector<HTMLElement>("section.editor");
+      if (!editor) throw new Error("The editor did not load; open it on its own page.");
+      // Only server-rendered, authenticated same-origin markup is adopted;
+      // names in it have passed the HTML escaper.
+      const node = document.importNode(editor, true);
+      // The heading's own nodes move, so a place under a name keeps its
+      // muted look and its separator (`Speaker R — Host output 2`).
+      const heading = node.querySelector("h2");
+      if (heading) title.replaceChildren(...heading.childNodes);
+      else title.textContent = "Edit";
+      heading?.remove();
+      // The dialog has its own Close: the page's way back (for its own
+      // page and without this script) would be a second one.
+      node.querySelectorAll("a[data-router-back]").forEach(back => (back.closest("p") ?? back).remove());
+      slot.replaceChildren(...node.childNodes);
+      allPickers();
+      // A reload after a change keeps the focus on its answer.
+      const answer = dialog.querySelector<HTMLElement>(".dialog-note");
+      if (reload && answer?.textContent) { answer.tabIndex = -1; answer.focus(); }
+      else slot.querySelector<HTMLElement>("input, button, a")?.focus();
+    } catch (error) {
+      slot.textContent = error instanceof Error ? error.message : "The editor did not load.";
+    }
+  }
+
+  function closeRouterDialog(): void {
+    const dialog = routerDialog();
+    if (dialog?.hasAttribute("open")) dialog.close();
+  }
+
+  document.addEventListener("click", e => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const t = e.target instanceof Element ? e.target : null;
+    const dialog = routerDialog();
+    if (!t || !dialog || typeof dialog.showModal !== "function") return;
+    const link = t.closest<HTMLAnchorElement>("a[data-router-open]");
+    if (link) {
+      e.preventDefault();
+      if (!dialog.hasAttribute("open")) routerOrigin = { id: anchorOf(link), el: link };
+      openRouterEditor(link.href);
+      return;
+    }
+    if (t.closest("[data-router-close]")) {
+      e.preventDefault();
+      closeRouterDialog();
+    }
+  });
+
+  routerDialog()?.addEventListener("close", () => {
+    routerUrl = null;
+    const back = routerOrigin;
+    routerOrigin = null;
+    refreshSoon();
+    if (!back) return;
+    const el = document.contains(back.el) ? back.el as HTMLElement
+      : document.getElementById(back.id)?.querySelector<HTMLElement>("a, button");
+    el?.focus();
+  });
+
+  // A mute or label change in the dialog: show the editor's new state.
+  document.addEventListener("tessera:posted", e => {
+    const { form, ok, text } = (e as CustomEvent<{ form: HTMLFormElement; ok: boolean; text: string }>).detail;
+    if (!routerUrl || !form.closest("#router-dialog")) return;
+    const dialog = routerDialog();
+    routerNote(dialog, ok ? "ok" : "bad", ok ? text : `failed: ${text}`);
+    if (ok) openRouterEditor(routerUrl);
+  });
+  /* ---- router grid -------------------------------------------------------- */
+  // Arrow keys move between the crosspoints of the grid (data-router-grid:
+  // cells carry data-row and data-col), Home and End to the row's ends.
+  document.addEventListener("keydown", e => {
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    const cell = t.closest<HTMLElement>("td[data-row][data-col]");
+    const grid = cell?.closest<HTMLElement>("[data-router-grid]");
+    if (!cell || !grid || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
+    const row = Number(cell.dataset.row), col = Number(cell.dataset.col);
+    const target = (el: HTMLElement) => el.querySelector<HTMLElement>("a, button:not([disabled])");
+    const cells = [...grid.querySelectorAll<HTMLElement>("td[data-row][data-col]")].filter(c => target(c));
+    const inRow = cells.filter(x => Number(x.dataset.row) === row).sort((a, b) => Number(a.dataset.col) - Number(b.dataset.col));
+    const inCol = cells.filter(x => Number(x.dataset.col) === col).sort((a, b) => Number(a.dataset.row) - Number(b.dataset.row));
+    let next: HTMLElement | undefined;
+    if (e.key === "ArrowLeft") next = inRow.filter(x => Number(x.dataset.col) < col).at(-1);
+    if (e.key === "ArrowRight") next = inRow.find(x => Number(x.dataset.col) > col);
+    if (e.key === "ArrowUp") next = inCol.filter(x => Number(x.dataset.row) < row).at(-1);
+    if (e.key === "ArrowDown") next = inCol.find(x => Number(x.dataset.row) > row);
+    if (e.key === "Home") next = inRow[0];
+    if (e.key === "End") next = inRow.at(-1);
+    const focus = next && target(next);
+    if (focus) { e.preventDefault(); focus.focus(); }
   });
 })();

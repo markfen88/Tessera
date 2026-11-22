@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use tessera_control_types::Direction;
+use tessera_control_types::{Direction, RouterPort};
 
 use crate::config::{Config, DeviceConfig, TickUs};
 use crate::env::{Environment, validate_channel_label, validate_device_name, validate_name};
@@ -269,6 +269,192 @@ fn check(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
 
     // [[bridge]]
     check_bridges(config, env, out);
+
+    // [host_volume] and [[route]]
+    check_host_volume(config, env, out);
+    check_routes(config, env, out);
+}
+
+/// Is `c` an ALSA card name or index as `amixer -c` takes it: letters,
+/// digits, `_` and `-`, 1..=64 bytes?
+#[must_use]
+pub fn valid_card_name(c: &str) -> bool {
+    !c.is_empty()
+        && c.len() <= 64
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// `[host_volume]`: the card and control names, the range inside the gain
+/// range. Configured on a daemon whose runtime cannot set it yet: a warning
+/// (nothing is lost; the portal keeps setting the amplifier itself).
+fn check_host_volume(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
+    use tessera_control_types::{GAIN_CEILING_MDB, GAIN_FLOOR_MDB};
+    let Some(h) = &config.host_volume else {
+        return;
+    };
+    if !valid_card_name(&h.card) {
+        out.push(Issue::error(
+            "host_volume.card",
+            format!(
+                "`{}` is not an ALSA card id or index (letters, digits, `_` and `-`, at most 64 bytes)",
+                h.card
+            ),
+        ));
+    }
+    if h.control.trim().is_empty()
+        || h.control.len() > 64
+        || h.control.chars().any(char::is_control)
+    {
+        out.push(Issue::error(
+            "host_volume.control",
+            "name a simple mixer control: 1..=64 bytes, no control characters",
+        ));
+    }
+    let range = f64::from(GAIN_FLOOR_MDB) / 1000.0..=f64::from(GAIN_CEILING_MDB) / 1000.0;
+    if !(h.min_db.is_finite() && range.contains(&h.min_db)) {
+        out.push(Issue::error(
+            "host_volume.min_db",
+            format!("{} is outside -96..=12 dB", h.min_db),
+        ));
+    } else if !(h.max_db.is_finite() && range.contains(&h.max_db)) {
+        out.push(Issue::error(
+            "host_volume.max_db",
+            format!("{} is outside -96..=12 dB", h.max_db),
+        ));
+    } else if h.min_mdb() >= h.max_mdb() {
+        out.push(Issue::error(
+            "host_volume.max_db",
+            format!("{} must be above min_db ({})", h.max_db, h.min_db),
+        ));
+    }
+    if !env.runtime.host_volume {
+        out.push(Issue::warning(
+            "host_volume",
+            "this tesserad cannot set the host volume yet: the table is kept but has no effect",
+        ));
+    }
+}
+
+/// Can a configured port be routed: the device has the channel, or an
+/// enabled `[[bridge]]` of that card and direction carries it?
+fn configured_port_problem(config: &Config, port: &RouterPort) -> Option<String> {
+    use crate::config::BridgeDirection;
+    let n = port.channel().get();
+    if let Some(device) = port.device() {
+        let Some(d) = config.device(&device.0) else {
+            return Some(format!("there is no device `{}`", device.0));
+        };
+        let (count, side) = match port {
+            RouterPort::NetworkRx { .. } | RouterPort::HostOut { .. } => (d.rx_channels, "rx"),
+            _ => (d.tx_channels, "tx"),
+        };
+        return (n > count).then(|| {
+            format!(
+                "device `{}` has {count} {side} channel(s), not {n}",
+                device.0
+            )
+        });
+    }
+    let card = port.card().unwrap_or_default();
+    let want = match port {
+        RouterPort::CardIn { .. } => BridgeDirection::Capture,
+        _ => BridgeDirection::Playback,
+    };
+    let carried = config.bridges.iter().any(|b| {
+        if !b.enabled || b.alsa_pcm != card || b.direction != want {
+            return false;
+        }
+        let count = if b.local_only {
+            b.channels.unwrap_or(0)
+        } else {
+            let available = config.device(&b.device).map_or(0, |d| match want {
+                BridgeDirection::Capture => d.tx_channels,
+                BridgeDirection::Playback => d.rx_channels,
+            });
+            b.channel_count(available)
+        };
+        let first = u32::from(b.card_first_channel);
+        (first..first + u32::from(count)).contains(&u32::from(n))
+    });
+    (!carried).then(|| {
+        format!(
+            "no enabled {} bridge of `{card}` carries card channel {n}",
+            match want {
+                BridgeDirection::Capture => "capture",
+                BridgeDirection::Playback => "playback",
+            }
+        )
+    })
+}
+
+/// `[[route]]`: a destination port as destination, ports that exist, the
+/// gain range, each pair once, no loop through taps; and a runtime that
+/// runs the router.
+fn check_routes(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
+    use tessera_control_types::{CrosspointKey, GAIN_CEILING_MDB, GAIN_FLOOR_MDB};
+    if config.routes.is_empty() {
+        return;
+    }
+    if !env.runtime.router {
+        out.push(Issue::error(
+            "route",
+            format!(
+                "{} [[route]] entr{} configured, but this tesserad cannot run the host router yet; remove them",
+                config.routes.len(),
+                if config.routes.len() == 1 { "y is" } else { "ies are" }
+            ),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut keys: Vec<CrosspointKey> = Vec::new();
+    for (i, r) in config.routes.iter().enumerate() {
+        let p = format!("route[{i}]");
+        if !r.destination.is_destination() {
+            out.push(Issue::error(
+                format!("{p}.destination"),
+                "must be a destination port: network_tx, host_out or card_out",
+            ));
+        }
+        if r.source == r.destination {
+            out.push(Issue::error(
+                format!("{p}.source"),
+                "a port cannot feed itself",
+            ));
+        }
+        for (key, port) in [("source", &r.source), ("destination", &r.destination)] {
+            if let Some(m) = configured_port_problem(config, port) {
+                out.push(Issue::error(format!("{p}.{key}"), m));
+            }
+        }
+        let range = f64::from(GAIN_FLOOR_MDB) / 1000.0..=f64::from(GAIN_CEILING_MDB) / 1000.0;
+        if !(r.gain_db.is_finite() && range.contains(&r.gain_db)) {
+            out.push(Issue::error(
+                format!("{p}.gain_db"),
+                format!("{} is outside -96..=12 dB", r.gain_db),
+            ));
+        }
+        let key = CrosspointKey::new(r.source.clone(), r.destination.clone());
+        if !seen.insert(key.clone()) {
+            out.push(Issue::error(
+                format!("{p}.destination"),
+                "this source and destination are already patched by an earlier [[route]]",
+            ));
+        }
+        keys.push(key);
+    }
+    if let Some(x) =
+        crate::router::find_loop(keys.iter().filter(|x| x.destination.is_destination()))
+    {
+        let i = keys.iter().position(|k| *k == x).unwrap_or(0);
+        out.push(Issue::error(
+            format!("route[{i}].source"),
+            format!(
+                "{} closes a loop: a destination would feed itself through taps",
+                crate::router::describe_key(&x)
+            ),
+        ));
+    }
 }
 
 /// `[[bridge]]`: names, device references, channel ranges (in range, not
@@ -373,14 +559,46 @@ fn check_bridges(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
             );
             continue;
         };
-        let available = match dir {
-            Direction::Rx => dev.rx_channels,
-            Direction::Tx => dev.tx_channels,
+        // A `local_only` bridge feeds no device channel: only its card slice
+        // (`channels` from `card_first_channel`) counts, and it overlaps no
+        // device range (its device only gives the clock and rate).
+        if b.local_only {
+            if !env.runtime.router {
+                err(
+                    out,
+                    format!("{p}.local_only"),
+                    "this tesserad cannot run the host router yet, so a card cannot be opened for local routing only; leave `local_only` out".into(),
+                );
+            }
+            if b.channels.is_none() {
+                err(
+                    out,
+                    format!("{p}.channels"),
+                    "a `local_only` bridge needs `channels` (the card channels it opens)".into(),
+                );
+            }
+        }
+        let available = if b.local_only {
+            b.channels.unwrap_or(0)
+        } else {
+            match dir {
+                Direction::Rx => dev.rx_channels,
+                Direction::Tx => dev.tx_channels,
+            }
         };
-        let count = b.channel_count(available);
+        let (first_channel, dev_key) = if b.local_only {
+            (1, "")
+        } else {
+            (b.first_channel, b.device.as_str())
+        };
+        let count = if b.local_only {
+            available
+        } else {
+            b.channel_count(available)
+        };
         if !list_ok {
             // Reported above.
-        } else if b.first_channel == 0 {
+        } else if first_channel == 0 {
             err(
                 out,
                 format!("{p}.first_channel"),
@@ -397,12 +615,12 @@ fn check_bridges(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
                         "device `{}` has no {} channel at or after channel {}",
                         b.device,
                         if dir == Direction::Rx { "rx" } else { "tx" },
-                        b.first_channel
+                        first_channel
                     )
                 },
             );
         } else {
-            let first = u32::from(b.first_channel);
+            let first = u32::from(first_channel);
             let last = first + u32::from(count) - 1;
             if last > u32::from(available) {
                 err(
@@ -416,7 +634,12 @@ fn check_bridges(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
                 );
             } else if b.enabled {
                 for (j, d, od, f, l, pcm) in &ranges {
-                    if *d == b.device && *od == dir && first <= *l && *f <= last {
+                    if !dev_key.is_empty()
+                        && *d == dev_key
+                        && *od == dir
+                        && first <= *l
+                        && *f <= last
+                    {
                         err(
                             out,
                             format!("{p}.channels"),
@@ -436,8 +659,26 @@ fn check_bridges(config: &Config, env: &Environment, out: &mut Vec<Issue>) {
                         );
                     }
                 }
-                ranges.push((i, b.device.as_str(), dir, first, last, b.alsa_pcm.as_str()));
+                ranges.push((i, dev_key, dir, first, last, b.alsa_pcm.as_str()));
             }
+        }
+        if b.card_first_channel == 0 {
+            err(
+                out,
+                format!("{p}.card_first_channel"),
+                "card channel numbers start at 1".into(),
+            );
+        } else if b.card_last_channel(count) > u32::from(u16::MAX) {
+            err(
+                out,
+                format!("{p}.card_first_channel"),
+                format!(
+                    "card channels {}..={} are beyond card channel {}",
+                    b.card_first_channel,
+                    b.card_last_channel(count),
+                    u16::MAX
+                ),
+            );
         }
         if let Some(r) = b.sample_rate.filter(|r| *r != dev.sample_rate) {
             err(
@@ -759,6 +1000,28 @@ fn check_device(p: &str, d: &DeviceConfig, env: &Environment, out: &mut Vec<Issu
     let err = |out: &mut Vec<Issue>, key: &str, msg: String| {
         out.push(Issue::error(format!("{p}.{key}"), msg));
     };
+    if d.monitor_rx_from_tx.len() > usize::from(d.rx_channels) {
+        err(
+            out,
+            "monitor_rx_from_tx",
+            format!(
+                "device `{}` lists {} monitor entries but has {} rx channel(s)",
+                d.id,
+                d.monitor_rx_from_tx.len(),
+                d.rx_channels
+            ),
+        );
+    }
+    if let Some(bad) = d.monitor_rx_from_tx.iter().find(|&&t| t > d.tx_channels) {
+        err(
+            out,
+            "monitor_rx_from_tx",
+            format!(
+                "device `{}` has no tx channel {bad} (it has {}); use 0 for no monitoring",
+                d.id, d.tx_channels
+            ),
+        );
+    }
     // One direction may be 0 (rx-only, tx-only), not both.
     if d.rx_channels == 0 && d.tx_channels == 0 {
         err(

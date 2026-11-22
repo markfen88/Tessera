@@ -5,8 +5,8 @@ name: Release packages
 # tasks. Pull requests build and check only. A `v*` tag also signs the release
 # (both checksum layers, docs/bundle.md "Trusted release keys"), records build
 # provenance and publishes the GitHub release; that job runs in the `release`
-# environment, which holds the signing key and waits for a maintainer's
-# approval.
+# environment, which holds the signing key and serves only `v*` tags: pushing
+# a release tag is the decision to publish.
 
 on:
   pull_request:

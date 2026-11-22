@@ -20,6 +20,17 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// Transport errors, or the daemon's refusal.
     fn request(&self, body: RequestBody) -> Result<Reply, ClientError>;
 
+    /// One request whose answer comes only after `wait` (the daemon watches
+    /// something first, as `Query::LearnControl` does): the usual timeout is
+    /// stretched by `wait`.
+    ///
+    /// # Errors
+    /// As for [`request`](Self::request).
+    fn request_waiting(&self, body: RequestBody, wait: Duration) -> Result<Reply, ClientError> {
+        let _ = wait;
+        self.request(body)
+    }
+
     /// Subscribe to events: calls `each` for every reply until it returns
     /// `false` or the connection ends.
     ///
@@ -46,6 +57,15 @@ impl SocketBackend {
 impl Backend for SocketBackend {
     fn request(&self, body: RequestBody) -> Result<Reply, ClientError> {
         Client::connect(&self.path, self.timeout, DEFAULT_MAX_RESPONSE_BYTES)?.request(body)
+    }
+
+    fn request_waiting(&self, body: RequestBody, wait: Duration) -> Result<Reply, ClientError> {
+        Client::connect(
+            &self.path,
+            self.timeout.saturating_add(wait),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )?
+        .request(body)
     }
 
     fn events(&self, each: &mut dyn FnMut(Reply) -> bool) -> Result<(), ClientError> {

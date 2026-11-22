@@ -59,6 +59,18 @@ pub fn card_index(link_target: &str) -> Option<u32> {
         .flatten()
 }
 
+/// The daemon drop-in that hands the amplifier volume to tesserad (`[host_volume]`):
+/// the daemon sets the control through the ALSA mixer, the portal and control surfaces
+/// send it commands. The portal keeps its own `[appliance.volume]` for a rollback to an
+/// older daemon, and hands its saved value over once.
+#[must_use]
+pub fn host_volume_dropin(card: &str, control: &str) -> String {
+    format!(
+        "# Written by the speaker installer: the amplifier volume, set by tesserad.\n\
+         [host_volume]\ncard = \"{card}\"\ncontrol = \"{control}\"\nmin_db = -60\nmax_db = 0\n"
+    )
+}
+
 /// How many ALSA card indexes the portal's unit may open the control device of: 0 to 31,
 /// the kernel's limit on cards.
 pub const CARD_LIMIT: u32 = 32;
@@ -364,6 +376,15 @@ pub fn seed(template: &str, rate: u32, playback: &str, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_volume_dropin_names_card_and_control() {
+        let d = host_volume_dropin("DigiAMP", "Digital");
+        let v: toml::Value = toml::from_str(&d).expect("valid TOML");
+        assert_eq!(v["host_volume"]["card"].as_str(), Some("DigiAMP"));
+        assert_eq!(v["host_volume"]["control"].as_str(), Some("Digital"));
+        assert_eq!(v["host_volume"]["min_db"].as_integer(), Some(-60));
+    }
 
     #[test]
     fn cards_get_their_device_number_spelled_out() {

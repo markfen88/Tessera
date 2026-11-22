@@ -22,6 +22,8 @@ workspace = true
 
 [dependencies]
 tessera-control-types = { workspace = true }
+# Surface configuration checks (`SetSurface`); sans-IO, no daemon code.
+tessera-surface = { path = "../tessera-surface", version = "0.6.0" }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 # The device access lock keeps a salted Argon2id hash of its PIN

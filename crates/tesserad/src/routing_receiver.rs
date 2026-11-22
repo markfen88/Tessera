@@ -70,6 +70,36 @@ pub(crate) fn check_response(page: &RoutingReceiverPage, max: usize) -> Result<(
     encoded_size(page, max).map(|_| ())
 }
 
+/// Make this host's completed page fit `max`: rows from the end move to the
+/// next page (`next_first`, the page index of this host's contiguous rows)
+/// until it fits. Too large only when not even one row fits.
+pub(crate) fn fit_response(page: &mut RoutingReceiverPage, max: usize) -> Result<(), CommandError> {
+    let Err(too_large) = encoded_size(page, max) else {
+        return Ok(());
+    };
+    let rows = std::mem::take(&mut page.channels);
+    // The first `n` rows, the rest from row `n` on the next page.
+    let take = |page: &mut RoutingReceiverPage, n: usize| {
+        page.channels = rows.get(..n).unwrap_or_default().to_vec();
+        page.next_first = rows.get(n).map(|r| r.id);
+        encoded_size(page, max).is_ok()
+    };
+    // The most rows that fit (fewer than all: all did not).
+    let (mut lo, mut hi) = (0, rows.len().saturating_sub(1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if take(page, mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 || !take(page, lo) {
+        return Err(too_large);
+    }
+    Ok(())
+}
+
 /// Construction is private: no unbounded receiver page can reach the actor.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedPage {
@@ -193,7 +223,8 @@ async fn page(
     exchange: &mut impl Exchange,
 ) -> Result<PreparedPage, CommandError> {
     let mut request = [0; 16];
-    // One sequence on one ephemeral connected socket. No resend or fallback.
+    // One sequence on one ephemeral connected socket (a retry is another
+    // socket and sequence, see [`READ_RETRY_AFTER`]); no version fallback.
     let request = target
         .profile
         .rx_list_request(sequence, first, 0, &mut request)
@@ -389,6 +420,104 @@ impl crate::routing_operation::Transport for OperationSocket {
     }
 }
 
+/// A read that got no answer is asked once more, with a fresh socket and
+/// sequence, this long after the first request (within the same deadline):
+/// one lost datagram must not fail the read. A read changes nothing on the
+/// receiver, so asking again is safe; the vendor controller also repeats a
+/// whole query round once, 1.1-1.3 s later (`control-arc.md` §2.1).
+pub(crate) const READ_RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// This host's own receiver, when the daemon serves it (the native device
+/// role): the page is answered from the live state in process (no
+/// advertisement or UDP round trip), byte for byte as the ARC listener
+/// would, so expectations issued on it match what a write reads.
+struct InProcess<'a>(&'a crate::engine_thread::EngineHandle);
+impl Exchange for InProcess<'_> {
+    async fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, CommandError> {
+        // Boxed: the state read goes through the engine's query path,
+        // which leads back here for a receiver query.
+        Box::pin(crate::native::local_read(self.0, request))
+            .await
+            .ok_or_else(|| failed("this host's receiver state is unavailable"))
+    }
+}
+
+/// Read a page of the receiver this daemon serves itself (see
+/// [`crate::native::serves`]).
+pub(crate) async fn read_local(
+    engine: &crate::engine_thread::EngineHandle,
+    target: &Target,
+    first: u16,
+    deadline: Instant,
+    max_frame: usize,
+) -> Result<PreparedPage, CommandError> {
+    tokio::time::timeout_at(
+        deadline.into(),
+        page(
+            target,
+            first,
+            next_sequence(&SEQUENCE),
+            max_frame,
+            &mut InProcess(engine),
+        ),
+    )
+    .await
+    .map_err(|_| CommandError::ReceiverReadTimeout)?
+}
+
+/// Run `attempt` until [`READ_RETRY_AFTER`]; when it got no answer and the
+/// deadline is not reached, once more until the deadline (a late answer to
+/// the first request goes to its closed socket).
+async fn with_retry<F, Fut>(deadline: Instant, mut attempt: F) -> Result<PreparedPage, CommandError>
+where
+    F: FnMut(Instant) -> Fut,
+    Fut: std::future::Future<Output = Result<PreparedPage, CommandError>>,
+{
+    let retry_at = Instant::now() + READ_RETRY_AFTER;
+    match attempt(retry_at.min(deadline)).await {
+        Err(CommandError::ReceiverReadTimeout) if Instant::now() < deadline => {
+            tracing::debug!(
+                "receiver read: no answer within {} ms, asking once more",
+                READ_RETRY_AFTER.as_millis()
+            );
+            attempt(deadline).await
+        }
+        r => r,
+    }
+}
+
+/// One request on its own socket, answered by `until`.
+#[cfg(target_os = "linux")]
+async fn attempt(
+    target: &Target,
+    first: u16,
+    until: Instant,
+    max_frame: usize,
+) -> Result<PreparedPage, CommandError> {
+    let socket = std::net::UdpSocket::bind(SocketAddrV4::new(target.source, 0)).map_err(failed)?;
+    nix::sys::socket::setsockopt(
+        &socket,
+        nix::sys::socket::sockopt::BindToDevice,
+        &std::ffi::OsString::from(&target.interface),
+    )
+    .map_err(failed)?;
+    socket.set_nonblocking(true).map_err(failed)?;
+    let socket = tokio::net::UdpSocket::from_std(socket).map_err(failed)?;
+    tokio::time::timeout_at(until.into(), async {
+        socket.connect(target.peer).await.map_err(failed)?;
+        page(
+            target,
+            first,
+            next_sequence(&SEQUENCE),
+            max_frame,
+            &mut Socket(socket),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| CommandError::ReceiverReadTimeout)?
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) async fn read(
     target: &Target,
@@ -401,28 +530,7 @@ pub(crate) async fn read(
         return Err(CommandError::RoutingSnapshotExpired);
     }
     let before_scope = scope(target)?;
-    let socket = std::net::UdpSocket::bind(SocketAddrV4::new(target.source, 0)).map_err(failed)?;
-    nix::sys::socket::setsockopt(
-        &socket,
-        nix::sys::socket::sockopt::BindToDevice,
-        &std::ffi::OsString::from(&target.interface),
-    )
-    .map_err(failed)?;
-    socket.set_nonblocking(true).map_err(failed)?;
-    let socket = tokio::net::UdpSocket::from_std(socket).map_err(failed)?;
-    let result = tokio::time::timeout_at(deadline.into(), async {
-        socket.connect(target.peer).await.map_err(failed)?;
-        page(
-            target,
-            first,
-            next_sequence(&SEQUENCE),
-            max_frame,
-            &mut Socket(socket),
-        )
-        .await
-    })
-    .await
-    .map_err(|_| CommandError::ReceiverReadTimeout)??;
+    let result = with_retry(deadline, |until| attempt(target, first, until, max_frame)).await?;
     if Instant::now() >= deadline {
         return Err(CommandError::ReceiverReadTimeout);
     }

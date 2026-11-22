@@ -165,6 +165,9 @@ pub struct ControlCtx {
     pub counters: Arc<Counters>,
     /// Rate-limited peer-behaviour log.
     pub peerlog: PeerLog,
+    /// The control-surface runtime (`Query::Surfaces`, `Query::LearnControl`);
+    /// `None`: those queries go to the state engine as they are.
+    pub surfaces: Option<Arc<crate::surfaces::Surfaces>>,
 }
 
 impl ControlCtx {
@@ -866,6 +869,35 @@ async fn run_query(
             .engine
             .receiver_read(query, max_frame, uid, access)
             .await;
+    }
+    // Devices and live surface state are the daemon's; the saved surfaces
+    // come from the state engine inside `report`.
+    if let (Query::Surfaces, Some(s)) = (&q, &ctx.surfaces) {
+        return s.report(&ctx.engine).await.map(Reply::Surfaces);
+    }
+    if let (Query::SurfaceProfiles, Some(s)) = (&q, &ctx.surfaces) {
+        return Ok(Reply::SurfaceProfiles(s.profiles()));
+    }
+    if let Query::LearnControl {
+        device,
+        timeout_ms,
+        moving_up,
+    } = &q
+    {
+        // Opens a device and holds the connection for up to 30 s:
+        // administrators only.
+        if !access.can_mutate() {
+            return Err(CommandError::PermissionDenied);
+        }
+        return match &ctx.surfaces {
+            Some(s) => s
+                .learn(device, *timeout_ms, *moving_up)
+                .await
+                .map(Reply::LearnedControl),
+            None => Err(CommandError::Unsupported {
+                what: "control surfaces".into(),
+            }),
+        };
     }
     if matches!(q, Query::Metrics) {
         // Clock and bridge state come from the engine, the rest is ours.

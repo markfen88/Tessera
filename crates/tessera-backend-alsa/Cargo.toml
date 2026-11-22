@@ -29,13 +29,16 @@ plugin = []
 # take part in the cross-target checks of the merge gate; see
 # tests/bridge_gate.rs.
 bridge = ["dep:alsa", "dep:tessera-media", "dep:tessera-resample", "dep:rtrb"]
+# A simple mixer control read and set through the ALSA mixer API: the
+# daemon's host (speaker) volume. Like `bridge`, it links libasound.
+mixer = ["dep:alsa"]
 
 [dependencies]
-tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.5.2" }
+tessera-audio-ipc = { path = "../tessera-audio-ipc", version = "0.6.0" }
 libc = "0.2"
 nix = { version = "0.31", default-features = false, features = ["socket", "poll", "fs", "user"] }
-tessera-media = { path = "../tessera-media", version = "0.5.2", optional = true }
-tessera-resample = { path = "../tessera-resample", version = "0.5.2", optional = true }
+tessera-media = { path = "../tessera-media", version = "0.6.0", optional = true }
+tessera-resample = { path = "../tessera-resample", version = "0.6.0", optional = true }
 alsa = { version = "0.12", optional = true }
 rtrb = { version = "0.4", optional = true }
 

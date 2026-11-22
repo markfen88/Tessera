@@ -59,10 +59,16 @@ The installer then:
 3. creates `/opt/camilladsp/configs/Speaker.yml` from the template, if no configuration exists yet:
    `tessera` in, your card out, and the `dashboard_signal_boost` gain filter the portal's boost
    control edits. The chain starts **flat**: add your equaliser filters with the GUI;
-4. writes `/etc/tessera/web.d/60-speaker.toml`, which turns on the portal's Speaker page with
-   service switches, the amplifier volume and the signal boost (see
-   [web-portal.md](web-portal.md#appliance-mode)); if you have a service list of your own in
-   `web.toml` or `web.d` the file carries none, so yours is used as it is;
+4. writes `/etc/tessera/config.d/60-host-volume.toml` (`[host_volume]`, same
+   card, control and −60…0 dB range) so `tesserad` owns the amplifier's ALSA
+   mixer control (allowing the portal, `tesseractl volume`, and control
+   surfaces such as a desk's Main fader to control it through the one state
+   engine), and `/etc/tessera/web.d/60-speaker.toml`, which turns on the
+   portal's Speaker page with service switches, the signal boost and
+   `[appliance.volume]` (kept for rollback to an older daemon; see
+   [web-portal.md](web-portal.md#appliance-mode)); if you have a service list of
+   your own in `web.toml` or `web.d` the file carries none, so yours is used as
+   it is;
 5. enables and starts `camilladsp` and `camillagui`, the GUI listening on the speaker's management address
    (see **GUI** below). On a speaker that already has an engine of its own or a switched-off engine or GUI,
    the installer keeps what it had (see the upgrade notes).
@@ -145,10 +151,16 @@ engine's spelling: `S32_LE`, `S24_3_LE`, `S24_4_LE` or `S16_LE`), activate it in
   (the portal's helper lets systemd reload after the change; without the reload the daemon's next start brought it back). A speaker
   upgraded from 0.2.2 gets the second link when the upgrade enables the engine again (the packages and the bundle both do, for an engine that was on); to add it
   by hand, `sudo systemctl enable camilladsp`, then `systemctl show -p WantedBy camilladsp` lists `tesserad.service`.
-- **Volume.** The portal's Volume slider is the amplifier's hardware mixer control, not
-  CamillaDSP's volume. The portal saves it in `/var/lib/tessera-web/volume.json`, sets it again
-  at start (also for a card that appears later), follows the card if its index changes and offers
-  **Unmute** when the card's playback switch is off ([web-portal.md](web-portal.md#eq-engine)).
+- **Volume.** The portal's Volume slider (and the Mixer's Main L/R strip)
+  drives the amplifier's hardware ALSA mixer control, not CamillaDSP's volume.
+  From 0.6.0, when `[host_volume]` is configured in `/etc/tessera/config.d/`
+  (written by the speaker installer as `60-host-volume.toml`), `tesserad` owns
+  the mixer control directly through alsa-lib, saves the level and mute in
+  `state.toml`, restores them at start (and when the card reappears), and
+  accepts commands from the portal, `tesseractl volume`, and control surfaces.
+  On upgrade from 0.5.x the portal hands its saved `/var/lib/tessera-web/volume.json`
+  value over once when the daemon has none saved yet, and leaves `volume.json`
+  and `[appliance.volume]` in place for rollback ([web-portal.md](web-portal.md#eq-engine)).
 - **Upgrades** never restart a running engine; the package prints a reminder.
 - **Rate.** The PCM `tessera` accepts only the tessera device's own rate (`tesseractl status`), so the
   engine's capture rate (`capture_samplerate`, else `samplerate`) must equal it. The seeded

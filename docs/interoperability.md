@@ -5,7 +5,7 @@ flows and, with the opt-in native device role, the device side of the vendor's
 control protocols. The project targets interoperability with Dante® media
 networks; it is not vendor-certified, affiliated with or endorsed by Audinate.
 
-| Capability | Status in 0.5.2 |
+| Capability | Status in 0.6.0 |
 |---|---|
 | PTPv1 follower/leader and holdover | Implemented; drives media time, never the host's wall clock |
 | PTPv1 election with Preferred Leader | Implemented: lower MAC decides between preferred leaders, stratum 0x2A to 0x2D, Sync every 250 ms, warning on a rival preferred leader; provisional values |
@@ -130,7 +130,7 @@ otherwise.
 
 ## Routing from the portal
 
-The portal's **Routing** page ([web-portal.md](web-portal.md#routing)) and
+The portal's **Network routing** page ([web-portal.md](web-portal.md#network-routing)) and
 `tesseractl routing` ([cli.md](cli.md#routing)) connect, replace and disconnect
 receive inputs through the daemon. Each change is reviewed first; on
 confirmation the daemon checks the receiver's current selection, the locks and

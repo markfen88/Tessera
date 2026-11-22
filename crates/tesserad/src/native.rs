@@ -168,6 +168,36 @@ pub(crate) fn local() -> Option<Local> {
     LOCAL.read().ok()?.clone()
 }
 
+/// The ARC profile the role advertises and answers.
+pub(crate) fn arc_profile() -> Option<tessera_control::arc::Legacy> {
+    tessera_control::arc::Legacy::from_advertised_version("2.7.41").ok()
+}
+
+/// The serving native role is the receiver at `peer` (this daemon answers
+/// its ARC requests itself).
+pub(crate) fn serves(peer: std::net::SocketAddrV4) -> bool {
+    local().is_some_and(|l| peer == std::net::SocketAddrV4::new(l.address, ARC_PORT))
+}
+
+/// Answer an ARC read request (the RX list, 0x3000) as the role's listener
+/// would, from the live state, without the network round trip: this host's
+/// own receiver page needs neither its advertisement seen nor a UDP answer.
+/// `None` for any other request or when the state cannot be read.
+pub(crate) async fn local_read(engine: &EngineHandle, request: &[u8]) -> Option<Vec<u8>> {
+    let (header, content) = wire::request(request)?;
+    if header.opcode != 0x3000 {
+        return None;
+    }
+    let (view, _) = device(engine).await.ok()?;
+    Some(match wire::page_start(content) {
+        Some(first) => {
+            let (c, more) = wire::rx_list(&view, first);
+            wire::reply(header, if more { wire::MORE } else { 1 }, &c)
+        }
+        None => wire::reply(header, wire::FAILURE, &[]),
+    })
+}
+
 fn set_local(value: Option<Local>) {
     if let Ok(mut l) = LOCAL.write() {
         *l = value;

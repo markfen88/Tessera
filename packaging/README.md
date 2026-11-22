@@ -220,9 +220,10 @@ release key from 0.5.2: `packaging/tessera-release.pub`, key id
 `4E330826A26C2812`. The GitHub release workflow (`.github/workflows/release.yml`
 of the public line) builds the packages and bundles from a `v*` tag, then signs
 both checksum layers in its `release` environment. That environment holds the
-encrypted key and its password as secrets, runs only for `v*` tags and waits for
-the owner's approval; an encrypted backup of the key and its password is kept in
-the owner's secret store. The workflow also records GitHub build provenance for
+encrypted key and its password as secrets and serves only `v*` tags, so pushing
+a release tag is the decision to publish (the owner approved 0.5.2 by hand, then
+removed the approval step); an encrypted backup of the key and its password is
+kept in the owner's secret store. The workflow also records GitHub build provenance for
 every asset. An optional `/etc/tessera/trusted-release-keys`
 adds keys, one bare minisign public key per line (no `.pub` comment header).
 It must be a root-owned regular file with mode **0644**. All parent directories
@@ -232,7 +233,7 @@ arrived with the download it claims to authenticate.
 
 The project owner decides **who holds the offline encrypted backup, where the CI
 secret is held, who knows its password, and who may change signing jobs**; the
-choice from 0.5.2 is the approval-gated workflow above. The commands below sign by
+choice from 0.5.2 is the tag-gated workflow above. The commands below sign by
 hand (a key rotation, or artifacts built outside the workflow): run them on a
 trusted machine, never in an unattended or automated run. Keep signing material outside the checkout and release inputs.
 Do not enable shell tracing or print environment values. On the owner's chosen

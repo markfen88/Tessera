@@ -667,6 +667,7 @@ async fn session(stream: UnixStream, ctx: Arc<AudioCtx>) {
         format: params.format,
         end,
         wake: Some(wake),
+        port: crate::media::SessionOwner::App,
     };
     if !ctx.media.add_session(spec) {
         ctx.sessions

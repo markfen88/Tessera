@@ -246,6 +246,62 @@ pub struct Environment {
     pub memlock_limit_bytes: Option<u64>,
     /// Cost of the Argon2id hash that stores a device access lock PIN.
     pub pin_cost: PinCost,
+    /// What the daemon's runtime can apply of the host router and its
+    /// controls (all `false` by default). The state refuses a change the
+    /// runtime cannot carry out with `Unsupported` instead of saving intent
+    /// that would silently do nothing.
+    pub runtime: RuntimeSupport,
+}
+
+/// The host-router features the daemon's runtime implements
+/// (`docs/plans/2026-11-22-host-router.md`). A daemon sets each one when
+/// its runtime can apply it; until then the matching commands answer
+/// `Unsupported` ("not supported yet by this tesserad").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct RuntimeSupport {
+    /// The mixing engine applies the router grid, local port levels and
+    /// `local_only` card bridges: `SetRouter`, `ResetRouter`,
+    /// `SetCrosspoint*`, `RemoveCrosspoint`, `SetPortGain`/`SetPortMute` on
+    /// local ports, `[[route]]`, `local_only` bridges, port and crosspoint
+    /// bindings.
+    pub router: bool,
+    /// The daemon sets the `[host_volume]` mixer control: `SetHostVolume`,
+    /// `SetHostMute`, host bindings and mixer strips.
+    pub host_volume: bool,
+    /// The surface runtime sends MIDI/HID out: `follow` bindings.
+    pub surface_follow: bool,
+    /// The surface runtime connects `tcp_midi` sources.
+    pub tcp_midi: bool,
+}
+
+impl RuntimeSupport {
+    /// What the tesserad of this release implements. `hardware`: the
+    /// daemon is built with ALSA hardware support (the `alsa-bridge`
+    /// feature), which the host volume needs; everything else is always
+    /// there. tesserad sets this in its environment, and `tesseractl config
+    /// check` (offline) assumes it, with hardware, for the daemon shipped
+    /// with it, so both judge a configuration the same way.
+    #[must_use]
+    pub const fn tesserad(hardware: bool) -> Self {
+        Self {
+            router: true,
+            host_volume: hardware,
+            surface_follow: true,
+            tcp_midi: true,
+        }
+    }
+
+    /// Everything supported (tests, and a daemon that implements it all).
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            router: true,
+            host_volume: true,
+            surface_follow: true,
+            tcp_midi: true,
+        }
+    }
 }
 
 /// Argon2id cost of a stored access-lock PIN (`device-lock.md` §9.1 L4).
@@ -311,6 +367,7 @@ impl Environment {
             bridges_supported: false,
             memlock_limit_bytes: None,
             pin_cost: PinCost::DEFAULT,
+            runtime: RuntimeSupport::default(),
         }
     }
 

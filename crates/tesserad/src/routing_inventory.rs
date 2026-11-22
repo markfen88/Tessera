@@ -32,6 +32,59 @@ pub(crate) struct DiscoverySnapshot {
     pub permitted_interfaces: Vec<String>,
     /// Actual announced service IDs and their local logical device keys.
     pub own: Vec<OwnAdvertisement>,
+    /// Who the refused observations (oversized or malformed records) belong
+    /// to, at most [`MAX_REJECTED`]: they make only that device's discovery
+    /// incomplete, not the whole LAN's (more than that many: all of it).
+    pub rejected: Vec<Rejected>,
+    /// More owners were refused than [`MAX_REJECTED`]: discovery as a
+    /// whole is incomplete.
+    pub rejected_unscoped: bool,
+}
+
+/// Most refused observations kept by owner (see
+/// [`DiscoverySnapshot::rejected`]).
+pub(crate) const MAX_REJECTED: usize = 256;
+
+/// The owner of a refused observation, as an inventory entry is keyed:
+/// the device label of its instance name and its SRV host, lower case and
+/// bounded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rejected {
+    /// Empty when the instance name carries no device label.
+    pub label: String,
+    pub host: String,
+}
+
+impl Rejected {
+    /// The owner of `observation` (any size).
+    pub(crate) fn of(observation: &ServiceObservation) -> Self {
+        let bounded = |s: &str| s.chars().take(255).collect::<String>().to_ascii_lowercase();
+        let service = &observation.service;
+        let label = device_label(service.id.kind, &service.id.instance).unwrap_or("");
+        Self {
+            label: bounded(label),
+            host: bounded(&service.host),
+        }
+    }
+
+    fn covers(&self, label: &str, host: &str) -> bool {
+        (!self.label.is_empty() && self.label == label)
+            || (!self.host.is_empty() && self.host == host)
+    }
+}
+
+/// The device label of a service instance name, as the inventory groups
+/// records: the whole name of an ARC/CMC record, the part after `@` of a
+/// channel or bundle record.
+fn device_label(kind: ServiceKind, instance: &str) -> Option<&str> {
+    match kind {
+        ServiceKind::Arc | ServiceKind::Cmc => Some(instance),
+        ServiceKind::Chan | ServiceKind::Bund => match instance.rsplit_once('@') {
+            Some((_, label)) if !label.is_empty() => Some(label),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 impl DiscoverySnapshot {
     pub fn empty(state: RoutingDiscoveryState) -> Self {
@@ -41,6 +94,8 @@ impl DiscoverySnapshot {
             health: RoutingDiscoveryHealth::new(state),
             permitted_interfaces: Vec::new(),
             own: Vec::new(),
+            rejected: Vec::new(),
+            rejected_unscoped: false,
         }
     }
 }
@@ -100,6 +155,8 @@ impl Inventory {
         self.dirty |= self.snapshot.observations != snapshot.observations
             || self.snapshot.browser_epoch != snapshot.browser_epoch
             || self.snapshot.own != snapshot.own
+            || self.snapshot.rejected != snapshot.rejected
+            || self.snapshot.rejected_unscoped != snapshot.rejected_unscoped
             || self.snapshot.permitted_interfaces != snapshot.permitted_interfaces;
         self.snapshot = snapshot;
         let completeness_changed = complete_before != self.complete();
@@ -120,8 +177,15 @@ impl Inventory {
         h.state == RoutingDiscoveryState::Browsing
             // Event loss is reconciled by this authoritative full cache
             // snapshot. Current cap/resolve problems keep backend readiness
-            // reconciling; lifetime counters remain diagnostic only.
-            && h.rejected_observations == 0
+            // reconciling; lifetime counters remain diagnostic only. A
+            // refused record makes only its own device incomplete
+            // (`rejected`), unless there were too many to keep.
+            && !self.snapshot.rejected_unscoped
+    }
+
+    /// A refused record belongs to the device of `label` on `host`.
+    fn rejected_for(&self, label: &str, host: &str) -> bool {
+        self.snapshot.rejected.iter().any(|r| r.covers(label, host))
     }
     fn refresh(&mut self, engine: &StateEngine) {
         if !self.dirty && self.locals_match(engine) {
@@ -169,14 +233,8 @@ impl Inventory {
         let mut hints: BTreeMap<String, BTreeSet<CmcHints<'_>>> = BTreeMap::new();
         for observation in &self.snapshot.observations {
             let service = &observation.service;
-            let label = match service.id.kind {
-                ServiceKind::Arc | ServiceKind::Cmc => service.id.instance.as_str(),
-                ServiceKind::Chan | ServiceKind::Bund => match service.id.instance.rsplit_once('@')
-                {
-                    Some((_, label)) if !label.is_empty() => label,
-                    _ => continue,
-                },
-                _ => continue,
+            let Some(label) = device_label(service.id.kind, &service.id.instance) else {
+                continue;
             };
             let key = (
                 label.to_ascii_lowercase(),
@@ -281,7 +339,7 @@ impl Inventory {
                 }
                 Some(_) => {}
             }
-            if !self.complete() {
+            if !self.complete() || self.rejected_for(&label, &host) {
                 device.unavailable.push(Reason::IncompleteDiscovery);
             }
             if hints.get(&label).is_some_and(|values| values.len() > 1) {
@@ -480,7 +538,10 @@ impl Inventory {
             .values()
             .find(|e| &e.device.endpoint == endpoint)
             .ok_or(CommandError::RoutingSnapshotExpired)?;
-        if !self.complete()
+        // This host's own receiver does not depend on what discovery saw
+        // of the LAN; another device's needs its own records complete.
+        let local_entry = entry.device.local_device.is_some();
+        if (!local_entry && !self.complete())
             || entry.device.unavailable.iter().any(|reason| {
                 matches!(
                     reason,
@@ -488,6 +549,7 @@ impl Inventory {
                         | Reason::BundleUnsupported
                         | Reason::InterfaceUnknown
                         | Reason::InterfaceNotPermitted
+                        | Reason::IncompleteDiscovery
                 )
             })
         {
@@ -495,15 +557,30 @@ impl Inventory {
                 "receiver discovery is incomplete, ambiguous or outside permitted interfaces",
             ));
         }
-        let network = engine
-            .network_status()
-            .ok_or_else(|| unsupported("host interface observation unavailable"))?;
-        let (interface, port, addresses, txt) = if let Some(local) = &entry.device.local_device {
+        if let Some(local) = &entry.device.local_device {
             if engine.model().devices.first().map(|d| &d.key) != Some(local) {
                 return Err(unsupported(
                     "only the first local logical device has a receiver endpoint",
                 ));
             }
+            // The native device role is this host's receiver: its endpoint
+            // is known here, no advertisement needs to be seen first.
+            if let Some(native) = crate::native::local() {
+                return Ok(Target {
+                    endpoint: endpoint.clone(),
+                    label: entry.device.label.clone(),
+                    interface: native.interface,
+                    source: native.address,
+                    peer: std::net::SocketAddrV4::new(native.address, crate::native::ARC_PORT),
+                    profile: crate::native::arc_profile()
+                        .ok_or_else(|| unsupported("native ARC profile unavailable"))?,
+                });
+            }
+        }
+        let network = engine
+            .network_status()
+            .ok_or_else(|| unsupported("host interface observation unavailable"))?;
+        let (interface, port, addresses, txt) = if let Some(local) = &entry.device.local_device {
             let mut arc = self
                 .snapshot
                 .own
@@ -608,6 +685,145 @@ impl Inventory {
             return Err(CommandError::RoutingSnapshotExpired);
         }
         page.into_reply(max_frame)
+    }
+
+    /// Complete a page of this host's own receiver from the state engine,
+    /// which owns its channels: the configured labels, the inputs the
+    /// answering runtime did not list (a compatibility runtime may report
+    /// fewer channels than the device has), and the configuration flows
+    /// (`[[flow]]`) that feed its inputs outside any subscription.
+    ///
+    /// Call it after expectations were issued: an added input never gets
+    /// one, so it stays read-only (local monitoring does not need one).
+    /// Another device's page is left as it is. Returns whether the page is
+    /// this host's (completed: the caller fits it to the frame, as labels and
+    /// added rows make it larger).
+    pub(crate) fn complete_local_page(
+        &self,
+        engine: &StateEngine,
+        target: &crate::routing_receiver::Target,
+        page: &mut tessera_control_types::RoutingReceiverPage,
+    ) -> bool {
+        /// Rows per completed page; the rest follow on "more inputs" pages.
+        const MAX_ROWS: usize = 64;
+        let Some(entry) = self
+            .entries
+            .values()
+            .find(|e| e.device.endpoint == target.endpoint)
+        else {
+            return false;
+        };
+        // The local logical device the entry is (any of them, by key).
+        let Some(device) = entry
+            .device
+            .local_device
+            .as_ref()
+            .and_then(|key| engine.model().devices.iter().find(|d| &d.key == key))
+        else {
+            return false;
+        };
+        for row in &mut page.channels {
+            if (1..=device.rx_channels).contains(&row.id) {
+                row.label = Some(device.rx_label(row.id));
+            }
+        }
+        if page.next_first.is_none() {
+            let last = page
+                .channels
+                .iter()
+                .map(|c| c.id)
+                .max()
+                .unwrap_or(page.first.saturating_sub(1));
+            for id in u32::from(last) + 1..=u32::from(device.rx_channels) {
+                let Ok(id) = u16::try_from(id) else { break };
+                if page.channels.len() >= MAX_ROWS {
+                    page.next_first = Some(id);
+                    break;
+                }
+                page.channels
+                    .push(tessera_control_types::RoutingReceiverChannel::new(
+                        id,
+                        Some(device.rx_label(id)),
+                        None,
+                        0,
+                    ));
+            }
+        }
+        let configured: BTreeSet<&str> = engine
+            .config()
+            .config
+            .flows
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        for row in &mut page.channels {
+            // The first configuration flow that carries the input, as the
+            // state's own read model (`ReceiverCarrier`) takes it.
+            row.config_flow = engine
+                .model()
+                .flows
+                .iter()
+                .filter(|f| {
+                    f.device == device.key.0
+                        && f.direction == Direction::Rx
+                        && configured.contains(f.id.as_str())
+                })
+                .find_map(|f| {
+                    let position = if f.channels.is_empty() {
+                        Some(row.id)
+                    } else {
+                        f.channels
+                            .iter()
+                            .position(|c| *c == row.id)
+                            .and_then(|i| u16::try_from(i + 1).ok())
+                    }?;
+                    let mut feed = tessera_control_types::ConfigFlowFeed::new(&f.id, position);
+                    let peer = f
+                        .peer
+                        .or(f.local_address.filter(std::net::Ipv4Addr::is_multicast));
+                    feed.peer = peer.map(|p| p.to_string());
+                    if let Some((source, names)) =
+                        f.peer.and_then(|p| self.peer_channel(p, position))
+                    {
+                        feed.source = Some(source);
+                        feed.source_names = Some(names);
+                    }
+                    feed.media = engine.flow_media(&device.key.0, row.id).cloned();
+                    Some(feed)
+                });
+        }
+        true
+    }
+
+    /// The TX channel `position` of the one discovered device that
+    /// advertises `peer`, if exactly one does and it lists that channel.
+    fn peer_channel(
+        &self,
+        peer: std::net::Ipv4Addr,
+        position: u16,
+    ) -> Option<(
+        tessera_control_types::RoutingSourceRef,
+        tessera_control_types::ReceiverSelection,
+    )> {
+        let address = std::net::IpAddr::V4(peer);
+        let mut matching = self.entries.values().filter(|e| {
+            e.local.is_none()
+                && e.observations
+                    .iter()
+                    .any(|o| o.service.addresses.contains(&address))
+        });
+        let entry = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let channel = entry
+            .channels
+            .iter()
+            .find(|c| c.direction == Direction::Tx && c.id == u32::from(position))?;
+        Some((
+            tessera_control_types::RoutingSourceRef::new(entry.device.endpoint.clone(), channel.id),
+            tessera_control_types::ReceiverSelection::new(&entry.device.label, &channel.label),
+        ))
     }
 
     /// Execution class of a receiver: this host's first receiver (its channel
@@ -1188,6 +1404,124 @@ mod tests {
         assert_eq!(fixture.engine.effective_config().unwrap(), before);
     }
 
+    /// The speaker's case: a compatibility runtime lists two generic inputs
+    /// of four; a configuration flow from a discovered device feeds RX 1-2.
+    #[test]
+    fn local_pages_get_every_input_labels_and_configuration_flows() {
+        use tessera_control_types::{RoutingReceiverChannel, RoutingReceiverPage};
+        let mut f = Fixture::with_config(
+            "[[device]]\nid='main'\nname='speaker'\nrx_channels=4\ntx_channels=2\n\
+             rx_channel_labels = { 1 = \"ndimon L\", 2 = \"ndimon R\", 3 = \"CQ USB ret 1\", 4 = \"CQ USB ret 2\" }\n\
+             [[flow]]\nid='from-ndimon'\ndevice='main'\ndirection='rx'\nchannels=[1, 2]\npeer='192.0.2.10'\nport=5004\n\
+             [[flow]]\nid='stray'\ndevice='main'\ndirection='rx'\nchannels=[4, 3]\npeer='198.51.100.7'\nport=5006\n",
+        );
+        f.engine.report_subscription_sweep(&[(
+            DeviceKey("main".into()),
+            tessera_control_types::Channel::new(1).unwrap(),
+            tessera_control_types::SubscriptionState::Receiving,
+        )]);
+        let engine = &f.engine;
+        let chan = |n: &str| {
+            observation(
+                ServiceKind::Chan,
+                &format!("{n}@STAGEBOX-01"),
+                "s1",
+                TxtRecord::new().with("id", n).unwrap(),
+            )
+        };
+        let mut inventory = Inventory::new();
+        inventory.report(snapshot(vec![chan("1"), chan("2")]), engine);
+        let page = devices(&mut inventory, engine);
+        let local = page
+            .devices
+            .iter()
+            .find(|d| d.local_device.is_some())
+            .unwrap()
+            .endpoint
+            .clone();
+        let remote = page
+            .devices
+            .iter()
+            .find(|d| d.label == "STAGEBOX-01")
+            .unwrap()
+            .endpoint
+            .clone();
+        let target = |endpoint: EndpointRef| crate::routing_receiver::Target {
+            endpoint,
+            label: "speaker".into(),
+            interface: "eth0".into(),
+            source: "192.0.2.1".parse().unwrap(),
+            peer: "192.0.2.1:4440".parse().unwrap(),
+            profile: tessera_control::arc::Legacy::from_advertised_version("2.7.41").unwrap(),
+        };
+        let mut page = RoutingReceiverPage::new(local.clone(), "speaker".into(), 1, 2);
+        page.channels = vec![
+            RoutingReceiverChannel::new(1, Some("RX 1".into()), None, 0),
+            RoutingReceiverChannel::new(2, Some("RX 2".into()), None, 0),
+        ];
+        inventory.complete_local_page(engine, &target(local.clone()), &mut page);
+        let ids: Vec<_> = page.channels.iter().map(|c| c.id).collect();
+        assert_eq!(ids, [1, 2, 3, 4], "every input of the device");
+        let labels: Vec<_> = page
+            .channels
+            .iter()
+            .map(|c| c.label.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            ["ndimon L", "ndimon R", "CQ USB ret 1", "CQ USB ret 2"]
+        );
+        assert!(page.channels.iter().all(|c| c.expectation.is_none()));
+        assert_eq!(page.next_first, None);
+        for (index, row) in page.channels[..2].iter().enumerate() {
+            let feed = row.config_flow.as_ref().expect("the configuration flow");
+            assert_eq!(feed.id, "from-ndimon");
+            assert_eq!(feed.peer.as_deref(), Some("192.0.2.10"));
+            assert_eq!(usize::from(feed.position), index + 1);
+            let source = feed.source.as_ref().expect("matched by address and order");
+            assert_eq!(source.endpoint, remote);
+            assert_eq!(source.channel, u32::from(feed.position));
+            assert_eq!(
+                feed.source_names,
+                Some(tessera_control_types::ReceiverSelection::new(
+                    "STAGEBOX-01",
+                    (index + 1).to_string()
+                ))
+            );
+            assert!(row.source.is_none(), "no subscription is invented");
+        }
+        assert_eq!(
+            page.channels[0].config_flow.as_ref().unwrap().media,
+            Some(tessera_control_types::SubscriptionState::Receiving)
+        );
+        // An unknown peer stays a bare address; the position is the wire
+        // order (RX 4 first), not the input number.
+        for (row, position) in [(&page.channels[2], 2), (&page.channels[3], 1)] {
+            let stray = row.config_flow.as_ref().unwrap();
+            assert_eq!(
+                (stray.id.as_str(), stray.position, stray.peer.as_deref()),
+                ("stray", position, Some("198.51.100.7"))
+            );
+            assert!(stray.source.is_none() && stray.source_names.is_none());
+            assert_eq!(stray.media, None);
+        }
+
+        // Another device's page is left exactly as it was read.
+        let mut other = RoutingReceiverPage::new(remote.clone(), "STAGEBOX-01".into(), 1, 2);
+        other.channels = vec![RoutingReceiverChannel::new(1, Some("RX1".into()), None, 0)];
+        let before = other.clone();
+        inventory.complete_local_page(engine, &target(remote), &mut other);
+        assert_eq!(other, before);
+
+        // A runtime page with more to come is not extended.
+        let mut first = RoutingReceiverPage::new(local.clone(), "speaker".into(), 1, 2);
+        first.channels = vec![RoutingReceiverChannel::new(1, None, None, 0)];
+        first.next_first = Some(2);
+        inventory.complete_local_page(engine, &target(local), &mut first);
+        assert_eq!(first.channels.len(), 1);
+        assert_eq!(first.channels[0].label.as_deref(), Some("ndimon L"));
+    }
+
     #[test]
     fn receiver_preparation_refuses_incomplete_discovery_and_disallowed_interfaces() {
         for disallowed in [false, true] {
@@ -1206,6 +1540,96 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn a_refused_record_makes_only_its_own_device_incomplete() {
+        let (fixture, mut inventory, endpoint) = receiver_fixture();
+        let rejected = |label: &str, host: &str| Rejected {
+            label: label.into(),
+            host: host.into(),
+        };
+        // An oversized record of another device: this one stays readable.
+        let mut changed = inventory.snapshot.clone();
+        changed.health.rejected_observations = 3;
+        changed.rejected = vec![rejected("other", "other.local.")];
+        inventory.report(changed, &fixture.engine);
+        assert!(
+            inventory
+                .receiver_target(&fixture.engine, &endpoint)
+                .is_ok()
+        );
+        // One of its own (by label or by host): incomplete, refused.
+        for r in [rejected("stage", ""), rejected("", "stage.local.")] {
+            let mut changed = inventory.snapshot.clone();
+            changed.rejected = vec![r];
+            inventory.report(changed, &fixture.engine);
+            let endpoint = devices(&mut inventory, &fixture.engine)
+                .devices
+                .into_iter()
+                .find(|d| d.local_device.is_none())
+                .unwrap();
+            assert!(endpoint.unavailable.contains(&Reason::IncompleteDiscovery));
+            assert!(
+                inventory
+                    .receiver_target(&fixture.engine, &endpoint.endpoint)
+                    .is_err()
+            );
+        }
+        // Too many to keep by owner: the whole of discovery is incomplete.
+        let mut changed = inventory.snapshot.clone();
+        changed.rejected.clear();
+        changed.rejected_unscoped = true;
+        inventory.report(changed, &fixture.engine);
+        let endpoint = devices(&mut inventory, &fixture.engine)
+            .devices
+            .into_iter()
+            .find(|d| d.local_device.is_none())
+            .unwrap()
+            .endpoint;
+        assert!(
+            inventory
+                .receiver_target(&fixture.engine, &endpoint)
+                .is_err()
+        );
+        // The owner of a refused record, as entries are keyed.
+        let o = observation(
+            ServiceKind::Chan,
+            &format!("01@{}", "Big".repeat(30)),
+            "source",
+            TxtRecord::new(),
+        );
+        let r = Rejected::of(&o);
+        assert_eq!(r.label, "big".repeat(30));
+        assert_eq!(r.host, "stage.local.");
+    }
+
+    #[test]
+    fn this_hosts_receiver_does_not_wait_for_discovery_of_the_lan() {
+        let (fixture, mut inventory, _) = receiver_fixture();
+        let key = fixture.engine.model().devices[0].key.clone();
+        let mut changed = inventory.snapshot.clone();
+        changed.own = vec![OwnAdvertisement {
+            id: ServiceId::new(ServiceKind::Arc, "Local"),
+            host: "local.local.".into(),
+            port: 4440,
+            addresses: vec!["192.0.2.1".parse().unwrap()],
+            txt: TxtRecord::new().with("arcp_vers", "2.7.41").unwrap(),
+            device: key,
+        }];
+        // Discovery of the LAN is not complete (failed, refused records).
+        changed.health.state = RoutingDiscoveryState::Failed;
+        changed.rejected_unscoped = true;
+        inventory.report(changed, &fixture.engine);
+        let local = devices(&mut inventory, &fixture.engine)
+            .devices
+            .into_iter()
+            .find(|d| d.local_device.is_some())
+            .unwrap()
+            .endpoint;
+        let target = inventory.receiver_target(&fixture.engine, &local).unwrap();
+        assert_eq!(target.peer.to_string(), "192.0.2.1:4440");
+        assert_eq!(target.source.to_string(), "192.0.2.1");
+    }
+
     fn devices(inventory: &mut Inventory, engine: &StateEngine) -> RoutingDevicePage {
         match inventory
             .query(

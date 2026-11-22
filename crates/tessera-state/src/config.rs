@@ -650,7 +650,9 @@ pub struct DiscoveryConfig {
     /// Advertise the logical devices (ARC, CMC and channel records) with
     /// mDNS. Enabled by default with the packaged Controller runtime.
     pub advertise_devices: bool,
-    /// Browse the existing permitted interfaces for the read-only catalogue.
+    /// Browse the existing permitted interfaces for the read-only catalogue
+    /// (on by default: the portal's routing matrix needs it; browsing sends
+    /// no routing commands). `false` opts out.
     pub browse_devices: bool,
     /// Discovery at all; `false` advertises nothing whatever
     /// `advertise_devices` says (`--no-discovery`).
@@ -663,7 +665,7 @@ impl Default for DiscoveryConfig {
             enabled: true,
             mdns: MdnsMode::Auto,
             advertise_devices: true,
-            browse_devices: false,
+            browse_devices: true,
         }
     }
 }
@@ -744,6 +746,17 @@ pub struct DeviceConfig {
     pub tx_channel_labels: BTreeMap<u16, String>,
     /// Multicast settings.
     pub multicast: MulticastConfig,
+    /// Local monitoring: RX channel `n` (the `n`-th entry, 1-based) also
+    /// plays this device's TX channel given there (1-based; 0: none),
+    /// mixed in, after that TX channel's gain and mute. For a bridged
+    /// card's inputs that go to the network and to the local outputs at
+    /// once. Empty (default): no monitoring.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub monitor_rx_from_tx: Vec<u16>,
+    /// How far behind the playback position the monitored TX channel is
+    /// read, microseconds. 0 (the default): auto, the lowest delay at which
+    /// the feeding capture bridge's audio is reliably in the ring.
+    pub monitor_delay_us: u32,
 }
 
 /// Default `[[bridge]] time_constant_s`: a slow, gentle loop, so that it
@@ -789,12 +802,17 @@ pub struct BridgeConfig {
     pub alsa_pcm: String,
     /// `playback` (network to card) or `capture` (card to network).
     pub direction: BridgeDirection,
-    /// First device channel carried (1-based); card channel 1 is this one.
+    /// First device channel carried (1-based); card channel
+    /// `card_first_channel` is this one.
     pub first_channel: u16,
     /// Channels carried; `None`: the rest of the device's channels in that
     /// direction from `first_channel` on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channels: Option<u16>,
+    /// First card channel carried (1-based, default 1). The card is opened
+    /// with at least `card_first_channel + channels - 1` channels (or the
+    /// count it requires); only that slice is carried.
+    pub card_first_channel: u16,
     /// The card's rate; must equal the device's (the bridge compensates
     /// drift, not rate differences). `None`: the device's rate, following
     /// its changes.
@@ -840,6 +858,11 @@ pub struct BridgeConfig {
     pub error_sleep_max_ms: Option<u32>,
     /// A `channels = [..]` list (the older form) that is not one ascending
     /// run of channels, kept for validation to report; `None` for every
+    /// Open the card for the host router only: its channels become router
+    /// ports (`card_in` / `card_out`) and no device channel is fed or read;
+    /// `first_channel` is ignored and `channels` is required. Needs a daemon
+    /// with the host router.
+    pub local_only: bool,
     /// usable configuration (a run is stored as `first_channel` + count).
     #[serde(skip)]
     pub channel_list: Option<Vec<u16>>,
@@ -857,6 +880,7 @@ impl BridgeConfig {
             direction,
             first_channel: 1,
             channels: None,
+            card_first_channel: 1,
             sample_rate: None,
             period_frames: None,
             buffer_frames: None,
@@ -871,6 +895,7 @@ impl BridgeConfig {
             error_sleep: None,
             error_sleep_min_ms: None,
             error_sleep_max_ms: None,
+            local_only: false,
             channel_list: None,
         }
     }
@@ -912,6 +937,13 @@ impl BridgeConfig {
             .unwrap_or_else(|| available.saturating_sub(self.first_channel.saturating_sub(1)))
     }
 
+    /// The last card channel carried (1-based) when the bridge carries
+    /// `count` channels: the card must have at least this many.
+    #[must_use]
+    pub fn card_last_channel(&self, count: u16) -> u32 {
+        (u32::from(self.card_first_channel) + u32::from(count)).saturating_sub(1)
+    }
+
     /// The period, resolved against the device rate.
     #[must_use]
     pub fn period(&self, rate: u32) -> u32 {
@@ -943,6 +975,101 @@ pub fn default_bridge_name(device: &str, direction: BridgeDirection) -> String {
         })
         .collect();
     format!("{device}-{direction}")
+}
+
+/// `[host_volume]`: the host (speaker amplifier) volume, a hardware mixer
+/// control the daemon sets (`SetHostVolume`, `SetHostMute`) and restores at
+/// start. Absent: no host volume.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HostVolumeConfig {
+    /// ALSA card id or index (`amixer -c <card>`): letters, digits, `_`,
+    /// `-`, at most 64 bytes. Named, so a card that moves to another index
+    /// after a reboot is still the same card.
+    pub card: String,
+    /// Simple mixer control (default `Digital`).
+    pub control: String,
+    /// Lowest volume offered, dB (default -60).
+    pub min_db: f64,
+    /// Highest volume offered, dB (default 0).
+    pub max_db: f64,
+}
+
+impl HostVolumeConfig {
+    /// The default control name.
+    pub const DEFAULT_CONTROL: &'static str = "Digital";
+    /// The default range, dB.
+    pub const DEFAULT_RANGE: (f64, f64) = (-60.0, 0.0);
+
+    /// A host volume on `card` with the default control and range.
+    #[must_use]
+    pub fn new(card: &str) -> Self {
+        Self {
+            card: card.to_owned(),
+            control: Self::DEFAULT_CONTROL.to_owned(),
+            min_db: Self::DEFAULT_RANGE.0,
+            max_db: Self::DEFAULT_RANGE.1,
+        }
+    }
+
+    /// `min_db` in milli-dB (rounded).
+    #[must_use]
+    pub fn min_mdb(&self) -> i32 {
+        db_to_mdb(self.min_db)
+    }
+
+    /// `max_db` in milli-dB (rounded).
+    #[must_use]
+    pub fn max_mdb(&self) -> i32 {
+        db_to_mdb(self.max_db)
+    }
+}
+
+/// dB → milli-dB, rounded and clamped to the `i32` range (validation
+/// reports values outside the gain range first).
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn db_to_mdb(db: f64) -> i32 {
+    if !db.is_finite() {
+        return if db > 0.0 { i32::MAX } else { i32::MIN };
+    }
+    (db * 1000.0)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// One `[[route]]`: a crosspoint of the host router's **default** grid,
+/// used while no grid is saved at run time (with the identity routes and
+/// local monitoring). A saved grid (`SetRouter`) replaces the whole default
+/// grid; it starts as a copy of it.
+///
+/// ```toml
+/// [[route]]
+/// source = { kind = "card_in", card = "hw:CARD=CQ,DEV=0", channel = 15 }
+/// destination = { kind = "host_out", device = "main", channel = 1 }
+/// gain_db = -3.0
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RouteConfig {
+    /// Any router port (a destination port here is a tap of what it carries).
+    pub source: tessera_control_types::RouterPort,
+    /// A destination port: `network_tx`, `host_out` or `card_out`.
+    pub destination: tessera_control_types::RouterPort,
+    /// Gain of the crosspoint, dB (default 0).
+    pub gain_db: f64,
+    /// Patched but silent (default false).
+    pub muted: bool,
+}
+
+impl RouteConfig {
+    /// The crosspoint this entry describes.
+    #[must_use]
+    pub fn crosspoint(&self) -> tessera_control_types::Crosspoint {
+        let mut x =
+            tessera_control_types::Crosspoint::new(self.source.clone(), self.destination.clone());
+        x.gain = tessera_control_types::Gain::MilliDb(db_to_mdb(self.gain_db));
+        x.muted = self.muted;
+        x
+    }
 }
 
 /// One `[[flow]]`: a **PROVISIONAL** static audio flow, tessera-only test
@@ -1048,6 +1175,9 @@ pub struct Config {
     pub aes67: Aes67Config,
     /// `[defaults]`: per-entry defaults of `[[flow]]` and `[[bridge]]`.
     pub defaults: DefaultsConfig,
+    /// `[host_volume]`: the host (speaker amplifier) volume; `None`: none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_volume: Option<HostVolumeConfig>,
     /// `[[device]]`. Never empty after loading: an empty configuration gets
     /// one default device.
     #[serde(rename = "device")]
@@ -1055,6 +1185,9 @@ pub struct Config {
     /// `[[bridge]]`.
     #[serde(rename = "bridge")]
     pub bridges: Vec<BridgeConfig>,
+    /// `[[route]]`: the host router's configured default crosspoints.
+    #[serde(rename = "route", skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<RouteConfig>,
     /// `[[flow]]` (PROVISIONAL static flows).
     #[serde(rename = "flow")]
     pub flows: Vec<FlowConfig>,
@@ -1742,6 +1875,11 @@ pub(crate) fn extract(table: Table, env: &Environment) -> (Config, Vec<Issue>) {
             });
         });
 
+        if let Some(t) = root.table("host_volume") {
+            let mut r = root.sub("host_volume".to_owned(), t);
+            cfg.host_volume = extract_host_volume(&mut r);
+        }
+
         let device_tables = root.tables("device");
         let multi = device_tables.len() > 1;
         for (path, t) in device_tables {
@@ -1751,6 +1889,12 @@ pub(crate) fn extract(table: Table, env: &Environment) -> (Config, Vec<Issue>) {
         for (path, t) in root.tables("bridge") {
             let mut r = root.sub(path, t);
             cfg.bridges.push(extract_bridge(&mut r));
+        }
+        for (path, t) in root.tables("route") {
+            let mut r = root.sub(path, t);
+            if let Some(route) = extract_route(&mut r) {
+                cfg.routes.push(route);
+            }
         }
         for (path, t) in root.tables("flow") {
             let mut r = root.sub(path, t);
@@ -1762,6 +1906,11 @@ pub(crate) fn extract(table: Table, env: &Environment) -> (Config, Vec<Issue>) {
     }
     (cfg, issues)
 }
+
+/// Default `[[device]] monitor_delay_us`: 0, auto (the lowest safe delay).
+pub const DEFAULT_MONITOR_DELAY_US: u32 = 0;
+/// Largest `[[device]] monitor_delay_us` (one second).
+pub const MAX_MONITOR_DELAY_US: u32 = 1_000_000;
 
 fn default_device(env: &Environment, id: &str, multi: bool) -> DeviceConfig {
     DeviceConfig {
@@ -1778,6 +1927,8 @@ fn default_device(env: &Environment, id: &str, multi: bool) -> DeviceConfig {
         rx_channel_labels: BTreeMap::new(),
         tx_channel_labels: BTreeMap::new(),
         multicast: MulticastConfig::default(),
+        monitor_rx_from_tx: Vec::new(),
+        monitor_delay_us: DEFAULT_MONITOR_DELAY_US,
     }
 }
 
@@ -1829,6 +1980,15 @@ fn extract_device(r: &mut Reader<'_>, env: &Environment, multi: bool) -> DeviceC
     }
     if let Some(v) = r.labels("tx_channel_labels") {
         d.tx_channel_labels = v;
+    }
+    if let Some(v) = r.uint_list("monitor_rx_from_tx", u64::from(u16::MAX)) {
+        d.monitor_rx_from_tx = v
+            .into_iter()
+            .map(|c| u16::try_from(c).unwrap_or(u16::MAX))
+            .collect();
+    }
+    if let Some(v) = r.uint("monitor_delay_us", u64::from(MAX_MONITOR_DELAY_US)) {
+        d.monitor_delay_us = u32::try_from(v).unwrap_or(MAX_MONITOR_DELAY_US);
     }
     r.section("multicast", &mut d.multicast, |r, m| {
         if let Some(v) = r.boolean("allow_tx_multicast") {
@@ -1904,6 +2064,9 @@ fn extract_bridge(r: &mut Reader<'_>) -> BridgeConfig {
             &other,
         ),
     }
+    if let Some(v) = r.uint("card_first_channel", u64::from(u16::MAX)) {
+        b.card_first_channel = u16::try_from(v).unwrap_or(u16::MAX);
+    }
     if let Some(v) = r.uint("sample_rate", u64::from(u32::MAX)) {
         b.sample_rate = Some(u32::try_from(v).unwrap_or(u32::MAX));
     }
@@ -1940,7 +2103,127 @@ fn extract_bridge(r: &mut Reader<'_>) -> BridgeConfig {
     b.error_sleep = r.boolean("error_sleep");
     b.error_sleep_min_ms = r.u32("error_sleep_min_ms");
     b.error_sleep_max_ms = r.u32("error_sleep_max_ms");
+    if let Some(v) = r.boolean("local_only") {
+        b.local_only = v;
+    }
     b
+}
+
+/// `[host_volume]`: `None` for an empty table (no `card`, nothing else):
+/// the host volume is off, as when the table is absent.
+fn extract_host_volume(r: &mut Reader<'_>) -> Option<HostVolumeConfig> {
+    let empty = r.table.is_empty();
+    let has_card = r.table.contains_key("card");
+    let card = r.string("card");
+    if card.is_none() {
+        if !empty && !has_card {
+            r.error(
+                "card",
+                "missing required key `card` (the ALSA card of the host volume)",
+            );
+        }
+        // Take the other keys so they are not reported as unknown.
+        for k in ["control", "min_db", "max_db"] {
+            let _ = r.take(k);
+        }
+        return None;
+    }
+    let mut h = HostVolumeConfig::new("");
+    if let Some(v) = card {
+        h.card = v;
+    }
+    if let Some(v) = r.string("control") {
+        h.control = v;
+    }
+    if let Some(v) = r.number("min_db") {
+        h.min_db = v;
+    }
+    if let Some(v) = r.number("max_db") {
+        h.max_db = v;
+    }
+    Some(h)
+}
+
+/// The kinds a router port table may have, for messages.
+const PORT_KINDS: &str = "network_rx, network_tx, app_out, host_out, card_in, card_out";
+
+/// A router port written as an inline table (`{ kind = "host_out", device =
+/// "main", channel = 1 }`); every problem is reported under `key`.
+fn port(r: &mut Reader<'_>, key: &'static str) -> Option<tessera_control_types::RouterPort> {
+    use tessera_control_types::{Channel, DeviceKey, RouterPort};
+    if !r.table.contains_key(key) {
+        r.known.push(key);
+        r.error(key, format!("missing required key `{key}`"));
+        return None;
+    }
+    let t = r.table(key)?;
+    let path = r.join(key);
+    let mut p = r.sub(path, t);
+    let kind = p.required_string("kind");
+    let device = p.string("device");
+    let card = p.string("card");
+    let channel = p
+        .uint("channel", u64::from(u16::MAX))
+        .and_then(|c| u16::try_from(c).ok());
+    let kind = kind?;
+    let Some(channel) = channel.and_then(Channel::new) else {
+        if !p.issues.iter().any(|i| i.path.starts_with(&p.path)) {
+            p.error("channel", "a 1-based channel number is required");
+        }
+        return None;
+    };
+    let need = |p: &mut Reader<'_>, what: &'static str, v: Option<String>| {
+        if v.is_none() {
+            p.error(what, format!("a `{kind}` port needs `{what}`"));
+        }
+        v
+    };
+    let wrong = |p: &mut Reader<'_>, what: &'static str, v: &Option<String>| {
+        if v.is_some() {
+            p.error(what, format!("a `{kind}` port has no `{what}`"));
+        }
+    };
+    match kind.as_str() {
+        "network_rx" | "network_tx" | "app_out" | "host_out" => {
+            wrong(&mut p, "card", &card);
+            let device = DeviceKey(need(&mut p, "device", device)?);
+            Some(match kind.as_str() {
+                "network_rx" => RouterPort::NetworkRx { device, channel },
+                "network_tx" => RouterPort::NetworkTx { device, channel },
+                "app_out" => RouterPort::AppOut { device, channel },
+                _ => RouterPort::HostOut { device, channel },
+            })
+        }
+        "card_in" | "card_out" => {
+            wrong(&mut p, "device", &device);
+            let card = need(&mut p, "card", card)?;
+            Some(if kind == "card_in" {
+                RouterPort::CardIn { card, channel }
+            } else {
+                RouterPort::CardOut { card, channel }
+            })
+        }
+        other => {
+            p.error(
+                "kind",
+                format!("unknown value `{other}`, valid values: {PORT_KINDS}"),
+            );
+            None
+        }
+    }
+}
+
+fn extract_route(r: &mut Reader<'_>) -> Option<RouteConfig> {
+    let source = port(r, "source");
+    let destination = port(r, "destination");
+    let gain_db = r.number("gain_db").unwrap_or(0.0);
+    let muted = r.boolean("muted").unwrap_or(false);
+    Some(RouteConfig {
+        source: source?,
+        destination: destination?,
+        gain_db,
+        muted,
+    })
 }
 
 fn ipv4(r: &mut Reader<'_>, key: &'static str) -> Option<Ipv4Addr> {

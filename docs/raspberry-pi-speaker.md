@@ -36,7 +36,7 @@ Pick **Direct** unless the speaker must also play local sources.
 |--|-----------------------------------|-----------------------------------------------------------|
 | Path | network → `tesserad` → ALSA plugin → CamillaDSP (resampler) → DAC | network → `tesserad` bridge (resampler, slow loop) → `snd-aloop` → CamillaDSP (rate adjust of the loopback) → DAC |
 | Clock crossings | one: CamillaDSP's resampler between the media clock and the DAC | two loops in series: the bridge follows the loopback, CamillaDSP keeps the loopback in step with the DAC |
-| Needs | `tessera-alsa` (the plugin) | `tesserad` built with `alsa-bridge`, `snd-aloop`, `SupplementaryGroups=audio` |
+| Needs | `tessera-alsa` (the plugin) | `tesserad` built with `alsa-bridge`, `snd-aloop` (`tesserad.service` already includes `SupplementaryGroups=audio`) |
 | Local sources (AirPlay, Squeezelite, Bluetooth) | not served | share the loopback through a `dmix` bus at the device's rate (see [Shared sources](#shared-sources-and-one-sample-rate)) |
 
 ---
@@ -187,8 +187,9 @@ topology is experimental; validate hardware compatibility for your installation.
  AirPlay / Squeezelite / Bluetooth ─────────────────────────┘
 ```
 
-1. `tesserad` with `alsa-bridge`, `SupplementaryGroups=audio`
-   ([audio-backends.md](audio-backends.md#prerequisites)), and `snd-aloop`:
+1. `tesserad` built with `alsa-bridge` (the packaged `tesserad.service` already
+   runs with `SupplementaryGroups=audio`,
+   [audio-backends.md](audio-backends.md#prerequisites)), and `snd-aloop`:
 
    ```sh
    echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf

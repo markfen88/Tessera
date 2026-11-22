@@ -132,6 +132,18 @@ pub struct RuntimePlan {
     pub model: tessera_state::Model,
     /// The merged configuration.
     pub config: tessera_state::Config,
+    /// The host router's active crosspoints (the effective grid, bridge-
+    /// implied ones included, without those whose ports are missing).
+    pub crosspoints: Vec<(
+        tessera_control_types::Crosspoint,
+        tessera_control_types::CrosspointOrigin,
+    )>,
+    /// Local router port levels (`app_out`, `card_in`, `card_out`).
+    pub port_levels: Vec<(
+        tessera_control_types::RouterPort,
+        tessera_control_types::Gain,
+        bool,
+    )>,
 }
 
 /// Requests served by the engine thread.
@@ -291,6 +303,13 @@ pub(crate) enum Msg {
     ClockInterfaces(Vec<String>),
     /// What the bridges are doing, from the bridge manager.
     ReportBridges(Vec<BridgeStatus>),
+    /// What the host volume's mixer control reads, or why it cannot be read.
+    ReportHostVolume(
+        Option<tessera_control_types::HostVolumeReading>,
+        Option<String>,
+    ),
+    /// The sound cards found on the host, from the surface runtime's scan.
+    SoundCards(Vec<tessera_state::engine::SoundCard>),
     /// One sweep of what the media layer sees of each rx subscription.
     ReportSubscriptions(Vec<(DeviceKey, Channel, SubscriptionState)>),
     ReportSubscriptionStates(Vec<(DeviceKey, Channel, SubscriptionState)>),
@@ -695,7 +714,13 @@ impl EngineHandle {
             .ask(|reply| Msg::ReceiverTarget { query, reply })
             .await??;
         let deadline = Instant::now() + Duration::from_secs(3);
-        let page = crate::routing_receiver::read(&target, first, deadline, max_frame).await?;
+        // This host's receiver served by the daemon itself (native role):
+        // answered in process, no UDP round trip.
+        let page = if crate::native::serves(target.peer) {
+            crate::routing_receiver::read_local(self, &target, first, deadline, max_frame).await?
+        } else {
+            crate::routing_receiver::read(&target, first, deadline, max_frame).await?
+        };
         // Another device's access lock (`device-lock.md` §9.3 L14); this
         // host's own receiver answers from the state engine instead.
         let page = if *target.peer.ip() == target.source {
@@ -876,6 +901,25 @@ impl EngineHandle {
     /// full: the caller reports again shortly.
     pub fn report_bridges(&self, rows: Vec<BridgeStatus>) -> bool {
         self.tx.try_send(Msg::ReportBridges(rows)).is_ok()
+    }
+
+    /// Report what the host volume's mixer control reads (`None` with a
+    /// problem when it cannot be read). Non-blocking; `false` if the queue
+    /// was full (the caller reports again).
+    pub fn report_host_volume(
+        &self,
+        reading: Option<tessera_control_types::HostVolumeReading>,
+        problem: Option<String>,
+    ) -> bool {
+        self.tx
+            .try_send(Msg::ReportHostVolume(reading, problem))
+            .is_ok()
+    }
+
+    /// Report the sound cards found on the host (non-blocking; dropped if
+    /// the queue is full: the next scan reports them again).
+    pub fn report_sound_cards(&self, cards: Vec<tessera_state::engine::SoundCard>) {
+        let _ = self.tx.try_send(Msg::SoundCards(cards));
     }
 
     /// Report one sweep of subscription states (non-blocking). `false` if the
@@ -1102,7 +1146,14 @@ fn run(
                                         &target,
                                         page,
                                     );
-                                    crate::routing_receiver::check_response(page, max_frame)?;
+                                    // After expectations: added inputs stay read-only.
+                                    if inventory.complete_local_page(&engine, &target, page) {
+                                        // Labels and added rows grew a page that
+                                        // fitted: the rest goes to the next page.
+                                        crate::routing_receiver::fit_response(page, max_frame)?;
+                                    } else {
+                                        crate::routing_receiver::check_response(page, max_frame)?;
+                                    }
                                 }
                                 Ok(result)
                             })
@@ -1394,15 +1445,36 @@ fn run(
                     let _ = reply.send(device_info(&engine, key.as_deref()));
                 }
                 Msg::RuntimePlan { reply } => {
+                    // Bridges and monitors saved by command run like the
+                    // configured ones.
+                    let mut config = engine.runtime_config();
+                    crate::state_compat::apply(&engine, &mut config);
+                    let report = engine.router_report();
                     let _ = reply.send(RuntimePlan {
                         model: engine.model().clone(),
-                        config: engine.runtime_config(),
+                        config,
+                        crosspoints: report
+                            .crosspoints
+                            .into_iter()
+                            .filter(|x| x.active)
+                            .map(|x| (x.crosspoint, x.origin))
+                            .collect(),
+                        port_levels: report
+                            .ports
+                            .into_iter()
+                            .filter(|p| crate::router::is_local_level(&p.port))
+                            .map(|p| (p.port, p.gain, p.muted))
+                            .collect(),
                     });
                 }
                 Msg::ReportClock(status) => engine.report_clock_status(status),
                 Msg::ReportNetwork(status) => engine.report_network_status(status),
                 Msg::ClockInterfaces(v) => engine.set_clock_interfaces(v),
                 Msg::ReportBridges(rows) => engine.report_bridge_status(rows),
+                Msg::ReportHostVolume(reading, problem) => {
+                    engine.report_host_volume(reading, problem);
+                }
+                Msg::SoundCards(cards) => engine.set_sound_cards(cards),
                 Msg::ReportSubscriptions(rows) => engine.report_subscription_sweep(&rows),
                 Msg::ReportNotice {
                     field,

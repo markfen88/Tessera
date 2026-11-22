@@ -8,7 +8,7 @@ applications attach to it through local sockets.
 
 | Component | Identity | Responsibility |
 |---|---|---|
-| `tesserad` | system service, `tessera` user | Logical devices, PTP, static media flows, runtime state, control/audio sockets, optional hardware bridges and, when enabled, the native device role (control ports and flow negotiation of the first logical device, in place of `tessera-controller@main`) |
+| `tesserad` | system service, `tessera` user (`audio` group) | Logical devices, host audio router, PTP, static media flows, runtime state, control/audio sockets, optional ALSA card bridges and host volume (`[host_volume]`), outbound control surfaces (`hidraw`, `rawmidi`, `tcp_midi`), and, when enabled, the native device role (control ports and flow negotiation of the first logical device, in place of `tessera-controller@main`) |
 | `tesseractl` | operator | Typed commands and queries over `control.sock` |
 | `tessera-web` | system service, `tessera-web` user | Authenticated pages/API; daemon control client; standalone network-helper client |
 | `tessera-network` | separate privileged helper | Supported OS networking, firewall isolation, transaction journal and recovery |
@@ -50,12 +50,25 @@ and [control interface](control-interface.md).
 
 ## Threads and audio paths
 
-The normal-priority control runtime handles sockets, discovery and supervision.
+Tessera separates **network channels** (the host's logical network device,
+whose RX and TX channels are all that network controllers see) from **local
+I/O** (sound-card inputs and outputs opened by card bridges, local application
+rings, and host/speaker outputs). The **host router** connects the two layers
+in one saved grid of crosspoints, compiled on the control plane into a flat
+real-time mix plan (`RouteTable`) and swapped into the media worker atomically.
+Every crosspoint and port level uses lock-free atomic gain words, so fader
+moves never rebuild the plan or allocate on the audio thread.
+
+The normal-priority control runtime handles sockets, discovery, outbound
+control surfaces (`hidraw`, ALSA rawmidi, and MIDI over TCP — Tessera connects
+out only and does not open an inbound MIDI listener), host volume (`[host_volume]`
+via the ALSA mixer API) and supervision.
 A separate state thread handles validation/persistence. Media control allocates
 flows, sockets and sessions before handing them to the media worker through
-bounded queues. The worker processes packets, advances flow engines and wakes
-audio clients. PTP has its own runner per configured interface. Optional ALSA
-bridges have a manager and a thread per active card path.
+bounded queues. The worker processes packets, evaluates the router mix plan,
+advances flow engines and wakes audio clients. PTP has its own runner per
+configured interface. Optional ALSA bridges have a manager and a thread per
+active card path.
 
 The worker and clock/bridge threads can request real-time scheduling, CPU affinity
 and locked memory. Setup failures appear in diagnostics. The media path uses

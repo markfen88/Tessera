@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tessera_control_types::{
-    CommandError, Reply, Request, RequestBody, Response, Status, WIRE_VERSION,
+    CommandError, LearnedControl, Query, Reply, Request, RequestBody, Response, Status,
+    SurfacesReport, WIRE_VERSION,
 };
 
 /// Default cap on a response frame (`--max-response-bytes`). It protects the
@@ -89,6 +90,7 @@ impl From<io::Error> for ClientError {
 #[derive(Debug)]
 pub struct Client {
     stream: UnixStream,
+    timeout: Option<Duration>,
     next_id: u64,
     max_response: usize,
     daemon_limit: Option<u64>,
@@ -113,6 +115,7 @@ impl Client {
         stream.set_write_timeout(t)?;
         Ok(Self {
             stream,
+            timeout: t,
             next_id: 1,
             max_response,
             daemon_limit: None,
@@ -226,6 +229,57 @@ impl Client {
             }
             other => Err(ClientError::Protocol(format!(
                 "expected a status, got {other:?}"
+            ))),
+        }
+    }
+
+    /// The devices present on the host and the configured control surfaces
+    /// with their live state (`Query::Surfaces`).
+    ///
+    /// # Errors
+    /// As for [`request`](Self::request), or a protocol error for the wrong
+    /// kind of reply.
+    pub fn surfaces(&mut self) -> Result<SurfacesReport, ClientError> {
+        match self.request(RequestBody::Query(Query::Surfaces))? {
+            Reply::Surfaces(r) => Ok(r),
+            other => Err(ClientError::Protocol(format!(
+                "expected the surfaces, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Watch the detected device `device` (a `DetectedDevice::id`) for up to
+    /// `wait` and return the first control that moves, or `None` if nothing
+    /// moved (`Query::LearnControl`, administrators only). `moving_up`: the
+    /// user was asked to move a fader up (tells an inverted fader). The daemon
+    /// answers only after the wait, so the read timeout of this call is
+    /// stretched to cover it; the connection's own timeout applies again
+    /// afterwards.
+    ///
+    /// # Errors
+    /// As for [`request`](Self::request), or a protocol error for the wrong
+    /// kind of reply.
+    pub fn learn_control(
+        &mut self,
+        device: &str,
+        wait: Duration,
+        moving_up: bool,
+    ) -> Result<Option<LearnedControl>, ClientError> {
+        let timeout_ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+        let stretched = self
+            .timeout
+            .map(|t| t.saturating_add(Duration::from_millis(u64::from(timeout_ms))));
+        self.stream.set_read_timeout(stretched)?;
+        let r = self.request(RequestBody::Query(Query::LearnControl {
+            device: device.to_owned(),
+            timeout_ms,
+            moving_up,
+        }));
+        self.stream.set_read_timeout(self.timeout)?;
+        match r? {
+            Reply::LearnedControl(l) => Ok(l),
+            other => Err(ClientError::Protocol(format!(
+                "expected a learned control, got {other:?}"
             ))),
         }
     }

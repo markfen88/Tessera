@@ -22,7 +22,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::auth::{Stored, same, verify_password};
 use crate::backend::HubMsg;
-use crate::{Shared, call, clear_cookie, peer, session_cookie, session_of};
+use crate::{Shared, call, clear_cookie, local_call_waiting, peer, session_cookie, session_of};
 
 /// The API routes, relative to `/api/v1`.
 pub fn routes() -> Router<Shared> {
@@ -41,6 +41,11 @@ pub fn routes() -> Router<Shared> {
         .route("/routing/channels", get(routing_channels))
         .route("/routing/receiver", get(routing_receiver))
         .route("/routing/operation", get(routing_operation))
+        .route("/surfaces", get(surfaces))
+        .route("/surfaces/profiles", get(surface_profiles))
+        .route("/router", get(router))
+        .route("/mixers", get(mixers))
+        .route("/surfaces/learn", post(learn))
         .route("/commands", post(command))
         .route("/events", get(events))
         .route("/session", post(login).delete(logout))
@@ -95,6 +100,13 @@ fn code_of(e: &CommandError) -> StatusCode {
         // The device access lock refuses the change; a wrong PIN.
         CommandError::AccessLocked { .. } => StatusCode::CONFLICT,
         CommandError::IncorrectPin => StatusCode::FORBIDDEN,
+        // A connected surface's fader sets this gain; nothing changed.
+        CommandError::GainOwned { .. } => StatusCode::CONFLICT,
+        // A connected surface's fader sets this level (router port,
+        // crosspoint, host volume); nothing changed.
+        CommandError::LevelOwned { .. } => StatusCode::CONFLICT,
+        // A mixer panel the daemon refused; nothing saved.
+        CommandError::InvalidMixer { .. } => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -123,6 +135,10 @@ async fn query(st: &Shared, headers: &HeaderMap, q: Query) -> Response {
         Ok(Reply::RoutingReceiver(page)) => Json(page).into_response(),
         Ok(Reply::ReceiverRecovery(review)) => Json(review).into_response(),
         Ok(Reply::RuntimeCarrierRecovery(review)) => Json(review).into_response(),
+        Ok(Reply::Surfaces(report)) => Json(report).into_response(),
+        Ok(Reply::SurfaceProfiles(list)) => Json(list).into_response(),
+        Ok(Reply::Router(report)) => Json(report).into_response(),
+        Ok(Reply::Mixers(panels)) => Json(panels).into_response(),
         Ok(Reply::EffectiveConfig(t)) => (
             [(header::CONTENT_TYPE, "application/toml; charset=utf-8")],
             t,
@@ -408,4 +424,96 @@ async fn logout(State(st): State<Shared>, headers: HeaderMap) -> Response {
         StatusCode::NO_CONTENT,
     )
         .into_response()
+}
+
+/// `GET /surfaces`: detected devices and configured control surfaces with
+/// their live state (`SurfacesReport`).
+async fn surfaces(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    query(&st, &headers, Query::Surfaces).await
+}
+
+/// `GET /surfaces/profiles`: the surface profiles the daemon found
+/// (`Reply::SurfaceProfiles`).
+async fn surface_profiles(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    query(&st, &headers, Query::SurfaceProfiles).await
+}
+
+/// `GET /router`: the host router (`Reply::Router`: ports, crosspoints,
+/// whether a grid is saved).
+async fn router(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    query(&st, &headers, Query::Router).await
+}
+
+/// `GET /mixers`: the saved mixer panels (`Reply::Mixers`).
+async fn mixers(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    query(&st, &headers, Query::Mixers).await
+}
+
+/// The longest a learn request may watch a device (the daemon's limit).
+pub(crate) const LEARN_MAX_MS: u32 = 30_000;
+
+#[derive(Debug, Deserialize)]
+struct LearnBody {
+    device: String,
+    #[serde(default = "learn_default_ms")]
+    timeout_ms: u32,
+    /// A fader is moved up (tells an inverted one); `false` for a button.
+    #[serde(default)]
+    moving_up: bool,
+}
+
+const fn learn_default_ms() -> u32 {
+    10_000
+}
+
+/// `POST /surfaces/learn` with `{"device": <detected id>, "timeout_ms": …,
+/// "moving_up": …}` (at most 30 s; keep hands off the first second)
+/// and the `X-CSRF-Token` header: the control that moved first
+/// (`LearnedControl`), or `null` if nothing moved in time. The daemon
+/// allows it to administrators only.
+async fn learn(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    body: Result<Json<LearnBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some((_, s)) = session_of(&st, &headers) else {
+        return unauthorized();
+    };
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !same(csrf, &s.csrf) {
+        return error(StatusCode::FORBIDDEN, "missing or wrong X-CSRF-Token");
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(e) => return error(e.status(), e.body_text()),
+    };
+    if body.timeout_ms == 0 || body.timeout_ms > LEARN_MAX_MS {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("timeout_ms must be from 1 to {LEARN_MAX_MS}"),
+        );
+    }
+    let wait = Duration::from_millis(u64::from(body.timeout_ms));
+    let r = local_call_waiting(
+        &st,
+        RequestBody::Query(Query::LearnControl {
+            device: body.device,
+            timeout_ms: body.timeout_ms,
+            moving_up: body.moving_up,
+        }),
+        wait,
+    )
+    .await;
+    tracing::info!(session = %s.id, ok = r.is_ok(), "api learn control");
+    match r {
+        Ok(Reply::LearnedControl(l)) => Json(l).into_response(),
+        Ok(other) => error(
+            StatusCode::BAD_GATEWAY,
+            format!("unexpected reply from the daemon: {other:?}"),
+        ),
+        Err(e) => daemon_error(&e),
+    }
 }

@@ -1,0 +1,19 @@
+# Example udev rule: lets tesserad read the HID interfaces of a control
+# surface, read only. Install as /etc/udev/rules.d/70-tessera-surfaces.rules,
+# then `udevadm control --reload && udevadm trigger --subsystem-match=hidraw`
+# (or replug the device). The unit already has `DeviceAllow=char-hidraw r`.
+#
+# Owner `tessera`, mode 0600: only the daemon's own user (tesserad.service
+# runs as User=tessera, created by sysusers.d/tessera.conf) can open the
+# node. Not the `tessera` group: that group also owns the control and audio
+# sockets, so local users given status or audio access are its members, and
+# a raw HID node shows every key and fader movement of the device. The node
+# stays root's otherwise; nobody else gets access (no `uaccess`, no 0666).
+#
+# One line per device, by USB vendor and product id (`lsusb`). The ids are
+# attributes of the USB device, the interface number of the USB interface:
+# udev cannot match both in one rule, so every HID interface of the device
+# becomes readable by the daemon (the surface config picks the one it reads).
+
+# FIFINE AmpliGame SC3 (HID interfaces 3 and 4).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3142", ATTRS{idProduct}=="0c33", OWNER="tessera", MODE="0600"

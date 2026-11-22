@@ -3,10 +3,11 @@
 //!
 //! `state.toml` holds **operator intent that changed at runtime** (names,
 //! labels, subscriptions, rate/encoding/latency, clock role and priority,
-//! controller flows) and the generated per-device identity. It holds nothing
-//! derived. Unknown keys inside a known schema version are ignored on load
-//! (and lost on the next write); a file from a *newer* schema version is never
-//! overwritten, it is moved aside (see [`load_state`]).
+//! channel gain and mute, control surfaces, controller flows) and the
+//! generated per-device identity. It holds nothing derived. Unknown keys
+//! inside a known schema version are ignored on load (and lost on the next
+//! write); a file from a *newer* schema version is never overwritten, it is
+//! moved aside (see [`load_state`]).
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -15,7 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tessera_control_types::{ClockRole, FlowSpec};
+use tessera_control_types::{
+    CardBridgeSpec, ClockRole, Crosspoint, FlowSpec, Gain, MixerSpec, PortLabel, RouterPort,
+    SurfaceSpec,
+};
 use toml::{Table, Value};
 
 use crate::error::StateError;
@@ -80,9 +84,44 @@ pub struct DeviceIntent {
     /// TX labels by channel number written as a string key.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tx_channel_labels: BTreeMap<String, String>,
+    /// Muted RX channels, ascending (`SetChannelMute`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rx_muted: Vec<u16>,
+    /// Muted TX channels, ascending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_muted: Vec<u16>,
+    /// RX channel gains other than unity (`SetChannelGain`), by channel
+    /// number written as a string key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rx_channel_gain: BTreeMap<String, Gain>,
+    /// TX channel gains other than unity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tx_channel_gain: BTreeMap<String, Gain>,
+    /// RX output levels other than unity (`SetOutputGain`: after the local
+    /// mix), by channel number written as a string key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rx_output_gain: BTreeMap<String, Gain>,
+    /// RX channels whose output is muted, ascending (`SetOutputMute`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rx_output_muted: Vec<u16>,
     /// Subscriptions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscription: Vec<SubscriptionIntent>,
+    /// Local monitoring (`SetMonitor`): overrides the configured
+    /// `monitor_rx_from_tx` and `monitor_delay_us`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<MonitorIntent>,
+}
+
+/// `[device.<key>.monitor]`: local monitoring set by `SetMonitor`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MonitorIntent {
+    /// RX channel `n` also plays TX channel `rx_from_tx[n-1]` (0: none).
+    #[serde(default)]
+    pub rx_from_tx: Vec<u16>,
+    /// Microseconds behind playback; 0: auto.
+    #[serde(default)]
+    pub delay_us: u32,
 }
 
 /// Persisted clock values.
@@ -191,6 +230,83 @@ pub struct StateFile {
     /// `[device.<key>]`, keyed by the config `device.id`.
     #[serde(default)]
     pub device: BTreeMap<String, DeviceIntent>,
+    /// `[[surface]]`: hardware control surfaces (`SetSurface`), in the
+    /// order they were added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surface: Vec<SurfaceSpec>,
+    /// `[[card_bridge]]`: sound-card bridges added by command
+    /// (`SetCardBridge`), in the order they were added. A `[[bridge]]` of the
+    /// configuration files with the same name wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub card_bridge: Vec<CardBridgeSpec>,
+    /// `[router]`: the host router's saved grid, local port labels and
+    /// local port levels.
+    #[serde(default, skip_serializing_if = "RouterIntent::is_empty")]
+    pub router: RouterIntent,
+    /// `[host_volume]`: the saved host volume and mute.
+    #[serde(default, skip_serializing_if = "HostVolumeIntent::is_empty")]
+    pub host_volume: HostVolumeIntent,
+    /// `[[mixer]]`: mixer panels (`SetMixer`), in id order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixer: Vec<MixerSpec>,
+}
+
+/// `[router]` of `state.toml`: the host router's saved intent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RouterIntent {
+    /// A grid is saved: `crosspoint` replaces the default grid (identity,
+    /// `[[route]]`, monitoring). `false`: the default grid applies and
+    /// `crosspoint` is empty.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub saved: bool,
+    /// `[[router.crosspoint]]`: the saved grid, each pair once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crosspoint: Vec<Crosspoint>,
+    /// `[[router.label]]`: labels of local ports, each port once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label: Vec<PortLabel>,
+    /// `[[router.level]]`: levels of local ports (`app_out`, `card_in`,
+    /// `card_out`) other than unity and unmuted, each port once. Network
+    /// ports and host outputs keep their levels in `[device.<key>]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub level: Vec<PortLevelIntent>,
+}
+
+impl RouterIntent {
+    fn is_empty(&self) -> bool {
+        !self.saved && self.crosspoint.is_empty() && self.label.is_empty() && self.level.is_empty()
+    }
+}
+
+/// The level of one local router port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortLevelIntent {
+    /// An `app_out`, `card_in` or `card_out` port.
+    pub port: RouterPort,
+    /// Its gain (unity when absent).
+    #[serde(default)]
+    pub gain: Gain,
+    /// Muted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
+}
+
+/// `[host_volume]` of `state.toml`: what `SetHostVolume` / `SetHostMute`
+/// saved. Kept when `[host_volume]` leaves the configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HostVolumeIntent {
+    /// The volume; `None`: never set (the daemon leaves the control alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain: Option<Gain>,
+    /// Muted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
+}
+
+impl HostVolumeIntent {
+    fn is_empty(&self) -> bool {
+        self.gain.is_none() && !self.muted
+    }
 }
 
 impl Default for StateFile {
@@ -207,6 +323,11 @@ impl Default for StateFile {
             clock: ClockIntent::default(),
             network: NetworkIntent::default(),
             device: BTreeMap::new(),
+            surface: Vec::new(),
+            card_bridge: Vec::new(),
+            router: RouterIntent::default(),
+            host_volume: HostVolumeIntent::default(),
+            mixer: Vec::new(),
         }
     }
 }
@@ -422,9 +543,10 @@ pub(crate) fn load_state_with(
 /// Rebuild as much state as possible from a table that does not fit the
 /// schema as a whole. Per device: the whole section if it parses, else just
 /// its `wire_device_id` (if that is a string). Clock, network and controller
-/// flow sections are kept if they parse. A malformed controller section clears
-/// that set explicitly so recovery cannot resurrect the legacy file. Returns
-/// the state and the number of devices kept.
+/// flow sections, and each surface, are kept if they parse. A malformed
+/// controller section clears that set explicitly so recovery cannot
+/// resurrect the legacy file. Returns the state and the number of devices
+/// kept.
 fn salvage(table: &Table) -> (StateFile, usize) {
     let mut out = StateFile::default();
     if let Some(flows) = table.get("protocol_flows") {
@@ -454,6 +576,36 @@ fn salvage(table: &Table) -> (StateFile, usize) {
                 out.device.insert(key.clone(), i);
             }
         }
+    }
+    // Surfaces one by one: a malformed entry does not cost the others.
+    if let Some(Value::Array(surfaces)) = table.get("surface") {
+        out.surface = surfaces
+            .iter()
+            .filter_map(|s| SurfaceSpec::deserialize(s.clone()).ok())
+            .collect();
+    }
+    if let Some(Value::Array(bridges)) = table.get("card_bridge") {
+        out.card_bridge = bridges
+            .iter()
+            .filter_map(|b| CardBridgeSpec::deserialize(b.clone()).ok())
+            .collect();
+    }
+    if let Some(r) = table.get("router") {
+        if let Ok(r) = RouterIntent::deserialize(r.clone()) {
+            out.router = r;
+        }
+    }
+    if let Some(h) = table.get("host_volume") {
+        if let Ok(h) = HostVolumeIntent::deserialize(h.clone()) {
+            out.host_volume = h;
+        }
+    }
+    // Panels one by one, like surfaces.
+    if let Some(Value::Array(mixers)) = table.get("mixer") {
+        out.mixer = mixers
+            .iter()
+            .filter_map(|m| MixerSpec::deserialize(m.clone()).ok())
+            .collect();
     }
     let n = out.device.len();
     (out, n)

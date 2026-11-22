@@ -18,8 +18,11 @@ pub mod auth;
 pub mod backend;
 pub mod config;
 mod live;
+pub mod mixer;
 pub mod network_profiles;
 pub mod pages;
+pub mod ports;
+pub mod profiles;
 pub mod routing_peers;
 pub mod signal;
 pub mod theme;
@@ -75,6 +78,10 @@ pub struct AppState {
     pub network_drafts: Mutex<HashMap<String, tessera_state::network_profiles::Profiles>>,
     /// Wrong network confirmation tokens per client, separate from login limits.
     pub confirm_limiter: network_profiles::ConfirmLimiter,
+    /// Profiles imported on the Surfaces page, per surface name: their fader
+    /// laws apply to faders mapped later. TEMPORARY, until the daemon lists
+    /// installed profiles; lost on restart (the controls stay saved).
+    pub imported_profiles: Mutex<HashMap<String, profiles::Profile>>,
 }
 
 /// A message shown once on the next page.
@@ -117,6 +124,7 @@ impl AppState {
             network: Arc::new(network_profiles::SocketBackend),
             network_drafts: Mutex::new(HashMap::new()),
             confirm_limiter: network_profiles::ConfirmLimiter::default(),
+            imported_profiles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -197,7 +205,90 @@ pub fn router(state: Shared) -> Router {
         post(network_profiles::finish),
     )
     .merge(network_profiles::token_routes())
+    .route("/mixer", get(mixer::show))
+    .route(
+        "/mixer/edit",
+        get(mixer::editor::show).post(mixer::editor::post),
+    )
+    .route("/router", get(pages::router::show))
+    .route(
+        "/router/crosspoint",
+        get(pages::router::crosspoint_editor).post(pages::router::set_crosspoint),
+    )
+    .route("/router/port", get(pages::router::port_editor))
+    .route("/router/label", post(pages::router::label))
+    .route("/router/reset", post(pages::router::reset))
+    .route("/router/patch", post(pages::router::patch))
+    .route("/levels/port/gain", post(pages::levels::port_gain))
+    .route("/levels/port/mute", post(pages::levels::port_mute))
+    .route(
+        "/levels/crosspoint/gain",
+        post(pages::levels::crosspoint_gain),
+    )
+    .route(
+        "/levels/crosspoint/mute",
+        post(pages::levels::crosspoint_mute),
+    )
+    .route("/host/volume", post(pages::levels::host_volume))
+    .route("/host/mute", post(pages::levels::host_mute))
     .route("/devices", get(pages::devices))
+    .route("/audio", get(pages::audio::show))
+    .route("/audio/bridges", post(pages::audio::add_bridge))
+    .route(
+        "/audio/bridges/{name}/enabled",
+        post(pages::audio::bridge_enabled),
+    )
+    .route(
+        "/audio/bridges/{name}/remove",
+        post(pages::audio::remove_bridge),
+    )
+    .route(
+        "/audio/bridges/{name}/local",
+        post(pages::audio::bridge_local),
+    )
+    .route("/audio/monitor/{key}", post(pages::audio::monitor))
+    .route("/audio/label", post(pages::audio::label))
+    .route("/surfaces", get(pages::surfaces::show))
+    .route("/surfaces/add", post(pages::surfaces::add))
+    .route("/surfaces/add-tcp", post(pages::surfaces::add_tcp))
+    .route("/surfaces/{name}/enabled", post(pages::surfaces::enabled))
+    .route("/surfaces/{name}/remove", post(pages::surfaces::remove))
+    .route("/surfaces/{name}/learn", post(pages::surfaces::learn))
+    .route(
+        "/surfaces/{name}/profile",
+        post(pages::surfaces::apply_profile),
+    )
+    .route(
+        "/surfaces/{name}/profile.toml",
+        get(pages::surfaces::export_profile),
+    )
+    .route(
+        "/surfaces/{name}/profile/import",
+        post(pages::surfaces::import_profile).layer(axum::extract::DefaultBodyLimit::max(
+            pages::surfaces::IMPORT_BODY_LIMIT,
+        )),
+    )
+    .route(
+        "/surfaces/{name}/controls",
+        post(pages::surfaces::save_control),
+    )
+    .route(
+        "/surfaces/{name}/controls/remove",
+        post(pages::surfaces::remove_control),
+    )
+    .route(
+        "/surfaces/{name}/bindings",
+        post(pages::surfaces::save_binding),
+    )
+    .route(
+        "/surfaces/{name}/bindings/remove",
+        post(pages::surfaces::remove_binding),
+    )
+    .route("/devices/{key}/mute", post(pages::channel_mute))
+    .route(
+        "/devices/{key}/gain/{direction}/{channel}",
+        post(pages::channel_gain),
+    )
     .route("/routing", get(pages::routing::receivers))
     .route("/routing/review", get(pages::routing::review))
     .route("/routing/recovery", get(pages::routing::inspect))
@@ -210,6 +301,8 @@ pub fn router(state: Shared) -> Router {
         get(pages::routing::peer_operation).post(pages::routing::retire_peer_operation),
     )
     .route("/routing/apply", post(pages::routing::apply))
+    .route("/routing/local-review", get(pages::audio::local_review))
+    .route("/routing/local", post(pages::audio::local_route))
     .route("/devices/{key}/settings", post(pages::device_settings))
     .route("/devices/{key}/channels", post(pages::device_channels))
     .route("/confirm", post(pages::confirm))
@@ -364,6 +457,19 @@ pub(crate) async fn local_call(st: &AppState, body: RequestBody) -> Result<Reply
         .unwrap_or_else(|e| Err(ClientError::Protocol(e.to_string())))
 }
 
+/// Ask only the local daemon a question it answers after `wait` (learning a
+/// control), on the blocking pool.
+pub(crate) async fn local_call_waiting(
+    st: &AppState,
+    body: RequestBody,
+    wait: std::time::Duration,
+) -> Result<Reply, ClientError> {
+    let b = Arc::clone(&st.backend);
+    tokio::task::spawn_blocking(move || b.request_waiting(body, wait))
+        .await
+        .unwrap_or_else(|e| Err(ClientError::Protocol(e.to_string())))
+}
+
 /// What to tell an operator about a failed request.
 #[must_use]
 pub fn explain(e: &ClientError) -> String {
@@ -372,6 +478,28 @@ pub fn explain(e: &ClientError) -> String {
             "The portal may only read: add the user `tessera-web` to the daemon's admin \
              group (`[daemon] admin_group`, default `tessera-admin`) and restart tessera-web."
                 .into()
+        }
+        ClientError::Command(CommandError::GainOwned {
+            device,
+            direction,
+            channel,
+            surface,
+        }) => format!(
+            "The gain of {} {} {channel} is set by the {surface} fader; mute still works.",
+            device.0,
+            match direction {
+                tessera_control_types::Direction::Rx => "RX",
+                tessera_control_types::Direction::Tx => "TX",
+            }
+        ),
+        ClientError::Command(CommandError::LevelOwned { what, surface }) => {
+            format!("The {what} is set by the {surface} fader; mute still works.")
+        }
+        ClientError::Command(CommandError::Unsupported { what }) => {
+            format!("Not supported yet by this tesserad: {what}. Nothing was changed.")
+        }
+        ClientError::Command(CommandError::InvalidMixer { reason }) => {
+            format!("The mixer panel was not saved: {reason}.")
         }
         ClientError::Connect { .. } => format!("The daemon is not reachable: {e}"),
         other => other.to_string(),

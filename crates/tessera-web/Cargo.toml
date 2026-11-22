@@ -25,9 +25,11 @@ bench = false
 
 [dependencies]
 tessera-control-types = { workspace = true }
-tessera-state = { path = "../tessera-state", version = "0.5.2" }
-tessera-network = { path = "../tessera-network", version = "0.5.2" }
-tesseractl = { path = "../tesseractl", version = "0.5.2" }
+tessera-state = { path = "../tessera-state", version = "0.6.0" }
+# The fader curve, to show a fader position as the gain it sets.
+tessera-surface = { path = "../tessera-surface", version = "0.6.0" }
+tessera-network = { path = "../tessera-network", version = "0.6.0" }
+tesseractl = { path = "../tesseractl", version = "0.6.0" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json", "query", "multipart"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "process", "signal", "sync", "time", "macros", "fs"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

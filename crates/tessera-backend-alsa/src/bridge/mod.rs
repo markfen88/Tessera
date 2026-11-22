@@ -40,6 +40,7 @@ mod card;
 mod clock;
 mod drift;
 mod playback;
+mod slice;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -48,9 +49,10 @@ use std::time::Duration;
 use tessera_audio_ipc::{RingConsumer, RingProducer};
 use tessera_media::{PiConfig, PiController, Quality, ResampleError};
 
-pub use alsa_card::{AlsaCard, CardParams};
+pub use alsa_card::{AlsaCard, CardParams, open_card};
 pub use card::{CardError, CardPcm};
 pub use clock::{BridgeClock, BridgeNow, LocalClock, Source};
+pub use slice::{CardSlice, SlicedCard};
 
 use crate::clock::Clock;
 use capture::Capture;

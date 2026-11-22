@@ -528,7 +528,7 @@ pub(crate) fn load_from_sources_for_state(
                         }
                     }
                 }
-                for key in ["bridge", "flow"] {
+                for key in ["bridge", "route", "flow"] {
                     if let (Some(Value::Array(old)), true) = (merged.get(key), t.contains_key(key))
                     {
                         if !old.is_empty() {
@@ -807,6 +807,10 @@ fn suppressed(path: &str, bad: &[String]) -> bool {
                 .iter()
                 .any(|(p, dep)| under(path, p) && under(b, dep))
             || (b.starts_with("device") && (path.starts_with("flow") || path.starts_with("bridge")))
+            // Routes are checked against devices and bridges, and an entry
+            // that did not parse is left out (the indices after it move).
+            || ((b.starts_with("device") || b.starts_with("bridge") || b.starts_with("route"))
+                && path.starts_with("route"))
             || (b.starts_with("defaults.bridge") && path.starts_with("bridge["))
             || (b.starts_with("defaults.flow") && path.starts_with("flow["))
             || b.is_empty()

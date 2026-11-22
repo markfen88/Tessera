@@ -5,9 +5,12 @@ use std::fmt::Write as _;
 use crate::sanitize::cleaned;
 
 use tessera_control_types::{
-    BridgeDirection, BridgeState, BridgeStatus, ClockRole, ClockSettings, ClockState, ClockStatus,
-    DeviceStatus, Direction, Event, Metrics, NetworkStatus, Origin, PrimarySource, Status,
-    SubscriptionState, SubscriptionStatus, Timestamping,
+    BindingAction, BridgeDirection, BridgeState, BridgeStatus, ButtonMode, CardBridgeSpec, Channel,
+    ChannelSet, ClockRole, ClockSettings, ClockState, ClockStatus, ControlKind, ControlValue,
+    CrosspointKey, DetectedKind, DeviceStatus, Direction, Event, Gain, LearnedControl, Metrics,
+    MidiAddress, MidiKind, NetworkStatus, Origin, PrimarySource, RouterPort, Status,
+    SubscriptionState, SubscriptionStatus, SurfaceBinding, SurfaceControl, SurfaceSource,
+    SurfaceStatus, SurfacesReport, Taper, Timestamping,
 };
 
 /// Lay out `rows` (the first is the header) in aligned columns.
@@ -45,6 +48,567 @@ fn dash_if_empty(items: &[String]) -> String {
     } else {
         items.join(",")
     }
+}
+
+/// Characters for the words of gains, ranges and bindings: ASCII for the
+/// terminal, typographic (real minus, en dash, ellipsis) for the portal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    /// `-6.0 dB`, `1-2`, `-60..0 dB`.
+    Ascii,
+    /// `−6.0 dB`, `1–2`, `−60…0 dB`.
+    Typographic,
+}
+
+impl Style {
+    fn minus(self) -> &'static str {
+        match self {
+            Self::Ascii => "-",
+            Self::Typographic => "\u{2212}",
+        }
+    }
+
+    fn dash(self) -> &'static str {
+        match self {
+            Self::Ascii => "-",
+            Self::Typographic => "\u{2013}",
+        }
+    }
+
+    fn ellipsis(self) -> &'static str {
+        match self {
+            Self::Ascii => "..",
+            Self::Typographic => "\u{2026}",
+        }
+    }
+}
+
+/// Milli-dB as a dB number with up to one decimal: `-6`, `-6.5`, `+3`
+/// (`0` unsigned).
+#[must_use]
+pub fn db_number(mdb: i32, style: Style) -> String {
+    let abs = mdb.unsigned_abs();
+    // Tenths, rounded half away from zero.
+    let tenths = (abs + 50) / 100;
+    let body = if tenths.is_multiple_of(10) {
+        format!("{}", tenths / 10)
+    } else {
+        format!("{}.{}", tenths / 10, tenths % 10)
+    };
+    if tenths == 0 {
+        "0".into()
+    } else if mdb < 0 {
+        format!("{}{body}", style.minus())
+    } else {
+        format!("+{body}")
+    }
+}
+
+/// A gain in words: `off`, `0 dB`, `-6.5 dB`.
+#[must_use]
+pub fn gain_words(g: Gain, style: Style) -> String {
+    match g {
+        Gain::Off => "off".into(),
+        Gain::MilliDb(m) => format!("{} dB", db_number(m, style)),
+        _ => "?".into(),
+    }
+}
+
+/// Channels as runs: `1-4,7` (ASCII) or `1–4, 7`.
+#[must_use]
+pub fn channel_runs(channels: &[Channel], style: Style) -> String {
+    let mut runs: Vec<(u16, u16)> = Vec::new();
+    for c in channels {
+        let n = c.get();
+        match runs.last_mut() {
+            Some((_, end)) if end.checked_add(1) == Some(n) => *end = n,
+            _ => runs.push((n, n)),
+        }
+    }
+    let sep = match style {
+        Style::Ascii => ",",
+        Style::Typographic => ", ",
+    };
+    runs.iter()
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}{}{b}", style.dash())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// A channel set in words: `main TX 1-2`.
+#[must_use]
+pub fn channel_set_words(t: &ChannelSet, style: Style) -> String {
+    format!(
+        "{} {} {}",
+        t.device.0,
+        match t.direction {
+            Direction::Rx => "RX",
+            Direction::Tx => "TX",
+        },
+        channel_runs(&t.channels, style)
+    )
+}
+
+/// What a binding does, in words: `Mute: main TX 1-2, toggle` or
+/// `Gain: main RX 1-2, -60..0 dB, owns gain`. `control` is the bound
+/// control (to tell a motorized fader and an encoder), `owning` whether
+/// the surface is connected and enabled, so that its non-motorized faders
+/// set the gain of their channels right now.
+#[must_use]
+pub fn binding_words(
+    b: &SurfaceBinding,
+    control: Option<&SurfaceControl>,
+    owning: bool,
+    style: Style,
+) -> String {
+    let target = channel_set_words(&b.target, style);
+    match b.action {
+        BindingAction::Mute | BindingAction::OutputMute => {
+            let mode = match b.mode {
+                ButtonMode::Toggle => "toggle",
+                ButtonMode::Momentary => "hold to mute",
+                ButtonMode::PushToTalk => "push to talk",
+                _ => "?",
+            };
+            let what = if b.action == BindingAction::OutputMute {
+                "Output mute"
+            } else {
+                "Mute"
+            };
+            format!("{what}: {target}, {mode}")
+        }
+        BindingAction::Gain | BindingAction::OutputGain => {
+            let output = b.action == BindingAction::OutputGain;
+            let what = if output { "Output" } else { "Gain" };
+            let kind = control.map(|c| c.kind);
+            if kind == Some(ControlKind::Encoder) {
+                return format!(
+                    "{what}: {target}, {} dB per step",
+                    db_number(b.step_mdb, style)
+                );
+            }
+            let range = match (b.curve.first(), b.curve.last()) {
+                (Some(lo), Some(hi)) => format!(
+                    "{}{}{} dB (the desk's fader law)",
+                    db_number(lo.mdb, style),
+                    style.ellipsis(),
+                    db_number(hi.mdb, style)
+                ),
+                _ => format!(
+                    "{}{}{} dB",
+                    db_number(b.min_mdb, style),
+                    style.ellipsis(),
+                    db_number(b.max_mdb, style)
+                ),
+            };
+            let taper = match b.taper {
+                _ if !b.curve.is_empty() => "",
+                Taper::Db => "",
+                Taper::Linear => ", linear taper",
+                _ => ", custom taper",
+            };
+            if output {
+                // The output level is never owned.
+                return format!("{what}: {target}, {range}{taper}");
+            }
+            let owner = if control.is_some_and(|c| c.motorized) {
+                "motorized"
+            } else if owning {
+                "owns gain"
+            } else {
+                "owns gain while connected"
+            };
+            format!("{what}: {target}, {range}{taper}, {owner}")
+        }
+        BindingAction::HostVolume => "Host volume".into(),
+        BindingAction::HostMute => "Host mute".into(),
+        BindingAction::PortGain | BindingAction::PortMute => {
+            let ports: Vec<String> = b.ports.iter().map(crate::cli::port_words).collect();
+            let what = if b.action == BindingAction::PortGain {
+                "Port level"
+            } else {
+                "Port mute"
+            };
+            format!("{what}: {}", ports.join(", "))
+        }
+        BindingAction::CrosspointGain | BindingAction::CrosspointMute => {
+            let xs: Vec<String> = b
+                .crosspoints
+                .iter()
+                .map(|x| {
+                    format!(
+                        "{} -> {}",
+                        crate::cli::port_words(&x.source),
+                        crate::cli::port_words(&x.destination)
+                    )
+                })
+                .collect();
+            let what = if b.action == BindingAction::CrosspointGain {
+                "Crosspoint gain"
+            } else {
+                "Crosspoint mute"
+            };
+            format!("{what}: {}", xs.join(", "))
+        }
+        BindingAction::Follow => b.follow.as_ref().map_or_else(
+            || "Follow: -".into(),
+            |f| format!("Follows {}/{}", f.surface, f.control),
+        ),
+        _ => target,
+    }
+}
+
+fn hex4(v: Option<u16>) -> String {
+    v.map_or_else(|| "-".into(), |v| format!("{v:04x}"))
+}
+
+/// Where a MIDI control lives, in words: `CC 7, ch 1`, `Note 60, ch 1`, or
+/// for NRPN its MSB/LSB in hex as desk manuals write them and the parameter
+/// number: `NRPN 40/00 (8192), ch 1`.
+#[must_use]
+pub fn midi_words(m: &MidiAddress) -> String {
+    match m.kind {
+        MidiKind::ControlChange => format!("CC {}, ch {}", m.number, m.channel),
+        MidiKind::Nrpn => format!(
+            "NRPN {:02X}/{:02X} ({}), ch {}",
+            m.number >> 7,
+            m.number & 0x7f,
+            m.number,
+            m.channel
+        ),
+        MidiKind::Note => format!("Note {}, ch {}", m.number, m.channel),
+        _ => format!("MIDI {}, ch {}", m.number, m.channel),
+    }
+}
+
+/// A surface's source in words: `USB 3142:0c33, interface 3` or
+/// `MIDI card CQ, port 0`.
+#[must_use]
+pub fn source_words(s: &SurfaceSource) -> String {
+    match s {
+        SurfaceSource::Hidraw {
+            vendor_id,
+            product_id,
+            interface,
+        } => format!(
+            "USB {vendor_id:04x}:{product_id:04x}{}",
+            interface.map_or_else(String::new, |i| format!(", interface {i}"))
+        ),
+        SurfaceSource::Midi { card, device } => format!("MIDI card {card}, port {device}"),
+        SurfaceSource::TcpMidi { host, port } => format!("MIDI over TCP to {host}:{port}"),
+        _ => "an unknown source".into(),
+    }
+}
+
+/// Sample rates as `44.1/48 kHz`.
+#[must_use]
+pub fn rates_words(rates: &[u32]) -> String {
+    if rates.is_empty() {
+        return "-".into();
+    }
+    let list: Vec<String> = rates
+        .iter()
+        .map(|r| {
+            if r % 1000 == 0 {
+                (r / 1000).to_string()
+            } else {
+                format!("{:.1}", f64::from(*r) / 1000.0)
+            }
+        })
+        .collect();
+    format!("{} kHz", list.join("/"))
+}
+
+/// What a detected device offers beyond its kind: a sound card's channels,
+/// rates and PCM; a MIDI port's card.
+fn detected_details(d: &tessera_control_types::DetectedDevice) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if d.kind == DetectedKind::SoundCard {
+        if let Some(i) = d.capture_channels {
+            parts.push(format!("in {i}"));
+        }
+        if let Some(o) = d.playback_channels {
+            parts.push(format!("out {o}"));
+        }
+        if !d.rates.is_empty() {
+            parts.push(rates_words(&d.rates));
+        }
+        if let Some(p) = &d.pcm {
+            parts.push(p.clone());
+        }
+    } else if let Some(SurfaceSource::Midi { card, device }) = &d.source {
+        parts.push(format!("card {card} port {device}"));
+    }
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// A card bridge's channel mapping in words: `hw:CARD=SC3,DEV=0 in 1-2 ->
+/// main TX 1-2` or `main RX 3-4 -> hw:... out 1-2`.
+#[must_use]
+pub fn bridge_mapping_words(
+    card: &str,
+    device: &str,
+    direction: BridgeDirection,
+    first: u16,
+    channels: u16,
+    style: Style,
+) -> String {
+    bridge_slice_words(card, device, direction, first, channels, 1, style)
+}
+
+/// As [`bridge_mapping_words`], for a bridge that carries card channels
+/// from `card_first` on: `hw:CARD=CQ,DEV=0 in 15-16 -> main TX 1-2`.
+#[must_use]
+pub fn bridge_slice_words(
+    card: &str,
+    device: &str,
+    direction: BridgeDirection,
+    first: u16,
+    channels: u16,
+    card_first: u16,
+    style: Style,
+) -> String {
+    let span = |a: u32, n: u32| {
+        if n <= 1 {
+            a.to_string()
+        } else {
+            format!("{a}{}{}", style.dash(), a + n - 1)
+        }
+    };
+    let n = u32::from(channels);
+    let dev = span(u32::from(first), n);
+    let crd = span(u32::from(card_first.max(1)), n);
+    let arrow = match style {
+        Style::Ascii => "->",
+        Style::Typographic => "\u{2192}",
+    };
+    match direction {
+        BridgeDirection::Capture => format!("{card} in {crd} {arrow} {device} TX {dev}"),
+        _ => format!("{device} RX {dev} {arrow} {card} out {crd}"),
+    }
+}
+
+/// A saved card bridge in words (for confirmations). A `local_only` bridge
+/// feeds no device channel: `hw:CARD=CQ,DEV=0 in 15-16 -> host router only`.
+#[must_use]
+pub fn card_bridge_words(b: &CardBridgeSpec, style: Style) -> String {
+    if b.local_only {
+        let first = u32::from(b.card_first_channel.max(1));
+        let n = u32::from(b.channels);
+        let span = if n <= 1 {
+            first.to_string()
+        } else {
+            format!("{first}{}{}", style.dash(), first + n - 1)
+        };
+        let arrow = match style {
+            Style::Ascii => "->",
+            Style::Typographic => "\u{2192}",
+        };
+        return match b.direction {
+            BridgeDirection::Capture => format!("{} in {span} {arrow} host router only", b.card),
+            _ => format!("host router only {arrow} {} out {span}", b.card),
+        };
+    }
+    bridge_slice_words(
+        &b.card,
+        &b.device.0,
+        b.direction,
+        b.first_channel,
+        b.channels,
+        b.card_first_channel,
+        style,
+    )
+}
+
+/// What kind of detected device, in words.
+#[must_use]
+pub fn detected_kind(k: DetectedKind) -> &'static str {
+    match k {
+        DetectedKind::Hid => "HID",
+        DetectedKind::SoundCard => "sound card",
+        DetectedKind::Midi => "MIDI",
+        _ => "other",
+    }
+}
+
+/// A control's live value: `128/255`, `pressed`, `released`, `-` (not
+/// reported yet).
+#[must_use]
+pub fn control_value(v: Option<&ControlValue>) -> String {
+    match v {
+        None => "-".into(),
+        Some(ControlValue::Button { pressed: true }) => "pressed".into(),
+        Some(ControlValue::Button { pressed: false }) => "released".into(),
+        Some(ControlValue::Fader { value, max }) => format!("{value}/{max}"),
+        Some(_) => "?".into(),
+    }
+}
+
+/// The connection state of a surface in words.
+#[must_use]
+pub fn surface_state(s: &SurfaceStatus) -> String {
+    if !s.spec.enabled {
+        "disabled".into()
+    } else if s.connected {
+        match &s.device {
+            Some(d) => format!("connected ({d})"),
+            None => "connected".into(),
+        }
+    } else {
+        match &s.problem {
+            Some(p) => format!("not connected: {p}"),
+            None => "not found".into(),
+        }
+    }
+}
+
+/// `surfaces`: the detected devices, then each surface with its controls
+/// and bindings.
+#[must_use]
+pub fn render_surfaces(r: &SurfacesReport) -> String {
+    let r = &cleaned(r);
+    let mut out = String::new();
+    if r.detected.is_empty() {
+        out.push_str("No devices detected.\n");
+    } else {
+        out.push_str("Detected devices:\n");
+        let mut rows = vec![vec![
+            "ID".into(),
+            "KIND".into(),
+            "NAME".into(),
+            "USB".into(),
+            "IFACE".into(),
+            "NODE".into(),
+            "DETAILS".into(),
+            "USED BY".into(),
+        ]];
+        for d in &r.detected {
+            rows.push(vec![
+                d.id.clone(),
+                detected_kind(d.kind).into(),
+                d.name.clone(),
+                if d.vendor_id.is_some() || d.product_id.is_some() {
+                    format!("{}:{}", hex4(d.vendor_id), hex4(d.product_id))
+                } else {
+                    "-".into()
+                },
+                d.interface.map_or_else(|| "-".into(), |i| i.to_string()),
+                d.node.clone(),
+                detected_details(d),
+                d.used_by.clone().unwrap_or_else(|| "-".into()),
+            ]);
+        }
+        for l in table(&rows).lines() {
+            let _ = writeln!(out, "  {l}");
+        }
+    }
+    if r.surfaces.is_empty() {
+        out.push_str("No control surfaces configured.\n");
+    }
+    for s in &r.surfaces {
+        let owning = s.spec.enabled && s.connected;
+        let _ = writeln!(out, "Surface {}: {}", s.spec.name, surface_state(s));
+        let _ = writeln!(out, "  source: {}", source_words(&s.spec.source));
+        if s.spec.controls.is_empty() {
+            out.push_str("  no controls yet\n");
+        }
+        for c in &s.spec.controls {
+            let value = s.controls.iter().find(|v| v.id == c.id);
+            let kind = match c.kind {
+                ControlKind::Button => "button",
+                ControlKind::Fader => "fader",
+                ControlKind::Encoder => "encoder",
+                _ => "control",
+            };
+            let label = c
+                .label
+                .as_ref()
+                .map_or_else(String::new, |l| format!(" \"{l}\""));
+            let midi = c
+                .midi
+                .as_ref()
+                .map_or_else(String::new, |m| format!("  [{}]", midi_words(m)));
+            let motor = if c.motorized { " (motorized)" } else { "" };
+            let _ = writeln!(
+                out,
+                "  {}{label}  {kind}{motor}{midi}  {}",
+                c.id,
+                control_value(value.and_then(|v| v.value.as_ref()))
+            );
+            for b in s.spec.bindings.iter().filter(|b| b.control == c.id) {
+                let _ = writeln!(
+                    out,
+                    "    {}",
+                    binding_words(b, Some(c), owning, Style::Ascii)
+                );
+            }
+        }
+        for b in s
+            .spec
+            .bindings
+            .iter()
+            .filter(|b| !s.spec.controls.iter().any(|c| c.id == b.control))
+        {
+            let _ = writeln!(
+                out,
+                "  (unknown control {}) {}",
+                b.control,
+                binding_words(b, None, owning, Style::Ascii)
+            );
+        }
+    }
+    out
+}
+
+/// `surface learn`: the suggested layout of the control that moved.
+#[must_use]
+pub fn render_learned(l: &LearnedControl) -> String {
+    let kind = match l.kind {
+        ControlKind::Button => "button",
+        ControlKind::Fader => "fader",
+        ControlKind::Encoder => "encoder",
+        _ => "control",
+    };
+    let mut out = format!("A {kind} moved.\n");
+    let mut rows = vec![vec!["kind".to_owned(), kind.to_owned()]];
+    if let Some(m) = &l.midi {
+        rows.push(vec!["midi".into(), midi_words(m)]);
+        if let Some(max) = l.max {
+            rows.push(vec!["max".into(), max.to_string()]);
+        }
+        for line in table(&rows).lines() {
+            let _ = writeln!(out, "  {line}");
+        }
+        return out;
+    }
+    rows.push(vec![
+        "report_id".into(),
+        l.report_id
+            .map_or_else(|| "none (unnumbered)".into(), |r| r.to_string()),
+    ]);
+    rows.push(vec!["offset".into(), format!("{} (bits)", l.offset)]);
+    rows.push(vec!["bits".into(), l.bits.to_string()]);
+    if let Some(m) = l.max {
+        rows.push(vec!["max".into(), m.to_string()]);
+    }
+    match l.kind {
+        ControlKind::Button => rows.push(vec!["active_low".into(), l.active_low.to_string()]),
+        _ => rows.push(vec!["inverted".into(), l.inverted.to_string()]),
+    }
+    for line in table(&rows).lines() {
+        let _ = writeln!(out, "  {line}");
+    }
+    out
 }
 
 /// Words for a subscription state.
@@ -275,16 +839,26 @@ pub fn render_bridges(bridges: &[BridgeStatus]) -> String {
         };
         let channels = if b.channels == 0 {
             "-".to_owned()
+        } else if b.local_only {
+            // Router ports only: no device channel.
+            "router".to_owned()
         } else {
             let last = u32::from(b.first_channel) + u32::from(b.channels) - 1;
             format!("{}..{last}", b.first_channel)
+        };
+        // The card's own channels when they do not start at 1.
+        let card = if b.card_first_channel > 1 && b.channels > 0 {
+            let last = u32::from(b.card_first_channel) + u32::from(b.channels) - 1;
+            format!("{} ch {}..{last}", b.card, b.card_first_channel)
+        } else {
+            b.card.clone()
         };
         rows.push(vec![
             b.name.clone(),
             b.device.0.clone(),
             dir.to_owned(),
             channels,
-            b.card.clone(),
+            card,
             format!("{state}{}", if b.rt_degraded { " (no rt)" } else { "" }),
             b.fill_frames.to_string(),
             b.position_error_frames.to_string(),
@@ -570,7 +1144,7 @@ pub fn render_device(d: &DeviceStatus) -> String {
     ] {
         let _ = writeln!(out, "  {title}:");
         for c in list {
-            let _ = writeln!(out, "    {:>3}  {}", c.channel, c.label);
+            let _ = writeln!(out, "    {:>3}  {}{}", c.channel, c.label, channel_level(c));
         }
     }
     let subs = subscription_rows(std::slice::from_ref(d));
@@ -581,6 +1155,39 @@ pub fn render_device(d: &DeviceStatus) -> String {
         }
     }
     out
+}
+
+/// A channel's gain and mute after its label, when not the defaults:
+/// `  [muted, -6 dB, gain set by the sc3 fader]` (and the same for the RX
+/// output level); empty at unity, unmuted.
+fn channel_level(c: &tessera_control_types::ChannelStatus) -> String {
+    let mut parts = Vec::new();
+    if c.muted {
+        parts.push("muted".to_owned());
+    }
+    if c.gain != Gain::default() || c.gain_owner.is_some() {
+        parts.push(gain_words(c.gain, Style::Ascii));
+    }
+    if let Some(s) = &c.gain_owner {
+        parts.push(format!("gain set by the {s} fader"));
+    }
+    if c.output_muted {
+        parts.push("output muted".to_owned());
+    }
+    if c.output_gain != Gain::default() || c.output_gain_owner.is_some() {
+        parts.push(format!(
+            "output {}",
+            gain_words(c.output_gain, Style::Ascii)
+        ));
+    }
+    if let Some(s) = &c.output_gain_owner {
+        parts.push(format!("output level set by the {s} fader"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", parts.join(", "))
+    }
 }
 
 /// Why the device's sample rate or encoding cannot change now, one line
@@ -616,6 +1223,7 @@ fn origin(o: &Origin) -> String {
         Origin::Config => "configuration".into(),
         Origin::Api { principal } => format!("api {principal}"),
         Origin::Internal => "daemon".into(),
+        Origin::Surface { name } => format!("surface {name}"),
         other => format!("{other:?}"),
     }
 }
@@ -778,8 +1386,276 @@ pub fn render_event(e: &Event) -> String {
             if *locked { "set" } else { "removed" },
             origin(o)
         ),
+        Event::ChannelMuteChanged {
+            target,
+            muted,
+            origin: o,
+        } => format!(
+            "{}: {} ({})",
+            channel_set_words(target, Style::Ascii),
+            if *muted { "muted" } else { "unmuted" },
+            origin(o)
+        ),
+        Event::ChannelGainChanged {
+            target,
+            gain,
+            origin: o,
+        } => format!(
+            "{}: gain {} ({})",
+            channel_set_words(target, Style::Ascii),
+            gain_words(*gain, Style::Ascii),
+            origin(o)
+        ),
+        Event::SurfacesChanged { origin: o } => format!("control surfaces changed ({})", origin(o)),
+        Event::OutputGainChanged {
+            target,
+            gain,
+            origin: o,
+        } => format!(
+            "{}: output level {} ({})",
+            channel_set_words(target, Style::Ascii),
+            gain_words(*gain, Style::Ascii),
+            origin(o)
+        ),
+        Event::OutputMuteChanged {
+            target,
+            muted,
+            origin: o,
+        } => format!(
+            "{}: output {} ({})",
+            channel_set_words(target, Style::Ascii),
+            if *muted { "muted" } else { "unmuted" },
+            origin(o)
+        ),
+        Event::RouterChanged { origin: o } => format!("host router changed ({})", origin(o)),
+        Event::CrosspointGainChanged {
+            crosspoints,
+            gain,
+            origin: o,
+        } => format!(
+            "{}: gain {} ({})",
+            crosspoint_words(crosspoints),
+            gain_words(*gain, Style::Ascii),
+            origin(o)
+        ),
+        Event::CrosspointMuteChanged {
+            crosspoints,
+            muted,
+            origin: o,
+        } => format!(
+            "{}: {} ({})",
+            crosspoint_words(crosspoints),
+            if *muted { "muted" } else { "unmuted" },
+            origin(o)
+        ),
+        Event::PortGainChanged {
+            ports,
+            gain,
+            origin: o,
+        } => format!(
+            "{}: level {} ({})",
+            port_list_words(ports),
+            gain_words(*gain, Style::Ascii),
+            origin(o)
+        ),
+        Event::PortMuteChanged {
+            ports,
+            muted,
+            origin: o,
+        } => format!(
+            "{}: {} ({})",
+            port_list_words(ports),
+            if *muted { "muted" } else { "unmuted" },
+            origin(o)
+        ),
+        Event::HostVolumeChanged {
+            gain,
+            muted,
+            origin: o,
+        } => format!(
+            "host volume: {}{} ({})",
+            gain.map_or_else(
+                || "not saved (left alone)".into(),
+                |g| gain_words(g, Style::Ascii)
+            ),
+            if *muted { ", muted" } else { ", unmuted" },
+            origin(o)
+        ),
+        Event::MixerChanged { id, origin: o } => {
+            format!("mixer panel {id} changed ({})", origin(o))
+        }
         other => format!("{other:?}"),
     }
+}
+
+/// Router ports in a `watch` line: `router port in:CQ:15` or `router ports
+/// in:CQ:15, in:CQ:16`.
+fn port_list_words(ports: &[RouterPort]) -> String {
+    let names: Vec<String> = ports.iter().map(crate::cli::port_words).collect();
+    format!(
+        "router port{} {}",
+        if names.len() == 1 { "" } else { "s" },
+        names.join(", ")
+    )
+}
+
+/// Crosspoints in a `watch` line: `crosspoint in:CQ:15 -> host:main:1`, or
+/// `crosspoints ...` with several separated by commas.
+fn crosspoint_words(crosspoints: &[CrosspointKey]) -> String {
+    let names: Vec<String> = crosspoints
+        .iter()
+        .map(|x| {
+            format!(
+                "{} -> {}",
+                crate::cli::port_words(&x.source),
+                crate::cli::port_words(&x.destination)
+            )
+        })
+        .collect();
+    format!(
+        "crosspoint{} {}",
+        if names.len() == 1 { "" } else { "s" },
+        names.join(", ")
+    )
+}
+
+/// The `router show` output: the ports with their levels, then the grid.
+#[must_use]
+pub fn render_router(r: &tessera_control_types::RouterReport) -> String {
+    use tessera_control_types::CrosspointOrigin as O;
+    let r = &cleaned(r);
+    let style = Style::Ascii;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Grid: {}{}",
+        if r.saved { "saved" } else { "default" },
+        if r.read_only {
+            " (read only: this tesserad cannot change it)"
+        } else {
+            ""
+        }
+    );
+    let mut rows = vec![vec![
+        "PORT".to_owned(),
+        "LABEL".into(),
+        "LEVEL".into(),
+        "MUTE".into(),
+        "NOTE".into(),
+    ]];
+    for p in &r.ports {
+        let mut note = Vec::new();
+        if !p.available {
+            note.push("not available".to_owned());
+        }
+        if let Some(o) = &p.gain_owner {
+            note.push(format!("set by surface {o}"));
+        }
+        rows.push(vec![
+            crate::cli::port_words(&p.port),
+            p.label.clone(),
+            gain_words(p.gain, style),
+            if p.muted { "muted" } else { "" }.into(),
+            note.join(", "),
+        ]);
+    }
+    out.push_str(&table(&rows));
+    if r.crosspoints.is_empty() {
+        out.push_str("No crosspoints.\n");
+        return out;
+    }
+    let mut rows = vec![vec![
+        "SOURCE".to_owned(),
+        "DESTINATION".into(),
+        "GAIN".into(),
+        "MUTE".into(),
+        "ORIGIN".into(),
+        "NOTE".into(),
+    ]];
+    for x in &r.crosspoints {
+        let origin = match &x.origin {
+            O::Saved => "saved".to_owned(),
+            O::Default => "default".into(),
+            O::Configured => "configured".into(),
+            O::Monitor => "monitor".into(),
+            O::Bridge { name } => format!("bridge {name}"),
+            _ => "?".into(),
+        };
+        let mut note = Vec::new();
+        if let Some(p) = &x.problem {
+            note.push(format!("inactive: {p}"));
+        }
+        if let Some(o) = &x.gain_owner {
+            note.push(format!("gain set by surface {o}"));
+        }
+        rows.push(vec![
+            crate::cli::port_words(&x.crosspoint.source),
+            crate::cli::port_words(&x.crosspoint.destination),
+            gain_words(x.crosspoint.gain, style),
+            if x.crosspoint.muted { "muted" } else { "" }.into(),
+            origin,
+            note.join(", "),
+        ]);
+    }
+    out.push_str(&table(&rows));
+    out
+}
+
+/// The `volume show` output.
+#[must_use]
+pub fn render_host_volume(v: &tessera_control_types::HostVolumeStatus) -> String {
+    let v = &cleaned(v);
+    let style = Style::Ascii;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Host volume: card {}, control {}, range {}{}{} dB",
+        v.card,
+        v.control,
+        db_number(v.min_mdb, style),
+        style.ellipsis(),
+        db_number(v.max_mdb, style)
+    );
+    let _ = writeln!(
+        out,
+        "Saved: {}{}",
+        v.gain
+            .map_or_else(|| "never set (left alone)".into(), |g| gain_words(g, style)),
+        if v.muted { ", muted" } else { "" }
+    );
+    match &v.reading {
+        Some(r) => {
+            let _ = writeln!(
+                out,
+                "Reads: {}{}",
+                gain_words(r.gain, style),
+                if r.muted { ", muted" } else { "" }
+            );
+        }
+        None => out.push_str("Reads: -\n"),
+    }
+    if let Some(o) = &v.gain_owner {
+        let _ = writeln!(out, "Set by the {o} fader");
+    }
+    if let Some(p) = &v.problem {
+        let _ = writeln!(out, "Problem: {p}");
+    }
+    out
+}
+
+/// The `mixer list` output.
+#[must_use]
+pub fn render_mixers(m: &[tessera_control_types::MixerSpec]) -> String {
+    let m = &cleaned(&m.to_vec());
+    let mut rows = vec![vec!["ID".to_owned(), "TITLE".into(), "STRIPS".into()]];
+    for p in m {
+        rows.push(vec![
+            p.id.clone(),
+            p.title.clone(),
+            p.strips.len().to_string(),
+        ]);
+    }
+    table(&rows)
 }
 
 #[cfg(test)]
@@ -1042,5 +1918,359 @@ mod tests {
         // A daemon that does not report the options: nothing extra.
         s.devices[0].formats = None;
         assert!(!render_device(&s.devices[0]).contains("can be set to"));
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+    use tessera_control_types::{
+        Channel, ChannelStatus, ControlState, DetectedDevice, DeviceKey, SurfaceSource, SurfaceSpec,
+    };
+
+    fn set(dir: Direction, ch: &[u16]) -> ChannelSet {
+        ChannelSet {
+            device: DeviceKey("main".into()),
+            direction: dir,
+            channels: ch.iter().map(|n| Channel::new(*n).unwrap()).collect(),
+        }
+    }
+
+    fn control(id: &str, kind: ControlKind, motorized: bool) -> SurfaceControl {
+        SurfaceControl {
+            id: id.into(),
+            label: None,
+            kind,
+            report_id: Some(1),
+            offset: Some(0),
+            bits: None,
+            max: None,
+            inverted: false,
+            active_low: false,
+            motorized,
+            code: None,
+            midi: None,
+        }
+    }
+
+    #[test]
+    fn midi_addresses_and_bridges_read_naturally() {
+        let m = MidiAddress::new(MidiKind::Nrpn, 1, (0x40 << 7) | 3);
+        assert_eq!(midi_words(&m), "NRPN 40/03 (8195), ch 1");
+        let cc = MidiAddress::new(MidiKind::ControlChange, 2, 7);
+        assert_eq!(midi_words(&cc), "CC 7, ch 2");
+        assert_eq!(rates_words(&[44_100, 48_000]), "44.1/48 kHz");
+        assert_eq!(
+            bridge_mapping_words("SC3", "main", BridgeDirection::Capture, 3, 2, Style::Ascii),
+            "SC3 in 1-2 -> main TX 3-4"
+        );
+        assert_eq!(
+            bridge_mapping_words("SC3", "main", BridgeDirection::Playback, 1, 1, Style::Ascii),
+            "main RX 1 -> SC3 out 1"
+        );
+        assert_eq!(
+            bridge_slice_words(
+                "CQ",
+                "main",
+                BridgeDirection::Capture,
+                1,
+                2,
+                15,
+                Style::Ascii
+            ),
+            "CQ in 15-16 -> main TX 1-2"
+        );
+        let mut c = control("ip1", ControlKind::Fader, true);
+        c.midi = Some(m);
+        let mut b = SurfaceBinding::new(
+            "ip1",
+            BindingAction::Gain,
+            ChannelSet {
+                device: tessera_control_types::DeviceKey("main".into()),
+                direction: Direction::Tx,
+                channels: vec![Channel::new(1).unwrap()],
+            },
+        );
+        b.curve = vec![tessera_control_types::CurvePoint {
+            raw: 12_544,
+            mdb: 0,
+        }];
+        assert_eq!(
+            binding_words(&b, Some(&c), true, Style::Ascii),
+            "Gain: main TX 1, 0..0 dB (the desk's fader law), motorized"
+        );
+        let mut out = SurfaceBinding::new(
+            "main",
+            BindingAction::OutputGain,
+            ChannelSet {
+                device: tessera_control_types::DeviceKey("speaker".into()),
+                direction: Direction::Rx,
+                channels: vec![Channel::new(1).unwrap(), Channel::new(2).unwrap()],
+            },
+        );
+        out.max_mdb = 10_000;
+        assert_eq!(
+            binding_words(&out, Some(&c), true, Style::Typographic),
+            "Output: speaker RX 1\u{2013}2, \u{2212}60\u{2026}+10 dB"
+        );
+    }
+
+    #[test]
+    fn gains_and_channel_runs_read_naturally() {
+        assert_eq!(db_number(-6000, Style::Ascii), "-6");
+        assert_eq!(db_number(-6500, Style::Typographic), "\u{2212}6.5");
+        assert_eq!(db_number(3000, Style::Ascii), "+3");
+        assert_eq!(db_number(0, Style::Ascii), "0");
+        assert_eq!(db_number(-20, Style::Ascii), "0");
+        assert_eq!(db_number(-250, Style::Ascii), "-0.3");
+        assert_eq!(gain_words(Gain::Off, Style::Ascii), "off");
+        assert_eq!(gain_words(Gain::MilliDb(-60_000), Style::Ascii), "-60 dB");
+        let s = set(Direction::Rx, &[1, 2, 3, 5, 7, 8]);
+        assert_eq!(channel_runs(&s.channels, Style::Ascii), "1-3,5,7-8");
+        assert_eq!(
+            channel_runs(&s.channels, Style::Typographic),
+            "1\u{2013}3, 5, 7\u{2013}8"
+        );
+        assert_eq!(channel_set_words(&s, Style::Ascii), "main RX 1-3,5,7-8");
+    }
+
+    #[test]
+    fn bindings_are_described_in_words() {
+        let mut mute = SurfaceBinding::new("m", BindingAction::Mute, set(Direction::Tx, &[1, 2]));
+        assert_eq!(
+            binding_words(&mute, None, true, Style::Typographic),
+            "Mute: main TX 1\u{2013}2, toggle"
+        );
+        mute.mode = ButtonMode::Momentary;
+        assert_eq!(
+            binding_words(&mute, None, true, Style::Ascii),
+            "Mute: main TX 1-2, hold to mute"
+        );
+        mute.mode = ButtonMode::PushToTalk;
+        assert!(binding_words(&mute, None, true, Style::Ascii).ends_with("push to talk"));
+        let gain = SurfaceBinding::new("f", BindingAction::Gain, set(Direction::Rx, &[1, 2]));
+        let fader = control("f", ControlKind::Fader, false);
+        assert_eq!(
+            binding_words(&gain, Some(&fader), true, Style::Typographic),
+            "Gain: main RX 1\u{2013}2, \u{2212}60\u{2026}0 dB, owns gain"
+        );
+        assert_eq!(
+            binding_words(&gain, Some(&fader), false, Style::Ascii),
+            "Gain: main RX 1-2, -60..0 dB, owns gain while connected"
+        );
+        let motor = control("f", ControlKind::Fader, true);
+        assert!(binding_words(&gain, Some(&motor), true, Style::Ascii).ends_with(", motorized"));
+        let enc = control("f", ControlKind::Encoder, false);
+        assert_eq!(
+            binding_words(&gain, Some(&enc), true, Style::Ascii),
+            "Gain: main RX 1-2, +1 dB per step"
+        );
+    }
+
+    fn report() -> SurfacesReport {
+        let source = SurfaceSource::Hidraw {
+            vendor_id: 0x3142,
+            product_id: 0x0c33,
+            interface: Some(3),
+        };
+        let spec = SurfaceSpec::new(
+            "sc3",
+            source.clone(),
+            vec![
+                control("mic-fader", ControlKind::Fader, false),
+                control("mic-mute", ControlKind::Button, false),
+            ],
+            vec![SurfaceBinding::new(
+                "mic-fader",
+                BindingAction::Gain,
+                set(Direction::Tx, &[1, 2]),
+            )],
+        );
+        let mut device = DetectedDevice::new(
+            "hid:3142:0c33:3",
+            DetectedKind::Hid,
+            "fifine SC3",
+            "/dev/hidraw3",
+        );
+        device.vendor_id = Some(0x3142);
+        device.product_id = Some(0x0c33);
+        device.interface = Some(3);
+        device.used_by = Some("sc3".into());
+        device.source = Some(source);
+        let mut status = SurfaceStatus::new(spec);
+        status.connected = true;
+        status.device = Some("hid:3142:0c33:3".into());
+        status.controls = vec![
+            ControlState::new(
+                "mic-fader",
+                Some(ControlValue::Fader {
+                    value: 128,
+                    max: 255,
+                }),
+            ),
+            ControlState::new("mic-mute", Some(ControlValue::Button { pressed: true })),
+        ];
+        let mut report = SurfacesReport::default();
+        report.detected = vec![device];
+        report.surfaces = vec![status];
+        report
+    }
+
+    #[test]
+    fn the_surfaces_report_lists_devices_controls_and_bindings() {
+        let text = render_surfaces(&report());
+        assert!(text.contains("hid:3142:0c33:3"), "{text}");
+        assert!(text.contains("3142:0c33"), "{text}");
+        assert!(text.contains("/dev/hidraw3"), "{text}");
+        assert!(
+            text.contains("Surface sc3: connected (hid:3142:0c33:3)"),
+            "{text}"
+        );
+        assert!(text.contains("mic-fader  fader  128/255"), "{text}");
+        assert!(text.contains("mic-mute  button  pressed"), "{text}");
+        assert!(
+            text.contains("Gain: main TX 1-2, -60..0 dB, owns gain"),
+            "{text}"
+        );
+        let mut r = report();
+        r.surfaces[0].connected = false;
+        r.surfaces[0].problem = Some("permission denied".into());
+        let text = render_surfaces(&r);
+        assert!(text.contains("not connected: permission denied"), "{text}");
+        assert!(text.contains("owns gain while connected"), "{text}");
+        let text = render_surfaces(&SurfacesReport::default());
+        assert!(text.contains("No devices detected."));
+        assert!(text.contains("No control surfaces configured."));
+    }
+
+    #[test]
+    fn channel_lines_show_gain_mute_and_the_owner_only_when_set() {
+        let c = ChannelStatus::new(Channel::new(1).unwrap(), "Mic");
+        assert_eq!(channel_level(&c), "");
+        let mut c = c;
+        c.muted = true;
+        c.gain = Gain::MilliDb(-6000);
+        c.gain_owner = Some("sc3".into());
+        assert_eq!(
+            channel_level(&c),
+            "  [muted, -6 dB, gain set by the sc3 fader]"
+        );
+        // An RX output level owned by a fader shows its owner too, even at unity.
+        let mut c = ChannelStatus::new(Channel::new(1).unwrap(), "Speaker L");
+        c.output_gain_owner = Some("cq".into());
+        assert_eq!(
+            channel_level(&c),
+            "  [output 0 dB, output level set by the cq fader]"
+        );
+    }
+
+    #[test]
+    fn router_mixer_and_host_volume_events_read_as_sentences() {
+        let cq = |n: u16| RouterPort::CardIn {
+            card: "hw:CARD=CQ,DEV=0".into(),
+            channel: Channel::new(n).unwrap(),
+        };
+        let main = |n: u16| RouterPort::HostOut {
+            device: DeviceKey("main".into()),
+            channel: Channel::new(n).unwrap(),
+        };
+        let surface = Origin::Surface { name: "cq".into() };
+        let cli = Origin::Cli { uid: 1000 };
+        let one = vec![CrosspointKey::new(cq(15), main(1))];
+        let two = vec![one[0].clone(), CrosspointKey::new(cq(16), main(2))];
+        for (event, line) in [
+            (
+                Event::RouterChanged {
+                    origin: cli.clone(),
+                },
+                "host router changed (cli uid 1000)",
+            ),
+            (
+                Event::CrosspointGainChanged {
+                    crosspoints: one,
+                    gain: Gain::MilliDb(-6000),
+                    origin: surface.clone(),
+                },
+                "crosspoint in:hw:CARD=CQ,DEV=0:15 -> host:main:1: gain -6 dB (surface cq)",
+            ),
+            (
+                Event::CrosspointMuteChanged {
+                    crosspoints: two,
+                    muted: true,
+                    origin: cli.clone(),
+                },
+                "crosspoints in:hw:CARD=CQ,DEV=0:15 -> host:main:1, in:hw:CARD=CQ,DEV=0:16 -> host:main:2: muted (cli uid 1000)",
+            ),
+            (
+                Event::PortGainChanged {
+                    ports: vec![cq(15), cq(16)],
+                    gain: Gain::MilliDb(-3000),
+                    origin: surface.clone(),
+                },
+                "router ports in:hw:CARD=CQ,DEV=0:15, in:hw:CARD=CQ,DEV=0:16: level -3 dB (surface cq)",
+            ),
+            (
+                Event::PortMuteChanged {
+                    ports: vec![cq(15)],
+                    muted: false,
+                    origin: cli.clone(),
+                },
+                "router port in:hw:CARD=CQ,DEV=0:15: unmuted (cli uid 1000)",
+            ),
+            (
+                Event::HostVolumeChanged {
+                    gain: Some(Gain::MilliDb(-20000)),
+                    muted: true,
+                    origin: surface,
+                },
+                "host volume: -20 dB, muted (surface cq)",
+            ),
+            (
+                Event::HostVolumeChanged {
+                    gain: None,
+                    muted: false,
+                    origin: Origin::Config,
+                },
+                "host volume: not saved (left alone), unmuted (configuration)",
+            ),
+            (
+                Event::MixerChanged {
+                    id: "speakers".into(),
+                    origin: cli,
+                },
+                "mixer panel speakers changed (cli uid 1000)",
+            ),
+        ] {
+            assert_eq!(render_event(&event), line);
+        }
+    }
+
+    #[test]
+    fn a_local_bridge_reads_as_router_ports() {
+        let mut b = CardBridgeSpec::new(
+            "dac",
+            DeviceKey("main".into()),
+            "hw:CARD=DAC,DEV=0",
+            BridgeDirection::Playback,
+            1,
+            1,
+        );
+        b.local_only = true;
+        b.card_first_channel = 3;
+        assert_eq!(
+            card_bridge_words(&b, Style::Ascii),
+            "host router only -> hw:CARD=DAC,DEV=0 out 3"
+        );
+        let mut status = BridgeStatus::new(
+            "dac",
+            DeviceKey("main".into()),
+            "hw:CARD=DAC,DEV=0",
+            BridgeDirection::Playback,
+            BridgeState::Running,
+        );
+        status.channels = 1;
+        status.local_only = true;
+        let text = render_bridges(&[status]);
+        assert!(text.lines().nth(1).unwrap().contains(" router "), "{text}");
     }
 }

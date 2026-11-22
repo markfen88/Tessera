@@ -11,6 +11,7 @@
 //! | media worker (real time) | [`media::worker`] | the tick loop: `recvmmsg` / `sendmmsg`, flow engines, client rings, wake bytes |
 //! | bridge control (feature `alsa-bridge`, only with `[[bridge]]`) | [`bridge`] | opens cards, retries, applies plans, reports bridge status |
 //! | bridge (real time, one per running `[[bridge]]`) | `bridge::rt_loop` | card I/O, resampler, PI loop |
+//! | control surfaces (tokio task, plus one reading thread per open device) | [`surfaces`] | find, read and map hardware control surfaces into mute and gain commands |
 //!
 //! Static `[[flow]]` entries are **PROVISIONAL** test scaffolding until ARC/CMC
 //! flow control exists (see `docs/configuration.md`).
@@ -27,6 +28,7 @@ pub mod daemon;
 pub mod disco;
 pub mod engine_thread;
 pub mod frame;
+pub mod host_volume;
 pub mod logging;
 pub mod media;
 pub mod metrics;
@@ -39,6 +41,7 @@ pub mod peerlog;
 pub mod platform;
 pub mod ptp;
 pub mod ratelimit;
+pub mod router;
 mod routing_inventory;
 mod routing_operation;
 mod routing_receiver;
@@ -48,8 +51,10 @@ pub mod runtime;
 mod runtime_host;
 pub mod sanitize;
 pub mod sockets;
+pub mod state_compat;
 pub mod subscriptions;
 pub mod supervisor;
+pub mod surfaces;
 pub mod tunables;
 
 pub use daemon::run;
