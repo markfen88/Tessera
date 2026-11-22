@@ -673,6 +673,9 @@ mod tests {
             s[..3].copy_from_slice(&[i, i + 1, i + 2]);
             tx.queue(usize::from(i), 3, dest, &ctr);
         }
+        // Before the send: the kernel stamps arrival, which can precede any
+        // clock read after the flush by more than a scheduling slice.
+        let before = realtime_ns();
         let f = tx.flush(5);
         assert_eq!(
             f,
@@ -682,7 +685,6 @@ mod tests {
                 errno: None
             }
         );
-        let before = realtime_ns();
         assert_eq!(wait_for(&mut rx, 5), 5);
         let after = realtime_ns();
         for i in 0..5usize {

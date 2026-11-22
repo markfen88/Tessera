@@ -1,0 +1,587 @@
+# Allen & Heath CQ series (CQ-12T, CQ-18T, CQ-20B) driven over USB MIDI.
+#
+# A tessera surface profile: the controls a device has and how it sends
+# them, so that a surface for it needs no learning. Copy this file to
+# /etc/tessera/surfaces.d/ (or share it) as a starting point for another
+# device.
+#
+# Source: Allen & Heath "CQ MIDI Protocol" V1.2 (issue 5) and a community
+# control module for the CQ. Confidence: likely (not yet checked against a
+# capture of this desk).
+#
+# Everything is NRPN on MIDI channel 1: CC 99 = parameter MSB, CC 98 = LSB,
+# CC 6 = value MSB (VC), CC 38 = value LSB (VF), value = VC << 7 | VF.
+# Levels are 0..16320 on the desk's fader law ("fader" below); mutes are
+# 1 (on) / 0 (off). The desk sends every change unsolicited and accepts the
+# same messages, so its faders follow what tessera sends back: they are
+# `motorized` here (a surface that shows the value tessera sets owns no
+# gain). NRPN number = MSB * 128 + LSB.
+
+name = "allen-heath-cq"
+vendor = "Allen & Heath"
+model = "CQ series"
+description = "Input levels to Main LR, Main LR and Out 1-6 levels, and their mutes, over USB MIDI."
+
+[match]
+midi_card = "CQ"
+
+# Desk raw level -> milli-dB. Raw 0 is off.
+[curves]
+fader = [
+    { raw = 192, mdb = -89000 },
+    { raw = 320, mdb = -80000 },
+    { raw = 768, mdb = -60000 },
+    { raw = 1024, mdb = -50000 },
+    { raw = 1984, mdb = -40000 },
+    { raw = 3968, mdb = -30000 },
+    { raw = 5952, mdb = -20000 },
+    { raw = 7936, mdb = -10000 },
+    { raw = 10048, mdb = -5000 },
+    { raw = 12544, mdb = 0 },
+    { raw = 14784, mdb = 5000 },
+    { raw = 16320, mdb = 10000 },
+]
+
+[[control]]
+id = "ip1"
+label = "Ch 1"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2000 }  # 40/00
+
+[[control]]
+id = "ip1-mute"
+label = "Ch 1 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0000 }  # 00/00
+
+[[control]]
+id = "ip2"
+label = "Ch 2"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2001 }  # 40/01
+
+[[control]]
+id = "ip2-mute"
+label = "Ch 2 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0001 }  # 00/01
+
+[[control]]
+id = "ip3"
+label = "Ch 3"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2002 }  # 40/02
+
+[[control]]
+id = "ip3-mute"
+label = "Ch 3 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0002 }  # 00/02
+
+[[control]]
+id = "ip4"
+label = "Ch 4"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2003 }  # 40/03
+
+[[control]]
+id = "ip4-mute"
+label = "Ch 4 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0003 }  # 00/03
+
+[[control]]
+id = "ip5"
+label = "Ch 5"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2004 }  # 40/04
+
+[[control]]
+id = "ip5-mute"
+label = "Ch 5 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0004 }  # 00/04
+
+[[control]]
+id = "ip6"
+label = "Ch 6"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2005 }  # 40/05
+
+[[control]]
+id = "ip6-mute"
+label = "Ch 6 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0005 }  # 00/05
+
+[[control]]
+id = "ip7"
+label = "Ch 7"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2006 }  # 40/06
+
+[[control]]
+id = "ip7-mute"
+label = "Ch 7 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0006 }  # 00/06
+
+[[control]]
+id = "ip8"
+label = "Ch 8"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2007 }  # 40/07
+
+[[control]]
+id = "ip8-mute"
+label = "Ch 8 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0007 }  # 00/07
+
+[[control]]
+id = "ip9"
+label = "Ch 9"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2008 }  # 40/08
+
+[[control]]
+id = "ip9-mute"
+label = "Ch 9 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0008 }  # 00/08
+
+[[control]]
+id = "ip10"
+label = "Ch 10"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2009 }  # 40/09
+
+[[control]]
+id = "ip10-mute"
+label = "Ch 10 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0009 }  # 00/09
+
+[[control]]
+id = "ip11"
+label = "Ch 11"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x200A }  # 40/0A
+
+[[control]]
+id = "ip11-mute"
+label = "Ch 11 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x000A }  # 00/0A
+
+[[control]]
+id = "ip12"
+label = "Ch 12"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x200B }  # 40/0B
+
+[[control]]
+id = "ip12-mute"
+label = "Ch 12 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x000B }  # 00/0B
+
+[[control]]
+id = "ip13"
+label = "Ch 13"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x200C }  # 40/0C
+
+[[control]]
+id = "ip13-mute"
+label = "Ch 13 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x000C }  # 00/0C
+
+[[control]]
+id = "ip14"
+label = "Ch 14"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x200D }  # 40/0D
+
+[[control]]
+id = "ip14-mute"
+label = "Ch 14 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x000D }  # 00/0D
+
+[[control]]
+id = "ip15"
+label = "Ch 15"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x200E }  # 40/0E
+
+[[control]]
+id = "ip15-mute"
+label = "Ch 15 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x000E }  # 00/0E
+
+[[control]]
+id = "ip16"
+label = "Ch 16"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x200F }  # 40/0F
+
+[[control]]
+id = "ip16-mute"
+label = "Ch 16 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x000F }  # 00/0F
+
+[[control]]
+id = "main-lr"
+label = "Main LR"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2780 }  # 4F/00
+
+[[control]]
+id = "main-lr-mute"
+label = "Main LR mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0044 }  # 00/44
+
+[[control]]
+id = "out1"
+label = "Out 1"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2781 }  # 4F/01
+
+[[control]]
+id = "out1-mute"
+label = "Out 1 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0045 }  # 00/45
+
+[[control]]
+id = "out2"
+label = "Out 2"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2782 }  # 4F/02
+
+[[control]]
+id = "out2-mute"
+label = "Out 2 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0046 }  # 00/46
+
+[[control]]
+id = "out3"
+label = "Out 3"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2783 }  # 4F/03
+
+[[control]]
+id = "out3-mute"
+label = "Out 3 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0047 }  # 00/47
+
+[[control]]
+id = "out4"
+label = "Out 4"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2784 }  # 4F/04
+
+[[control]]
+id = "out4-mute"
+label = "Out 4 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0048 }  # 00/48
+
+[[control]]
+id = "out5"
+label = "Out 5"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2785 }  # 4F/05
+
+[[control]]
+id = "out5-mute"
+label = "Out 5 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x0049 }  # 00/49
+
+[[control]]
+id = "out6"
+label = "Out 6"
+kind = "fader"
+max = 16320
+motorized = true
+midi = { kind = "nrpn", channel = 1, number = 0x2786 }  # 4F/06
+
+[[control]]
+id = "out6-mute"
+label = "Out 6 mute"
+kind = "button"
+midi = { kind = "nrpn", channel = 1, number = 0x004A }  # 00/4A
+
+# Suggested bindings: levels drive gain on the desk's fader law, mutes
+# follow the desk's mute state. The portal asks for the device and the
+# channels; the `direction` and `channels` given below are examples only.
+#
+# - Main L/R level and mute drive the host volume and mute (the speaker
+#   volume: the sound card control of `[host_volume]`), on the desk's fader
+#   law: `host_volume` / `host_mute`. Without `[host_volume]`, map them to
+#   the output stage of RX 1-2 instead (`output_gain` / `output_mute`).
+# - Ip4 and Ip5 drive the input gain of incoming network sources (RX 1-2
+#   and RX 3-4, before the mix). The other inputs suggest no channels.
+
+[[binding]]
+control = "ip1"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip1-mute"
+action = "mute"
+
+[[binding]]
+control = "ip2"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip2-mute"
+action = "mute"
+
+[[binding]]
+control = "ip3"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip3-mute"
+action = "mute"
+
+[[binding]]
+control = "ip4"
+action = "gain"
+curve = "fader"
+direction = "rx"
+channels = [1, 2]
+
+[[binding]]
+control = "ip4-mute"
+action = "mute"
+
+[[binding]]
+control = "ip5"
+action = "gain"
+curve = "fader"
+direction = "rx"
+channels = [3, 4]
+
+[[binding]]
+control = "ip5-mute"
+action = "mute"
+
+[[binding]]
+control = "ip6"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip6-mute"
+action = "mute"
+
+[[binding]]
+control = "ip7"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip7-mute"
+action = "mute"
+
+[[binding]]
+control = "ip8"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip8-mute"
+action = "mute"
+
+[[binding]]
+control = "ip9"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip9-mute"
+action = "mute"
+
+[[binding]]
+control = "ip10"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip10-mute"
+action = "mute"
+
+[[binding]]
+control = "ip11"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip11-mute"
+action = "mute"
+
+[[binding]]
+control = "ip12"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip12-mute"
+action = "mute"
+
+[[binding]]
+control = "ip13"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip13-mute"
+action = "mute"
+
+[[binding]]
+control = "ip14"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip14-mute"
+action = "mute"
+
+[[binding]]
+control = "ip15"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip15-mute"
+action = "mute"
+
+[[binding]]
+control = "ip16"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "ip16-mute"
+action = "mute"
+
+[[binding]]
+control = "main-lr"
+action = "host_volume"
+curve = "fader"
+
+[[binding]]
+control = "main-lr-mute"
+action = "host_mute"
+
+[[binding]]
+control = "out1"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "out1-mute"
+action = "mute"
+
+[[binding]]
+control = "out2"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "out2-mute"
+action = "mute"
+
+[[binding]]
+control = "out3"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "out3-mute"
+action = "mute"
+
+[[binding]]
+control = "out4"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "out4-mute"
+action = "mute"
+
+[[binding]]
+control = "out5"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "out5-mute"
+action = "mute"
+
+[[binding]]
+control = "out6"
+action = "gain"
+curve = "fader"
+
+[[binding]]
+control = "out6-mute"
+action = "mute"

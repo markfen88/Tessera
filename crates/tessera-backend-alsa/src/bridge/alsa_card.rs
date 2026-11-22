@@ -18,8 +18,13 @@ pub struct CardParams {
     pub name: String,
     /// Sample rate; the card must run exactly at it.
     pub rate: u32,
-    /// Channels.
+    /// Channels the bridge carries.
     pub channels: u32,
+    /// First card channel carried (1-based, default 1). The card is opened
+    /// with at least `card_first_channel + channels - 1` channels, or more
+    /// if that is all it offers ([`AlsaCard::channels`] says how many);
+    /// [`open_card`] presents only the slice to the bridge.
+    pub card_first_channel: u32,
     /// Frames per period (the nearest the card offers is used).
     pub period_frames: usize,
     /// Periods in the buffer (at least 3 for playback: prefill plus one
@@ -37,6 +42,7 @@ impl CardParams {
             name: name.to_string(),
             rate,
             channels,
+            card_first_channel: 1,
             period_frames: (rate as usize / 100).max(32),
             periods: 4,
             formats: vec![
@@ -100,23 +106,32 @@ impl AlsaCard {
     /// [`BridgeError::Open`] naming the step that failed, including a card
     /// that cannot run at exactly `p.rate`.
     pub fn open(p: &CardParams, playback: bool) -> Result<AlsaCard, BridgeError> {
-        if p.rate == 0 || p.channels == 0 || p.period_frames == 0 || p.periods < 2 {
+        if p.rate == 0
+            || p.channels == 0
+            || p.card_first_channel == 0
+            || p.period_frames == 0
+            || p.periods < 2
+        {
             return Err(BridgeError::Config(
-                "rate, channels, period and periods must be positive".into(),
+                "rate, channels, the first card channel, period and periods must be positive"
+                    .into(),
             ));
         }
+        let needed = p
+            .card_first_channel
+            .checked_add(p.channels - 1)
+            .ok_or_else(|| BridgeError::Config("card channel beyond u32".into()))?;
         let dir = if playback {
             Direction::Playback
         } else {
             Direction::Capture
         };
         let pcm = PCM::new(&p.name, dir, true).map_err(|e| open_err("open", e))?;
-        let (fmt, rate, period, buffer) = {
+        let (fmt, rate, period, buffer, channels) = {
             let hwp = HwParams::any(&pcm).map_err(|e| open_err("hw_params_any", e))?;
             hwp.set_access(Access::RWInterleaved)
                 .map_err(|e| open_err("access", e))?;
-            hwp.set_channels(p.channels)
-                .map_err(|e| open_err("channels", e))?;
+            let channels = card_channels(&hwp, needed, &p.name)?;
             hwp.set_rate(p.rate, ValueOr::Nearest)
                 .map_err(|e| open_err("rate", e))?;
             let rate = hwp.get_rate().map_err(|e| open_err("rate", e))?;
@@ -151,6 +166,7 @@ impl AlsaCard {
                     .map_err(|e| open_err("period size", e))? as usize,
                 hwp.get_buffer_size()
                     .map_err(|e| open_err("buffer size", e))? as usize,
+                channels,
             )
         };
         {
@@ -181,11 +197,11 @@ impl AlsaCard {
             fds,
             nfds,
             fmt,
-            channels: p.channels as usize,
+            channels: channels as usize,
             rate,
             period,
             buffer,
-            frame_bytes: p.channels as usize * fmt.bytes(),
+            frame_bytes: channels as usize * fmt.bytes(),
             playback,
         })
     }
@@ -199,6 +215,47 @@ impl AlsaCard {
             _ => CardError::Other(libc::EIO),
         }
     }
+}
+
+/// Restricts `hwp` to a channel count of at least `needed`: exactly
+/// `needed` where the card offers it, otherwise the nearest count it offers
+/// above (a card that opens only with all its channels). Returns the count.
+fn card_channels(hwp: &HwParams<'_>, needed: u32, name: &str) -> Result<u32, BridgeError> {
+    if hwp.set_channels(needed).is_ok() {
+        return Ok(needed);
+    }
+    let max = hwp
+        .get_channels_max()
+        .map_err(|e| open_err("channels", e))?;
+    if max < needed {
+        return Err(BridgeError::Open(format!(
+            "{name} has at most {max} channel(s) in this direction; the bridge needs card channels up to {needed}"
+        )));
+    }
+    let near = hwp
+        .set_channels_near(needed)
+        .map_err(|e| open_err("channels", e))?;
+    if near >= needed {
+        return Ok(near);
+    }
+    hwp.set_channels(max).map_err(|e| open_err("channels", e))?;
+    Ok(max)
+}
+
+/// Opens a card ([`AlsaCard::open`]) and presents to the bridge only the
+/// `p.channels` card channels from `p.card_first_channel` on
+/// ([`SlicedCard`](super::SlicedCard)); the card itself when that is all
+/// of it. Control thread.
+///
+/// # Errors
+/// As [`AlsaCard::open`].
+pub fn open_card(p: &CardParams, playback: bool) -> Result<Box<dyn CardPcm>, BridgeError> {
+    let card = AlsaCard::open(p, playback)?;
+    super::SlicedCard::wrap(
+        Box::new(card),
+        p.card_first_channel as usize,
+        p.channels as usize,
+    )
 }
 
 fn map(e: alsa::Error) -> CardError {

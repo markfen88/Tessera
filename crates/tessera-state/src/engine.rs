@@ -20,10 +20,10 @@ use std::time::Duration;
 
 use tessera_control_types::{
     BridgeDirection as WireBridgeDirection, BridgeState, BridgeStatus, Channel, ChannelStatus,
-    ClockRole, ClockSettings, ClockStatus, Command, CommandError, DeviceKey, DeviceStatus,
-    Direction, Encoding, Event, Impact, ImpactToken, LatencyUs, Limits, NetworkStatus, Origin,
-    PREFERRED_LEADER_BELOW, Query, Reply, SampleRate, Status, SubscriptionState,
-    SubscriptionStatus,
+    ClockRole, ClockSettings, ClockStatus, Command, CommandError, CrosspointKey, DeviceKey,
+    DeviceStatus, Direction, Encoding, Event, Gain, Impact, ImpactToken, LatencyUs, Limits,
+    NetworkStatus, Origin, PREFERRED_LEADER_BELOW, Query, Reply, SampleRate, Status,
+    SubscriptionState, SubscriptionStatus,
 };
 
 use crate::bus::{EventBus, Subscription};
@@ -48,7 +48,15 @@ use crate::persist::{
 use crate::validate::validate_for_start;
 
 mod access_guard;
+mod card_bridges;
+pub use card_bridges::SoundCard;
+mod host_volume;
+mod mixers;
+mod router;
 mod runtime_reports;
+mod surfaces;
+
+pub use card_bridges::bridge_config;
 pub use runtime_reports::{RuntimeCarrierReview, RuntimeRead, RuntimeRun};
 
 /// File locations for the engine.
@@ -266,12 +274,34 @@ pub struct StateEngine {
     /// (engine clock), e.g. a controller's identify request.
     notices: Vec<(Issue, Duration)>,
     runtime_subs: BTreeMap<(String, u16), RuntimeSub>,
+    /// Packet activity of every RX channel a flow carries, from the latest
+    /// media sweep, whether or not a subscription names it (a configuration
+    /// flow has none). Replaced whole by each sweep; never persisted.
+    flow_media: BTreeMap<(String, u16), SubscriptionState>,
     clocks: Vec<ClockStatus>,
     /// Interfaces with a PTP port now (`None`: not reported; show all).
     clock_interfaces: Option<Vec<String>>,
     host_network: Option<NetworkStatus>,
     /// The latest runtime observation of each bridge, by name.
     bridge_reports: BTreeMap<String, BridgeStatus>,
+    /// The sound cards the daemon last found on the host, for checking a
+    /// bridge's card channels (never saved).
+    sound_cards: Vec<card_bridges::SoundCard>,
+    /// Surfaces the surface runtime reports as connected (never saved).
+    surfaces_connected: BTreeSet<String>,
+    /// Connection epoch of each surface changed since start (never saved;
+    /// absent: 0). See `renew_surface_epochs`.
+    surface_epochs: BTreeMap<String, u64>,
+    /// The last connection epoch handed out.
+    next_surface_epoch: u64,
+    /// The gain of each owned crosspoint a command unpatched while its
+    /// owner was connected (never saved): patching it again from another
+    /// origin must keep that gain. See `guard_owned_crosspoints`.
+    unpatched_owned_gains: BTreeMap<CrosspointKey, Gain>,
+    /// What the daemon last read from the host volume control (never saved).
+    host_volume_reading: Option<tessera_control_types::HostVolumeReading>,
+    /// Why the daemon cannot read or set the host volume (never saved).
+    host_volume_problem: Option<String>,
     bus: EventBus,
     debounce: Debouncer,
     limiter: Option<RateLimiter>,
@@ -389,10 +419,18 @@ impl StateEngine {
             persist_error: None,
             notices: Vec::new(),
             runtime_subs: BTreeMap::new(),
+            flow_media: BTreeMap::new(),
             clocks: Vec::new(),
             clock_interfaces: None,
             host_network: None,
             bridge_reports: BTreeMap::new(),
+            sound_cards: Vec::new(),
+            surfaces_connected: BTreeSet::new(),
+            surface_epochs: BTreeMap::new(),
+            next_surface_epoch: 0,
+            unpatched_owned_gains: BTreeMap::new(),
+            host_volume_reading: None,
+            host_volume_problem: None,
             bus: EventBus::new(),
             runtime_reports: runtime_reports::RuntimeReports::default(),
             access,
@@ -665,6 +703,24 @@ impl StateEngine {
                 .map(Reply::EffectiveConfig)
                 .map_err(|message| CommandError::Internal { message }),
             Query::Bridges => Ok(Reply::Bridges(self.bridges())),
+            // The saved surfaces and whether each is connected; the daemon adds
+            // the detected devices and live control values.
+            Query::Surfaces => {
+                let mut report = tessera_control_types::SurfacesReport::default();
+                report.surfaces = self
+                    .surfaces()
+                    .iter()
+                    .map(|spec| {
+                        let mut s = tessera_control_types::SurfaceStatus::new(spec.clone());
+                        s.connected = self.surface_connected(&spec.name);
+                        s.connection_epoch = self.surface_connection_epoch(&spec.name);
+                        s
+                    })
+                    .collect();
+                Ok(Reply::Surfaces(report))
+            }
+            Query::Router => Ok(Reply::Router(self.router_report())),
+            Query::Mixers => Ok(Reply::Mixers(self.mixers().to_vec())),
             Query::Metrics => Err(CommandError::Unsupported {
                 what: "metrics are not provided by the state engine".into(),
             }),
@@ -700,6 +756,10 @@ impl StateEngine {
             .with_warnings(warnings)
             .with_bridges(self.bridges())
             .with_limits(Limits::new(self.config.config.control.max_frame_bytes));
+        let s = match self.host_volume_status() {
+            Some(h) => s.with_host_volume(h),
+            None => s,
+        };
         match self.network_status() {
             Some(n) => s.with_network(n),
             None => s,
@@ -838,10 +898,17 @@ impl StateEngine {
                 .subscriptions
                 .get(&channel.channel.get())
                 .map(|intent| ReceiverIntent::new(&intent.tx_device, &intent.tx_channel));
-            route.media = self
-                .runtime_subs
-                .get(&(d.key.0.clone(), channel.channel.get()))
-                .map(|(state, _)| state.clone());
+            let key = (d.key.0.clone(), channel.channel.get());
+            // A subscription's own state first; otherwise the activity of the
+            // flow that carries the input (a configuration flow has no
+            // subscription, yet its media is observed all the same).
+            route.media = match self.runtime_subs.get(&key) {
+                Some((state, _)) => Some(state.clone()),
+                None if !matches!(route.carrier, ReceiverCarrier::None) => {
+                    self.flow_media.get(&key).cloned()
+                }
+                None => None,
+            };
             if route.intent.is_some()
                 || !matches!(route.carrier, ReceiverCarrier::None)
                 || route.media.is_some()
@@ -849,6 +916,8 @@ impl StateEngine {
                 channel.routing = Some(route);
             }
         }
+        self.fill_channel_controls(&mut status);
+        self.fill_monitor(&mut status);
         status
     }
 
@@ -922,6 +991,10 @@ impl StateEngine {
         &mut self,
         observed: &[(DeviceKey, Channel, SubscriptionState)],
     ) {
+        self.flow_media = observed
+            .iter()
+            .map(|(d, c, s)| ((d.0.clone(), c.get()), s.clone()))
+            .collect();
         let seen: BTreeSet<(&str, u16)> = observed
             .iter()
             .map(|(d, c, _)| (d.0.as_str(), c.get()))
@@ -944,6 +1017,14 @@ impl StateEngine {
             let latency = self.observed_latency(&d.0, c.get());
             let _ = self.report_subscription_state(&d, c, SubscriptionState::InProgress, latency);
         }
+    }
+
+    /// Packet activity of the flow carrying RX channel `channel` of device
+    /// `device`, from the latest media sweep, with or without a subscription.
+    /// `None` when no flow carries it or no sweep has been reported.
+    #[must_use]
+    pub fn flow_media(&self, device: &str, channel: u16) -> Option<&SubscriptionState> {
+        self.flow_media.get(&(device.to_owned(), channel))
     }
 
     /// The effective latency on record for a subscription, if any.
@@ -1009,15 +1090,16 @@ impl StateEngine {
         self.bridge_reports = rows.into_iter().map(|r| (r.name.clone(), r)).collect();
     }
 
-    /// One row per configured `[[bridge]]`, in configuration order: the
+    /// One row per bridge the daemon runs ([`effective_bridges`]: each
+    /// configured `[[bridge]]`, then those saved by `SetCardBridge`): the
     /// daemon's latest report for it if it matches the entry (same device,
     /// card and direction), otherwise the configured values with state
     /// `Disabled` or `Starting`.
+    ///
+    /// [`effective_bridges`]: Self::effective_bridges
     #[must_use]
     pub fn bridges(&self) -> Vec<BridgeStatus> {
-        self.config
-            .config
-            .bridges
+        self.effective_bridges()
             .iter()
             .map(|b| {
                 let configured = self.configured_bridge(b);
@@ -1066,7 +1148,13 @@ impl StateEngine {
             _ => d.rx_channels,
         });
         s.first_channel = b.first_channel;
-        s.channels = b.channel_count(available);
+        s.channels = if b.local_only {
+            b.channels.unwrap_or(0)
+        } else {
+            b.channel_count(available)
+        };
+        s.card_first_channel = b.card_first_channel;
+        s.local_only = b.local_only;
         s.time_constant_s = b.time_constant_s;
         s.max_correction_ppm = b.max_correction_ppm;
         s
@@ -1162,17 +1250,24 @@ impl StateEngine {
     ///
     /// # Errors
     /// As [`apply`](Self::apply) (validation, locks), except
-    /// `ConfirmationRequired` and rate limiting.
+    /// `ConfirmationRequired` and rate limiting. Fader priority is checked
+    /// as for any origin other than the owning surface: `SetChannelGain` on
+    /// a channel a connected fader owns is refused with `GainOwned`, as its
+    /// apply would be.
     pub fn impact(&self, cmd: &Command) -> Result<Impact, CommandError> {
         if self.access.any_locked().is_some() {
             self.access_refusal(cmd)?;
         }
-        if access_guard::is_access_command(cmd) {
+        if access_guard::is_access_command(cmd)
+            || matches!(cmd, Command::ReportSurfaceConnection { .. })
+        {
             return Ok(crate::impact::no_impact(cmd));
         }
         if matches!(cmd, Command::ReloadConfig) {
             return Ok(self.prepare_reload()?.impact);
         }
+        // A preview has no origin; the owning surface never asks for one.
+        self.guard_gain_owner(&Origin::Internal, cmd)?;
         self.guard_managed_intent(cmd)?;
         let mut intent = self.intent.clone();
         if !self.mutate(&mut intent, cmd)? {
@@ -1228,6 +1323,11 @@ impl StateEngine {
         if access_guard::is_access_command(&cmd) {
             return self.apply_access(origin, &cmd);
         }
+        if matches!(cmd, Command::ReportSurfaceConnection { .. }) {
+            return self.report_surface_connection(origin, &cmd);
+        }
+        // Fader priority (after the access lock, like any refusal).
+        self.guard_gain_owner(&origin, &cmd)?;
         let gated = !matches!(
             origin,
             Origin::Protocol { .. } | Origin::Config | Origin::Internal
@@ -1307,8 +1407,24 @@ impl StateEngine {
                 &intent,
             );
         }
+        let unpatched = self.unpatched_owned_after(&intent);
         let mut events = self.diff_models(&self.model, &model, &origin);
+        events.extend(surfaces::channel_events(&self.intent, &intent, &origin));
         events.extend(runtime_changes(&self.intent, &intent, &origin));
+        events.extend(card_bridges::bridge_events(&self.intent, &intent, &origin));
+        let ports_changed = model.devices.len() != self.model.devices.len()
+            || model.devices.iter().any(|n| {
+                self.model.device(&n.key.0).is_none_or(|o| {
+                    (o.rx_channels, o.tx_channels) != (n.rx_channels, n.tx_channels)
+                })
+            });
+        events.extend(self.router_events(&self.intent, &intent, ports_changed, &origin));
+        events.extend(host_volume::host_volume_events(
+            &self.intent,
+            &intent,
+            &origin,
+        ));
+        events.extend(mixers::mixer_events(&self.intent, &intent, &origin));
         let effects: Vec<Effect> = model
             .devices
             .iter()
@@ -1328,7 +1444,14 @@ impl StateEngine {
         if !self.routing_query_context_eq(&self.config.config, &model, self.host_network.as_ref()) {
             self.advance_routing_query_revision();
         }
-        self.intent = intent;
+        let before = std::mem::replace(&mut self.intent, intent);
+        // Added, removed, enabled, disabled or moved to another device: the
+        // surface stays unconnected (owning nothing) until the runtime
+        // reports it again under its new connection epoch.
+        self.renew_surface_epochs(&before.surface);
+        if let Some(memory) = unpatched {
+            self.unpatched_owned_gains = memory;
+        }
         self.prune_runtime(&model);
         self.model = model;
         self.state_warnings = warnings;
@@ -1718,9 +1841,17 @@ impl StateEngine {
             } => self.clear_configuration(intent, device, *keep_network),
             // ReloadConfig is handled by the caller; anything else is a
             // command added to control-types after this crate was written.
-            _ => Err(CommandError::Unsupported {
-                what: "command".into(),
-            }),
+            other => self
+                .mutate_surface_intent(intent, other)
+                .or_else(|| self.mutate_bridge_intent(intent, other))
+                .or_else(|| self.mutate_router_intent(intent, other))
+                .or_else(|| self.mutate_host_volume_intent(intent, other))
+                .or_else(|| self.mutate_mixer_intent(intent, other))
+                .unwrap_or_else(|| {
+                    Err(CommandError::Unsupported {
+                        what: "command".into(),
+                    })
+                }),
         }
     }
 
@@ -1964,12 +2095,16 @@ impl StateEngine {
         self.device_for(device)?;
         let mut next = intent.clone();
         if let Some(stored) = next.device.get_mut(&device.0) {
+            let before = std::mem::take(stored);
             *stored = DeviceIntent {
-                wire_device_id: stored.wire_device_id.take(),
-                rx_channels: stored.rx_channels,
-                tx_channels: stored.tx_channels,
+                wire_device_id: before.wire_device_id.clone(),
+                rx_channels: before.rx_channels,
+                tx_channels: before.tx_channels,
                 ..DeviceIntent::default()
             };
+            // Mute and gain go back to unmuted unity, except the gain of a
+            // channel a connected fader owns: the fader sets it.
+            self.keep_owned_gains(&device.0, &before, stored);
         }
         if control.locked.contains(&ControlLock::Subscriptions)
             && intent
@@ -2054,7 +2189,8 @@ impl StateEngine {
         }
         let intent_changed = intent != self.intent;
         self.prune_runtime(&model);
-        self.intent = intent;
+        let before = std::mem::replace(&mut self.intent, intent);
+        self.renew_surface_epochs(&before.surface);
         self.model = model;
         self.state_warnings = warnings;
         self.config = loaded;
@@ -2675,6 +2811,9 @@ impl StateEngine {
         {
             return Err(issue.to_string());
         }
+        self.check_surface_invariants()?;
+        self.check_router_invariants()?;
+        self.check_mixer_invariants()?;
         let mut again = self.intent.clone();
         let (model, _, changed) = reconcile(cfg, &mut again, &self.env);
         if changed || model != self.model {
@@ -2824,11 +2963,29 @@ fn runtime_changes(before: &StateFile, after: &StateFile, origin: &Origin) -> Ve
                 a.tx_channel_labels != b.tx_channel_labels,
             ),
             ("subscription", a.subscription != b.subscription),
+            ("rx_muted", a.rx_muted != b.rx_muted),
+            ("tx_muted", a.tx_muted != b.tx_muted),
+            ("rx_channel_gain", a.rx_channel_gain != b.rx_channel_gain),
+            ("tx_channel_gain", a.tx_channel_gain != b.tx_channel_gain),
+            ("rx_output_gain", a.rx_output_gain != b.rx_output_gain),
+            ("rx_output_muted", a.rx_output_muted != b.rx_output_muted),
         ] {
             if changed {
                 fields.push(format!("device.{key}.{name}"));
             }
         }
+    }
+    if before.surface != after.surface {
+        fields.push("surface".to_owned());
+    }
+    if before.router != after.router {
+        fields.push("router".to_owned());
+    }
+    if before.host_volume != after.host_volume {
+        fields.push("host_volume".to_owned());
+    }
+    if before.mixer != after.mixer {
+        fields.push("mixer".to_owned());
     }
     fields
         .into_iter()

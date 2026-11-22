@@ -25,8 +25,11 @@
 
 pub mod clock;
 pub mod format;
+pub mod gains;
 pub mod keepalive;
 pub mod plan;
+pub mod router;
+pub mod router_build;
 pub mod stats;
 pub mod udp;
 pub mod worker;
@@ -43,10 +46,11 @@ use tessera_audio_ipc::{ClockOverlayReader, SampleFormat, WakeSignal};
 use tessera_control_types::Direction;
 
 use self::clock::OverlayClock;
+use self::gains::GainRegistry;
 use self::plan::{FlowPlan, Tuning, TxBuilt, build_rx, build_sock, build_tx, sock_key};
 use self::stats::MediaStats;
 use self::worker::{
-    Cmd, EngineEvent, Retired, SessionEnd, SessionRt, Tables, Worker, WorkerConfig,
+    Cmd, EngineEvent, Retired, SessionEnd, SessionPort, SessionRt, Tables, Worker, WorkerConfig,
 };
 
 /// Settings of the media engine.
@@ -102,6 +106,22 @@ pub struct SessionSpec {
     /// whose consumer does not wait on the engine, such as a hardware-card
     /// bridge).
     pub wake: Option<WakeSignal>,
+    /// Whose ring it is (an audio client's unless a card bridge says so).
+    pub port: SessionOwner,
+}
+
+/// Whose ring a session is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionOwner {
+    /// An audio client: device channels.
+    #[default]
+    App,
+    /// A network card bridge: device channels.
+    Bridge,
+    /// A `local_only` card bridge of this ALSA PCM: `first_channel` and
+    /// `channel_count` are card channels; only the host router reads or
+    /// writes it.
+    Card(String),
 }
 
 enum Ctl {
@@ -109,6 +129,7 @@ enum Ctl {
     RemoveSession(u64),
     SetFlows(Vec<FlowPlan>),
     SetFreeRunningTx(bool),
+    SetRouter(Box<crate::router::RouteTable>),
     Stop,
 }
 
@@ -122,6 +143,7 @@ pub struct MediaHandle {
     margin_ns: u64,
     stats: Arc<MediaStats>,
     pending_removals: Arc<std::sync::Mutex<Vec<u64>>>,
+    gains: Arc<GainRegistry>,
 }
 
 impl std::fmt::Debug for MediaHandle {
@@ -164,6 +186,12 @@ impl MediaHandle {
         let _ = self.tx.send(Ctl::SetFreeRunningTx(on));
     }
 
+    /// Run this host router table (`media::router`): built into a real-time
+    /// plan on the control thread and swapped in by the worker.
+    pub fn set_router(&self, table: crate::router::RouteTable) {
+        let _ = self.tx.send(Ctl::SetRouter(Box::new(table)));
+    }
+
     /// How much later than the flow latency an RX client has to read: one
     /// engine tick (data is delivered once per tick) plus the configured
     /// margin. Published to clients as part of the effective latency.
@@ -176,6 +204,13 @@ impl MediaHandle {
     #[must_use]
     pub fn stats(&self) -> &Arc<MediaStats> {
         &self.stats
+    }
+
+    /// The per-device-channel gain words the worker applies (kept equal to
+    /// the state engine by [`gains::run`]).
+    #[must_use]
+    pub fn gains(&self) -> &Arc<GainRegistry> {
+        &self.gains
     }
 
     /// Ask the engine to stop.
@@ -206,6 +241,7 @@ const LOG_EVERY: Duration = Duration::from_secs(1);
 struct Control {
     cfg: MediaConfig,
     stats: Arc<MediaStats>,
+    gains: Arc<GainRegistry>,
     cmd: rtrb::Producer<Cmd>,
     retire: rtrb::Consumer<Retired>,
     events: rtrb::Consumer<EngineEvent>,
@@ -225,6 +261,10 @@ struct Control {
     counts: [usize; 4],
     names: HashMap<u64, String>,
     last_log: HashMap<&'static str, Instant>,
+    /// Card PCM names by index (sessions and router plans).
+    cards: HashMap<String, u32>,
+    /// What the last router plan's indices mean, to carry state over.
+    router_prev: router_build::Index,
 }
 
 #[derive(Clone, Copy)]
@@ -334,9 +374,19 @@ impl Control {
         *self.devices.entry(key.to_owned()).or_insert(next)
     }
 
+    fn card_index(&mut self, pcm: &str) -> u32 {
+        let next = u32::try_from(self.cards.len()).unwrap_or(u32::MAX);
+        *self.cards.entry(pcm.to_owned()).or_insert(next)
+    }
+
     fn add_session(&mut self, s: SessionSpec) {
         let device = self.device_index(&s.device);
         let first = s.first_channel.saturating_sub(1);
+        let port = match &s.port {
+            SessionOwner::App => SessionPort::App,
+            SessionOwner::Bridge => SessionPort::Bridge,
+            SessionOwner::Card(pcm) => SessionPort::Card(self.card_index(pcm)),
+        };
         self.reserve(Table::Session);
         self.sessions += 1;
         self.push(Cmd::AddSession(Box::new(SessionRt {
@@ -348,7 +398,31 @@ impl Control {
             end: s.end,
             wake: s.wake,
             read_end: 0,
+            port,
         })));
+    }
+
+    // Control thread: all allocation for the plan happens here.
+    fn set_router(&mut self, table: &crate::router::RouteTable) {
+        let mut devices = std::mem::take(&mut self.devices);
+        let mut cards = std::mem::take(&mut self.cards);
+        let (plan, index) = router_build::build(
+            table,
+            &self.gains,
+            &mut |d| {
+                let next = u32::try_from(devices.len()).unwrap_or(u32::MAX);
+                *devices.entry(d.to_owned()).or_insert(next)
+            },
+            &mut |c| {
+                let next = u32::try_from(cards.len()).unwrap_or(u32::MAX);
+                *cards.entry(c.to_owned()).or_insert(next)
+            },
+            &self.router_prev,
+        );
+        self.devices = devices;
+        self.cards = cards;
+        self.router_prev = index;
+        self.push(Cmd::SetRouter(plan));
     }
 
     fn remove_session(&mut self, id: u64) {
@@ -370,7 +444,11 @@ impl Control {
                 let reuse =
                     self.handover
                         .remove(&(p.local, p.interface.clone(), p.ifindex, p.port));
-                let built = build_rx(p, key, device, &self.cfg.tuning, reuse)?;
+                let mut built = build_rx(p, key, device, &self.cfg.tuning, reuse)?;
+                built.rt.gains = self
+                    .gains
+                    .for_flow(&p.device, Direction::Rx, &p.channels, p.rate);
+                built.rt.out_gains = self.gains.for_output(&p.device, &p.channels, p.rate);
                 self.note_buffer(
                     "receive",
                     &p.id,
@@ -412,7 +490,7 @@ impl Control {
                     }
                 };
                 let TxBuilt {
-                    rt,
+                    mut rt,
                     metrics,
                     send_failures,
                 } = match build_tx(p, key, device, skey) {
@@ -422,6 +500,9 @@ impl Control {
                         return Err(e);
                     }
                 };
+                rt.gains = self
+                    .gains
+                    .for_flow(&p.device, Direction::Tx, &p.channels, p.rate);
                 if let Some(e) = self.socks.get_mut(&sk) {
                     e.1 += 1;
                 }
@@ -664,9 +745,11 @@ pub fn spawn(
     let pending_for_handle = Arc::clone(&pending);
     let margin_ns = cfg.worker.tick_ns + cfg.rx_margin_ns;
     let cap = cfg.initial_capacity.max(1);
+    let gains = Arc::new(GainRegistry::new());
     let mut ctl = Control {
         cfg,
         stats: Arc::clone(&stats),
+        gains: Arc::clone(&gains),
         cmd: cmd_tx,
         retire: retire_rx,
         events: ev_rx,
@@ -682,6 +765,8 @@ pub fn spawn(
         counts: [0; 4],
         names: HashMap::new(),
         last_log: HashMap::new(),
+        cards: HashMap::new(),
+        router_prev: router_build::Index::default(),
     };
     let join = std::thread::Builder::new()
         .name("tessera-media-ctl".into())
@@ -693,6 +778,7 @@ pub fn spawn(
                     Ok(Ctl::RemoveSession(id)) => ctl.remove_session(id),
                     Ok(Ctl::SetFlows(p)) => ctl.set_flows(p),
                     Ok(Ctl::SetFreeRunningTx(v)) => ctl.push(Cmd::SetFreeRunningTx(v)),
+                    Ok(Ctl::SetRouter(t)) => ctl.set_router(&t),
                     Ok(Ctl::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
                 }
@@ -728,6 +814,7 @@ pub fn spawn(
             margin_ns,
             stats,
             pending_removals: pending_for_handle,
+            gains,
         },
         join,
     ))

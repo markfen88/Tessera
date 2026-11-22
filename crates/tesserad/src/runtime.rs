@@ -32,7 +32,8 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::AudioCtx;
-use crate::bridge::{BridgeManager, BridgePlan, plan_bridges};
+use crate::bridge::plan::plan_bridges_with;
+use crate::bridge::{BridgeManager, BridgePlan};
 use crate::disco::{DeviceAdvert, DiscoveryManager, DiscoveryPlan};
 use crate::engine_thread::{EngineHandle, RuntimePlan};
 use crate::media::MediaHandle;
@@ -57,6 +58,8 @@ pub struct RuntimeOpts {
     pub ptp_rt_priority: Option<u8>,
     /// CPU of the PTP threads (the first of `[engine] cpu_affinity`).
     pub cpu: Option<usize>,
+    /// The media engine's tick, nanoseconds (`[engine] tick_us`; 0: 1 ms).
+    pub tick_ns: u64,
 }
 
 impl RuntimeOpts {
@@ -75,6 +78,7 @@ impl RuntimeOpts {
                 .cpu_affinity
                 .first()
                 .and_then(|c| usize::try_from(*c).ok()),
+            tick_ns: crate::tunables::media_config(cfg).worker.tick_ns,
         }
     }
 }
@@ -103,6 +107,10 @@ pub struct Desired {
     /// Bridges that cannot run on the effective devices, with what their
     /// status rows show.
     pub bridge_errors: Vec<crate::bridge::plan::PlanError>,
+    /// The host router's compiled grid.
+    pub router: crate::router::RouteTable,
+    /// Crosspoints the router cannot mix, in words.
+    pub router_warnings: Vec<String>,
 }
 
 /// The part of a device that fixes the shape of its audio rings.
@@ -118,6 +126,52 @@ pub struct Geometry {
     pub rx: u16,
     /// TX channels.
     pub tx: u16,
+}
+
+/// Does capture bridge `b` write one of the TX channels `rx_from_tx`
+/// monitors on `device`?
+#[must_use]
+pub fn feeds_monitor(b: &BridgePlan, device: &str, rx_from_tx: &[u16]) -> bool {
+    b.direction == tessera_state::config::BridgeDirection::Capture
+        && b.device == device
+        && rx_from_tx.iter().any(|&tx| {
+            tx >= b.first_channel
+                && u32::from(tx) < u32::from(b.first_channel) + u32::from(b.channels)
+        })
+}
+
+/// Where monitored TX channels are read, relative to the RX playback
+/// position (nanoseconds; positive: newer audio).
+///
+/// * `delay_us > 0` (configured): that far behind the playback position.
+/// * `delay_us == 0` (**auto**) with capture bridges feeding the monitored
+///   channels: as new as they reliably are. A capture bridge writes its
+///   chunks `lead` frames ahead of the media clock (`lead = max(3 c, T +
+///   2 c)`, `c` its period, `T` the loop transient it may lag by), and the
+///   playback position is `latency` behind the clock, so up to `latency +
+///   lead - T - c` ahead of the playback position is written; one more
+///   period and 1 ms are kept as margin (a chunk's wake-up, the worker's
+///   tick). The most cautious of the feeding bridges wins.
+/// * auto without a feeding bridge (an audio client writes the channel, ahead
+///   of the clock): at the playback position (0).
+#[must_use]
+pub fn monitor_offset_ns(delay_us: u32, latency_us: u32, feeders: &[&BridgePlan]) -> i64 {
+    if delay_us > 0 {
+        return -(i64::from(delay_us) * 1_000);
+    }
+    feeders
+        .iter()
+        .map(|b| {
+            let c = u64::from(b.period_frames);
+            let t = b.transient_frames();
+            let lead = (3 * c).max(t + 2 * c);
+            let frames = lead.saturating_sub(t + 2 * c);
+            let ns = i64::try_from(frames.saturating_mul(1_000_000_000) / u64::from(b.rate.max(1)))
+                .unwrap_or(0);
+            i64::from(latency_us) * 1_000 + ns - 1_000_000
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 /// Work out what should run from the effective model and configuration.
@@ -173,6 +227,25 @@ pub fn derive_with(
             )));
         }
     }
+    // The host router: card inputs it plays locally make their capture
+    // bridges run for latency; then the grid compiles against the bridges
+    // that run (local monitoring is part of the grid: TX taps into host
+    // outputs).
+    let listened = crate::router::local_listeners(&rp.crosspoints);
+    let (bridges, bridge_errors) = plan_bridges_with(cfg, &rp.model.devices, opts.no_rt, &listened);
+    let delays: std::collections::BTreeMap<String, u32> = cfg
+        .devices
+        .iter()
+        .map(|d| (d.id.clone(), d.monitor_delay_us))
+        .collect();
+    let (router, router_warnings) = crate::router::compile(crate::router::Inputs {
+        devices: &rp.model.devices,
+        monitor_delay_us: &delays,
+        crosspoints: &rp.crosspoints,
+        port_levels: &rp.port_levels,
+        bridges: &bridges,
+        tick_ns: opts.tick_ns,
+    });
     // Advertise by default; honour configuration/runtime opt-outs and skip loopback.
     let off = opts.no_discovery
         || (!cfg.discovery.advertise_devices && !cfg.discovery.browse_devices)
@@ -211,8 +284,9 @@ pub fn derive_with(
             )
         })
         .collect();
-    let (bridges, bridge_errors) = plan_bridges(cfg, &rp.model.devices, opts.no_rt);
     Desired {
+        router,
+        router_warnings,
         bridges,
         bridge_errors,
         clock,
@@ -258,12 +332,19 @@ struct Applied {
     fallback: Option<String>,
     clock_interfaces: Option<Vec<String>>,
     bridges: Option<BridgeSet>,
+    router: Option<crate::router::RouteTable>,
+    router_warnings: Vec<String>,
 }
 
 /// Bridge plans and the bridges that cannot run.
 type BridgeSet = (Vec<BridgePlan>, Vec<crate::bridge::plan::PlanError>);
 
 fn relevant(e: &Event) -> bool {
+    // Card bridges (`SetCardBridge`) and monitors (`SetMonitor`) saved by
+    // command are runtime values of the plan.
+    if let Event::RuntimeValueChanged { field, .. } = e {
+        return field.starts_with("card_bridge.") || field.ends_with(".monitor");
+    }
     !matches!(
         e,
         Event::ClockStateChanged { .. }
@@ -271,6 +352,22 @@ fn relevant(e: &Event) -> bool {
             | Event::SubscriptionChangedWithOrigin { .. }
             | Event::LockedValueRefused { .. }
             | Event::RuntimeValueChanged { .. }
+            // Gain and mute go to the media gain table (`media::gains`), and
+            // surfaces to their own runtime: neither changes the flow plan, and
+            // a fader sends many of them.
+            | Event::ChannelMuteChanged { .. }
+            | Event::ChannelGainChanged { .. }
+            | Event::OutputMuteChanged { .. }
+            | Event::OutputGainChanged { .. }
+            | Event::SurfacesChanged { .. }
+            // Router levels and crosspoint gains are words too; the host
+            // volume and mixer panels are not audio of the media path.
+            | Event::CrosspointGainChanged { .. }
+            | Event::CrosspointMuteChanged { .. }
+            | Event::PortGainChanged { .. }
+            | Event::PortMuteChanged { .. }
+            | Event::HostVolumeChanged { .. }
+            | Event::MixerChanged { .. }
     )
 }
 
@@ -283,6 +380,19 @@ impl Runtime {
         if st.free_running_tx != Some(d.free_running_tx) {
             self.media.set_free_running_tx(d.free_running_tx);
             st.free_running_tx = Some(d.free_running_tx);
+        }
+        // The router first: flows that start next deliver into its buses.
+        if !st.router.as_ref().is_some_and(|r| r.same_shape(&d.router)) {
+            self.media.set_router(d.router.clone());
+            st.router = Some(d.router.clone());
+        }
+        if st.router_warnings != d.router_warnings {
+            for w in &d.router_warnings {
+                if !st.router_warnings.contains(w) {
+                    tracing::warn!("host router: {w}");
+                }
+            }
+            st.router_warnings.clone_from(&d.router_warnings);
         }
         // A changed keepalive alone does not make two plans differ (it waits
         // for the flow's next (re)start), but the engine must still get it.
@@ -533,6 +643,8 @@ mod tests {
                 network: tessera_state::model::NetworkModel::default(),
             },
             config,
+            crosspoints: Vec::new(),
+            port_levels: Vec::new(),
         }
     }
 
@@ -563,7 +675,11 @@ mod tests {
     fn devices_are_advertised_by_default_and_can_be_disabled() {
         let mut r = rp();
         assert!(r.config.discovery.advertise_devices);
-        assert!(!r.config.discovery.browse_devices);
+        assert!(
+            r.config.discovery.browse_devices,
+            "browsing is on by default"
+        );
+        r.config.discovery.browse_devices = false;
         let d = derive_with(&r, RuntimeOpts::default(), &lookup, &[]);
         assert_eq!(d.discovery.mode, MdnsMode::Auto, "on by default");
         assert_eq!(d.discovery.devices.len(), 1);
@@ -679,5 +795,66 @@ mod tests {
             status: ClockStatus::new("e", ClockState::Locked, Timestamping::Software)
         }));
         assert!(relevant(&Event::ConfigReloaded));
+    }
+
+    #[test]
+    fn the_grid_compiles_into_the_router_table_and_only_its_shape_matters() {
+        use tessera_control_types::{Channel, Crosspoint, CrosspointOrigin, RouterPort};
+        let mut r = rp();
+        let p = |n: u16| Channel::new(n).unwrap();
+        let k = DeviceKey("main".into());
+        r.crosspoints = vec![
+            (
+                Crosspoint::new(
+                    RouterPort::NetworkRx {
+                        device: k.clone(),
+                        channel: p(1),
+                    },
+                    RouterPort::HostOut {
+                        device: k.clone(),
+                        channel: p(1),
+                    },
+                ),
+                CrosspointOrigin::Default,
+            ),
+            (
+                Crosspoint::new(
+                    RouterPort::NetworkTx {
+                        device: k.clone(),
+                        channel: p(2),
+                    },
+                    RouterPort::HostOut {
+                        device: k.clone(),
+                        channel: p(1),
+                    },
+                ),
+                CrosspointOrigin::Monitor,
+            ),
+            (
+                Crosspoint::new(
+                    RouterPort::AppOut {
+                        device: k.clone(),
+                        channel: p(2),
+                    },
+                    RouterPort::NetworkTx {
+                        device: k.clone(),
+                        channel: p(2),
+                    },
+                ),
+                CrosspointOrigin::Default,
+            ),
+        ];
+        let o = RuntimeOpts::of(&r.config);
+        let d = derive_with(&r, o, &lookup, &[]);
+        assert!(d.router_warnings.is_empty(), "{:?}", d.router_warnings);
+        assert_eq!(d.router.rx.len(), 1);
+        assert_eq!(d.router.rx[0].terms.len(), 2, "RX 1 and the TX 2 tap");
+        assert_eq!(d.router.tx.len(), 1);
+        // A gain change alone (a seed) is not a new shape.
+        let mut moved = r.clone();
+        moved.crosspoints[1].0.gain = tessera_control_types::Gain::MilliDb(-6_000);
+        let e = derive_with(&moved, o, &lookup, &[]);
+        assert_ne!(d.router, e.router);
+        assert!(d.router.same_shape(&e.router));
     }
 }

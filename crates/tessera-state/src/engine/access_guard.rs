@@ -27,6 +27,19 @@ enum Covered<'a> {
     Host,
     /// The controller flow set: the devices whose flows it changes.
     Flows(&'a [FlowSpec]),
+    /// A control surface added, replaced or removed: the devices its
+    /// bindings (old and new) act on, followed through `follow` bindings,
+    /// and the host when one of them drives the host volume or mute (then
+    /// refused while any device is locked, as `SetHostVolume` is).
+    Surface,
+    /// A sound-card bridge added, replaced or removed by command: its device
+    /// (and the device of the saved bridge it replaces or removes).
+    CardBridge,
+    /// A host-router change: the devices whose ports it names, and every
+    /// device whose effective crosspoints, port labels or levels it would
+    /// change, old and new (a whole-grid change: only those). Card-to-card
+    /// routing names no device.
+    Router,
     /// Carrier bookkeeping and receiver operations of the local receiver,
     /// the first device (policy, conservative: they can lead to a receiver
     /// change).
@@ -35,9 +48,12 @@ enum Covered<'a> {
 
 fn covered(cmd: &Command) -> Covered<'_> {
     match cmd {
-        Command::UnlockAccess { .. } | Command::ResetAccessLock { .. } | Command::ReloadConfig => {
-            Covered::Nothing
-        }
+        Command::UnlockAccess { .. }
+        | Command::ResetAccessLock { .. }
+        | Command::ReloadConfig
+        // Runtime connection state of a surface, from the daemon itself: it
+        // changes no setting.
+        | Command::ReportSurfaceConnection { .. } => Covered::Nothing,
         Command::LockAccess { device, .. }
         | Command::SetDeviceName { device, .. }
         | Command::SetChannelLabel { device, .. }
@@ -47,6 +63,27 @@ fn covered(cmd: &Command) -> Covered<'_> {
         | Command::SetEncoding { device, .. }
         | Command::SetLatency { device, .. }
         | Command::SetDeviceChannels { device, .. } => Covered::Device(device),
+        Command::SetChannelMute { target, .. }
+        | Command::SetChannelGain { target, .. }
+        | Command::SetOutputMute { target, .. }
+        | Command::SetOutputGain { target, .. } => Covered::Device(&target.device),
+        Command::SetSurface { .. } | Command::RemoveSurface { .. } => Covered::Surface,
+        Command::SetCardBridge { .. } | Command::RemoveCardBridge { .. } => Covered::CardBridge,
+        Command::SetMonitor { device, .. } => Covered::Device(device),
+        Command::SetRouter { .. }
+        | Command::ResetRouter
+        | Command::SetCrosspoint { .. }
+        | Command::RemoveCrosspoint { .. }
+        | Command::SetCrosspointGain { .. }
+        | Command::SetCrosspointMute { .. }
+        | Command::SetPortGain { .. }
+        | Command::SetPortMute { .. }
+        | Command::SetPortLabel { .. } => Covered::Router,
+        // The speaker volume belongs to the host (policy: like the clock,
+        // refused while any device is locked).
+        Command::SetHostVolume { .. } | Command::SetHostMute { .. } => Covered::Host,
+        // A panel is presentation only: it changes no audio and no setting.
+        Command::SetMixer { .. } | Command::RemoveMixer { .. } => Covered::Nothing,
         // Also clears the clock settings and, unless kept, the primary
         // interface selection.
         Command::ClearConfiguration { device, .. } => Covered::DeviceAndHost(device),
@@ -134,6 +171,26 @@ impl StateEngine {
                 .find(|d| self.access.is_locked(d))
                 .map_or(Ok(()), |d| Err(refused(&d))),
             Covered::LocalReceiver => self.check_local_receiver_access(),
+            Covered::Surface => {
+                let (devices, drives_host) = self.surface_command_coverage(cmd);
+                if drives_host {
+                    host()?;
+                }
+                devices
+                    .into_iter()
+                    .find(|d| self.access.is_locked(d))
+                    .map_or(Ok(()), |d| Err(refused(&d)))
+            }
+            Covered::Router => self
+                .router_command_devices(cmd)
+                .into_iter()
+                .find(|d| self.access.is_locked(d))
+                .map_or(Ok(()), |d| Err(refused(&d))),
+            Covered::CardBridge => self
+                .bridge_command_devices(cmd)
+                .into_iter()
+                .find(|d| self.access.is_locked(d))
+                .map_or(Ok(()), |d| Err(refused(&d))),
         }
     }
 

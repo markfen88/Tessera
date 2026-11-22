@@ -184,6 +184,11 @@ pub const SECTIONS: &[SectionSpec] = &[
         doc: "Defaults for every [[bridge]] entry (each entry can override them). Two waits, both only after an error, never in steady state. error_backoff*: when a card is missing, busy, unplugged or keeps failing, the bridge manager (a normal-priority thread) closes it and waits before reopening it, so a failing card is not reopened (and its real-time thread restarted) in a tight loop; the wait starts at error_backoff_min_ms and doubles up to error_backoff_max_ms, and a run of 10 s resets it. error_sleep*: while the card stays open, the real-time bridge thread pauses after a step that met an xrun or a card error, so a card in trouble cannot make it spin (polling the card cannot replace the pause: the card reports an error at once in exactly those states); the pause starts at error_sleep_min_ms and doubles up to error_sleep_max_ms while the trouble lasts, and the first clean step resets it. Changes apply at the bridge's next error.",
     },
     SectionSpec {
+        name: "host_volume",
+        array: false,
+        doc: "The host (speaker amplifier) volume: an ALSA mixer control the daemon sets and restores at start, changed at run time by SetHostVolume / SetHostMute (the portal's Main fader, a surface fader bound to host_volume); the value set is stored in state.toml. Off while card is unset. Needs a daemon whose runtime sets the host volume.",
+    },
+    SectionSpec {
         name: "device",
         array: true,
         doc: "A logical device as it appears on the network. Several are allowed; the defaults below apply to each. Values marked live can also be changed at run time and are then stored in state.toml (pin them with `locked`).",
@@ -192,6 +197,11 @@ pub const SECTIONS: &[SectionSpec] = &[
         name: "bridge",
         array: true,
         doc: "An in-daemon ALSA hardware-card bridge: moves audio between a card and a contiguous channel range of a device, compensating the card's clock drift.",
+    },
+    SectionSpec {
+        name: "route",
+        array: true,
+        doc: "A crosspoint of the host router's default grid: source mixed into destination with its own gain. The default grid (each RX channel to the host output of the same number, each application output to the TX channel of the same number, local monitoring, and these entries) applies until a grid is saved at run time (SetRouter, or an edit in the portal), which starts as a copy of it. Ports are inline tables: { kind = \"network_rx\" | \"network_tx\" | \"app_out\" | \"host_out\", device = \"<id>\", channel = n } or { kind = \"card_in\" | \"card_out\", card = \"<ALSA PCM of a bridge>\", channel = n }. Needs a daemon whose runtime runs the host router.",
     },
     SectionSpec {
         name: "flow",
@@ -818,12 +828,12 @@ pub const KEYS: &[KeySpec] = &[
     k!(
         "discovery",
         "browse_devices",
-        Value("false"),
+        Value("true"),
         "",
         "true|false",
         Reload,
         NONE,
-        "Browse permitted interfaces for the read-only routing catalogue. Does not send routing commands."
+        "Browse permitted interfaces for the read-only routing catalogue (the portal's Routing page needs it). Does not send routing commands. `false` opts out."
     ),
     // [backends]
     k!(
@@ -948,6 +958,51 @@ pub const KEYS: &[KeySpec] = &[
         Reload,
         NONE,
         "Longest pause of the bridge thread while the trouble lasts. Higher values use less CPU on a broken card but make an xrun recover more slowly (the card is serviced again only after the pause)."
+    ),
+    // [host_volume]
+    k!(
+        "host_volume",
+        "card",
+        Unset {
+            example: "\"Headphones\""
+        },
+        "",
+        "an ALSA card id or index: letters, digits, _ and -, at most 64 bytes",
+        Reload,
+        NONE,
+        "The ALSA card of the volume control, by its id (amixer -c <card>), so a card that moves to another index after a reboot is still found. Setting it enables the host volume."
+    ),
+    k!(
+        "host_volume",
+        "control",
+        Unset {
+            example: "\"Digital\""
+        },
+        "",
+        "a simple mixer control name, 1..=64 bytes; unset: Digital",
+        Reload,
+        NONE,
+        "The simple mixer control that sets the amplifier's level."
+    ),
+    k!(
+        "host_volume",
+        "min_db",
+        Unset { example: "-60.0" },
+        "dB",
+        "-96..max_db; unset: -60",
+        Reload,
+        NONE,
+        "Lowest volume offered (the bottom of a fader's travel)."
+    ),
+    k!(
+        "host_volume",
+        "max_db",
+        Unset { example: "0.0" },
+        "dB",
+        "min_db..=12; unset: 0",
+        Reload,
+        NONE,
+        "Highest volume offered."
     ),
     // [[device]]
     k!(
@@ -1086,6 +1141,26 @@ pub const KEYS: &[KeySpec] = &[
         NONE,
         "May this device transmit multicast flows."
     ),
+    k!(
+        "device",
+        "monitor_rx_from_tx",
+        Unset { example: "[1, 2]" },
+        "",
+        "one TX channel (1-based, 0: none) per RX channel",
+        Reload,
+        NONE,
+        "Local monitoring: RX channel n also plays the TX channel in entry n, after that channel's gain and mute. Overridden by `SetMonitor`."
+    ),
+    k!(
+        "device",
+        "monitor_delay_us",
+        Value("0"),
+        "us",
+        "0..=1000000",
+        Reload,
+        NONE,
+        "How far behind playback the monitored TX channels are read. 0: auto, the lowest delay at which a feeding capture bridge's audio is reliably there (at the playback position when an audio client feeds them). Overridden by `SetMonitor`."
+    ),
     // [[bridge]]
     k!(
         "bridge",
@@ -1151,7 +1226,7 @@ pub const KEYS: &[KeySpec] = &[
         ">= 1",
         Reload,
         DEVICE,
-        "First device channel carried; card channel 1 is this one."
+        "First device channel carried; card channel card_first_channel is this one."
     ),
     k!(
         "bridge",
@@ -1162,6 +1237,16 @@ pub const KEYS: &[KeySpec] = &[
         Reload,
         DEVICE,
         "Channels carried. Unset: the rest of the device's channels from first_channel on."
+    ),
+    k!(
+        "bridge",
+        "card_first_channel",
+        Value("1"),
+        "",
+        ">= 1",
+        Reload,
+        DEVICE,
+        "First card channel carried (for example 15 for a mixer's main mix on USB channels 15-16). The card is opened with at least card_first_channel + channels - 1 channels (or the count it requires); capture ignores its other channels, playback sends silence on them."
     ),
     k!(
         "bridge",
@@ -1302,6 +1387,61 @@ pub const KEYS: &[KeySpec] = &[
         Reload,
         NONE,
         "Override of [defaults.bridge] error_sleep_max_ms for this bridge."
+    ),
+    k!(
+        "bridge",
+        "local_only",
+        Value("false"),
+        "",
+        "true|false",
+        Reload,
+        DEVICE,
+        "Open the card for the host router only: its channels card_first_channel.. become router ports (card_in for capture, card_out for playback) and no device channel is fed or read, so the card stays off the network until a crosspoint patches it there. first_channel is ignored and channels is required. Needs a daemon whose runtime runs the host router."
+    ),
+    // [[route]]
+    k!(
+        "route",
+        "source",
+        Required {
+            example: "{ kind = \"network_rx\", device = \"main\", channel = 1 }"
+        },
+        "",
+        "a router port table",
+        Reload,
+        NONE,
+        "What is mixed in: network_rx, app_out or card_in, or a destination port (network_tx, host_out, card_out) as a tap of what it carries. Required."
+    ),
+    k!(
+        "route",
+        "destination",
+        Required {
+            example: "{ kind = \"host_out\", device = \"main\", channel = 2 }"
+        },
+        "",
+        "a network_tx, host_out or card_out port table",
+        Reload,
+        NONE,
+        "Where it is mixed into. Required."
+    ),
+    k!(
+        "route",
+        "gain_db",
+        Value("0.0"),
+        "dB",
+        "-96..=12",
+        Reload,
+        NONE,
+        "Gain of this crosspoint."
+    ),
+    k!(
+        "route",
+        "muted",
+        Value("false"),
+        "",
+        "true|false",
+        Reload,
+        NONE,
+        "Patched but silent."
     ),
     // [[flow]]
     k!(
@@ -1564,8 +1704,8 @@ pub const REFERENCE_HEADER: &str = "\
 # this file in lexical order; a later file wins. Merging: tables merge key
 # by key; plain values and plain arrays (interfaces, cpu_affinity, ...)
 # replace, except `locked` lists, which add up; [[device]] entries merge
-# by `id` (a drop-in cannot remove a device); [[bridge]] and [[flow]]
-# lists are replaced as a whole by a file that has any. The configuration
+# by `id` (a drop-in cannot remove a device); [[bridge]], [[route]] and
+# [[flow]] lists are replaced as a whole by a file that has any. The configuration
 # guide (/usr/share/doc/tessera/configuration.md where installed,
 # docs/configuration.md in the sources)
 # explains precedence, drop-ins and locks.

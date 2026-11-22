@@ -23,8 +23,8 @@ use tessera_control_types::{
 use tessera_state::{ConfigPaths, Environment, load_config};
 
 use crate::cli::{
-    AccessCmd, Cli, ClockCmd, Cmd, ConfigCmd, DirArgs, FlowCmd, NetworkCmd, RoutingCmd, ShowArgs,
-    WatchArgs,
+    AccessCmd, BridgeCmd, Cli, ClockCmd, Cmd, ConfigCmd, DirArgs, FlowCmd, NetworkCmd, RoutingCmd,
+    ShowArgs, SurfaceCmd, WatchArgs,
 };
 use crate::client::{Client, ClientError};
 
@@ -148,6 +148,20 @@ pub fn describe(e: &CliError) -> String {
             ),
             _ => format!("cannot connect to {}: {source}", path.display()),
         },
+        CliError::Client(ClientError::Command(CommandError::GainOwned {
+            device,
+            direction,
+            channel,
+            surface,
+        })) => format!(
+            "the gain of {} {} channel {channel} is set by the {} fader; mute still works",
+            sanitize::clean(&device.0),
+            match direction {
+                tessera_control_types::Direction::Rx => "rx",
+                tessera_control_types::Direction::Tx => "tx",
+            },
+            sanitize::clean(surface)
+        ),
         CliError::Client(ClientError::Command(CommandError::PermissionDenied)) => {
             "permission denied: changing settings needs root or membership of the daemon's \
              admin group (`tessera-admin` by default); reading status does not"
@@ -387,7 +401,7 @@ pub fn run_with(
                 write!(out, "{}", output::render_flows(&metrics.flows))?;
             }
         }
-        Cmd::Bridges => {
+        Cmd::Bridges | Cmd::Bridge(BridgeCmd::List) => {
             let reply = c.request(RequestBody::Query(Query::Bridges))?;
             let Reply::Bridges(b) = reply else {
                 return Err(unexpected(&reply));
@@ -442,6 +456,144 @@ pub fn run_with(
                 write!(out, "{}", sanitize::clean_text(&text))?;
             }
         }
+        Cmd::Surfaces => {
+            let r = c.surfaces()?;
+            if cli.json {
+                json(out, &r)?;
+            } else {
+                write!(out, "{}", output::render_surfaces(&r))?;
+            }
+        }
+        Cmd::Surface(SurfaceCmd::Learn { id, wait, fader }) => {
+            if !cli.json {
+                let how = if *fader {
+                    "move the fader from the bottom all the way up"
+                } else {
+                    "press the button once"
+                };
+                writeln!(
+                    err,
+                    "Hands off the control for a second (the daemon reads its resting state), \
+                     then {how}; waiting up to {wait} s..."
+                )?;
+                err.flush()?;
+            }
+            let learned = c.learn_control(id, Duration::from_secs(u64::from(*wait)), *fader)?;
+            if cli.json {
+                json(out, &learned)?;
+            } else {
+                match learned {
+                    None => writeln!(out, "Nothing moved in {wait} s.")?,
+                    Some(l) => write!(out, "{}", output::render_learned(&l))?,
+                }
+            }
+        }
+        Cmd::Router(cli::RouterCmd::Show) => {
+            let reply = c.request(RequestBody::Query(Query::Router))?;
+            let Reply::Router(r) = reply else {
+                return Err(unexpected(&reply));
+            };
+            if cli.json {
+                json(out, &r)?;
+            } else {
+                write!(out, "{}", output::render_router(&r))?;
+            }
+        }
+        Cmd::Volume(cli::VolumeCmd::Show) => {
+            let s = c.status()?;
+            match (&s.host_volume, cli.json) {
+                (v, true) => json(out, v)?,
+                (Some(v), false) => write!(out, "{}", output::render_host_volume(v))?,
+                (None, false) => writeln!(
+                    out,
+                    "No host volume is configured ([host_volume] in the configuration)."
+                )?,
+            }
+        }
+        Cmd::Mixer(cli::MixerCmd::List) => {
+            let reply = c.request(RequestBody::Query(Query::Mixers))?;
+            let Reply::Mixers(m) = reply else {
+                return Err(unexpected(&reply));
+            };
+            if cli.json {
+                json(out, &m)?;
+            } else if m.is_empty() {
+                writeln!(
+                    out,
+                    "No mixer panels are saved (the web portal shows its default one)."
+                )?;
+            } else {
+                write!(out, "{}", output::render_mixers(&m))?;
+            }
+        }
+        Cmd::Surface(SurfaceCmd::TcpMidi { name, host, port }) => {
+            // Keep the controls and bindings of a surface that exists.
+            let r = c.surfaces()?;
+            let spec = match r.surfaces.into_iter().find(|s| s.spec.name == *name) {
+                Some(mut s) => {
+                    s.spec.source = tessera_control_types::SurfaceSource::TcpMidi {
+                        host: host.clone(),
+                        port: *port,
+                    };
+                    s.spec
+                }
+                None => tessera_control_types::SurfaceSpec::new(
+                    name.clone(),
+                    tessera_control_types::SurfaceSource::TcpMidi {
+                        host: host.clone(),
+                        port: *port,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
+            let command = Command::SetSurface { surface: spec };
+            let reply = apply(&mut c, cli, &command, None, err, input)?;
+            if cli.json {
+                writeln!(out, "{}", serde_json::json!({ "ok": true }))?;
+            } else if matches!(reply, Reply::Done | Reply::Impact(_)) {
+                writeln!(out, "surface {name}: MIDI over TCP to {host}:{port}")?;
+            } else {
+                return Err(unexpected(&reply));
+            }
+        }
+        Cmd::Surface(s @ (SurfaceCmd::Enable { name } | SurfaceCmd::Disable { name })) => {
+            let enable = matches!(s, SurfaceCmd::Enable { .. });
+            let word = if enable { "enabled" } else { "disabled" };
+            // The whole spec goes back: only `enabled` changes.
+            let r = c.surfaces()?;
+            let Some(mut spec) = r
+                .surfaces
+                .into_iter()
+                .map(|s| s.spec)
+                .find(|s| s.name == *name)
+            else {
+                return Err(CliError::Usage(format!(
+                    "there is no surface `{name}` (see `surfaces`)"
+                )));
+            };
+            // Already so: nothing is sent.
+            let changed = spec.enabled != enable;
+            if changed {
+                spec.enabled = enable;
+                let command = Command::SetSurface { surface: spec };
+                let reply = apply(&mut c, cli, &command, None, err, input)?;
+                if !matches!(reply, Reply::Done | Reply::Impact(_)) {
+                    return Err(unexpected(&reply));
+                }
+            }
+            if cli.json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::json!({ "ok": true, "changed": changed })
+                )?;
+            } else if changed {
+                writeln!(out, "surface {name} {word}")?;
+            } else {
+                writeln!(out, "surface {name} is already {word}")?;
+            }
+        }
         Cmd::Completions { .. } | Cmd::Config(ConfigCmd::Check(_)) => {}
         cmd => {
             let device = if cli::needs_device(cmd) {
@@ -454,6 +606,24 @@ pub fn run_with(
                 let flows =
                     tessera_state::flows::parse_flow_specs(&text).map_err(CliError::Config)?;
                 Command::SetProtocolFlows { flows }
+            } else if let Cmd::Monitor {
+                device_key,
+                rx_from_tx,
+                delay_ms: None,
+            } = cmd
+            {
+                // Keep the delay in effect: read it first.
+                let s = c.status()?;
+                let Some(d) = s.devices.iter().find(|d| d.key.0 == *device_key) else {
+                    return Err(CliError::Usage(format!(
+                        "there is no device `{device_key}` (see `status`)"
+                    )));
+                };
+                Command::SetMonitor {
+                    device: d.key.clone(),
+                    rx_from_tx: rx_from_tx.0.clone(),
+                    delay_us: d.monitor_delay_us,
+                }
             } else if let Cmd::Access(a @ (AccessCmd::Lock | AccessCmd::Unlock)) = cmd {
                 let pin = read_pin(input, err, matches!(a, AccessCmd::Lock))?;
                 cli::access_command(a, &device, pin)
@@ -721,7 +891,123 @@ fn confirmation(cmd: &Cmd, device: &DeviceKey) -> String {
         Cmd::Access(AccessCmd::Reset) => {
             format!("{d}: access lock reset (removed without the PIN)")
         }
+        Cmd::Mute(t) => format!(
+            "{}: muted",
+            output::channel_set_words(&t.set(), output::Style::Ascii)
+        ),
+        Cmd::Unmute(t) => format!(
+            "{}: unmuted",
+            output::channel_set_words(&t.set(), output::Style::Ascii)
+        ),
+        Cmd::Gain { target, gain } => format!(
+            "{}: gain set to {}",
+            output::channel_set_words(&target.set(), output::Style::Ascii),
+            output::gain_words(*gain, output::Style::Ascii)
+        ),
+        Cmd::Surface(SurfaceCmd::Remove { name }) => format!("surface {name} removed"),
+        Cmd::Surface(SurfaceCmd::Set { file }) => format!("surface {} saved", file.name),
+        Cmd::Bridge(BridgeCmd::Add(a)) => format!(
+            "bridge {} saved: {}{}",
+            a.name,
+            output::card_bridge_words(&a.spec(device), output::Style::Ascii),
+            if a.disabled { " (disabled)" } else { "" }
+        ),
+        Cmd::Bridge(BridgeCmd::Remove { name }) => format!("bridge {name} removed"),
+        Cmd::OutputGain {
+            device_key,
+            channels,
+            gain,
+        } => format!(
+            "{device_key} RX {}: output level set to {}",
+            output::channel_runs(&channels.0, output::Style::Ascii),
+            output::gain_words(*gain, output::Style::Ascii)
+        ),
+        Cmd::OutputMute {
+            device_key,
+            channels,
+            off,
+        } => format!(
+            "{device_key} RX {}: output {}",
+            output::channel_runs(&channels.0, output::Style::Ascii),
+            if *off { "unmuted" } else { "muted" }
+        ),
+        Cmd::Monitor {
+            device_key,
+            rx_from_tx,
+            ..
+        } => {
+            let pairs: Vec<String> = rx_from_tx
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| **t != 0)
+                .map(|(i, t)| format!("RX {} plays TX {t}", i + 1))
+                .collect();
+            if pairs.is_empty() {
+                format!("{device_key}: local monitoring off")
+            } else {
+                format!("{device_key}: {}", pairs.join(", "))
+            }
+        }
+        Cmd::Router(r) => router_confirmation(r),
+        Cmd::Volume(cli::VolumeCmd::Set { gain }) => format!(
+            "host volume set to {}",
+            output::gain_words(*gain, output::Style::Ascii)
+        ),
+        Cmd::Volume(cli::VolumeCmd::Mute { off }) => {
+            format!("host volume {}", if *off { "unmuted" } else { "muted" })
+        }
+        Cmd::Mixer(cli::MixerCmd::Set { file }) => format!("mixer panel {} saved", file.id),
+        Cmd::Mixer(cli::MixerCmd::Remove { id }) => format!("mixer panel {id} removed"),
         _ => "ok".into(),
+    }
+}
+
+fn router_confirmation(r: &cli::RouterCmd) -> String {
+    use cli::{RouterCmd as R, port_words as p};
+    let g = |g: &tessera_control_types::Gain| output::gain_words(*g, output::Style::Ascii);
+    match r {
+        R::Patch {
+            source,
+            destination,
+            ..
+        } => format!("{} patched to {}", p(source), p(destination)),
+        R::Unpatch {
+            source,
+            destination,
+        } => format!("{} unpatched from {}", p(source), p(destination)),
+        R::Gain {
+            source,
+            destination,
+            gain,
+        } => format!(
+            "{} -> {}: gain set to {}",
+            p(source),
+            p(destination),
+            g(gain)
+        ),
+        R::Mute {
+            source,
+            destination,
+            off,
+        } => format!(
+            "{} -> {}: {}",
+            p(source),
+            p(destination),
+            if *off { "unmuted" } else { "muted" }
+        ),
+        R::PortGain { port, gain } => format!("{}: level set to {}", p(port), g(gain)),
+        R::PortMute { port, off } => {
+            format!("{}: {}", p(port), if *off { "unmuted" } else { "muted" })
+        }
+        R::Label {
+            port,
+            label: Some(l),
+        } => format!("{}: labelled \"{l}\"", p(port)),
+        R::Label { port, label: None } => format!("{}: default label again", p(port)),
+        R::Set { file } => format!("router grid saved ({} crosspoints)", file.crosspoints.len()),
+        R::Reset => "router back to the default grid".into(),
+        R::Show => "ok".into(),
     }
 }
 
@@ -867,12 +1153,21 @@ fn load_files(d: &DirArgs) -> Result<tessera_state::LoadedConfig, CliError> {
         d.config_dir.join("config.toml"),
         d.config_dir.join("config.d"),
     );
-    // The schema is checked here; whether the installed daemon was built
-    // with the hardware bridge only the daemon knows (it refuses
-    // `[[bridge]]` at reload if not), so the offline check accepts them.
+    load_config(&paths, &offline_environment()).map_err(|e| CliError::Config(e.to_string()))
+}
+
+/// The environment the offline configuration check judges files with: this
+/// host, and the runtime support of the tesserad shipped with this
+/// tesseractl ([`RuntimeSupport::tesserad`](tessera_state::env::RuntimeSupport::tesserad)),
+/// so `[[route]]`, `local_only` bridges and `[host_volume]` are accepted as
+/// the daemon accepts them. Whether the installed daemon was built with the
+/// hardware support only the daemon knows (it refuses `[[bridge]]` at
+/// reload and warns about `[host_volume]` if not), so the check assumes it.
+fn offline_environment() -> Environment {
     let mut env = Environment::detect();
     env.bridges_supported = true;
-    load_config(&paths, &env).map_err(|e| CliError::Config(e.to_string()))
+    env.runtime = tessera_state::env::RuntimeSupport::tesserad(true);
+    env
 }
 
 fn config_files(

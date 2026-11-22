@@ -1,5 +1,243 @@
 # Tessera changelog
 
+## 0.6.0
+
+Tessera 0.6.0 makes Tessera an audio routing device with two clean layers:
+network channels interoperable with Dante® on one side, and local I/O (sound
+cards, USB mixers, local applications, speaker outputs) on the other, joined by
+a real-time host router. It adds hardware control surfaces (USB HID, USB MIDI,
+and MIDI over TCP), custom mixing-desk panels, daemon-owned speaker amplifier
+volume, channel-sliced and local-only sound-card bridges, and Network routing
+matrix fixes. Interoperability with Dante® remains uncertified.
+
+### Added
+
+- **Host audio router (`/router`, `tesseractl router`, `[[route]]`).**
+  - Two-layer model: the host exposes its logical network device's RX (network
+    → this host) and TX (this host → network) channels to network controllers;
+    local I/O (`app_out`, `host_out`, `card_in`, `card_out`) stays local until
+    patched by a crosspoint.
+  - Real-time mixing engine in `tesserad`: compiles active crosspoints into a
+    flat lock-free plan (`RouteTable`) hot-swapped into the media worker
+    without stopping audio or allocating on RT threads. Every destination sums
+    every crosspoint that feeds it, with per-crosspoint gain and mute and
+    per-port levels and labels. Taps (a destination port used as a source,
+    after its own level) are supported; loops through taps are refused.
+  - Default grid reproduces 0.5 behaviour (RX *n* → host out *n*, app *n* → TX
+    *n* where no capture bridge feeds it, local monitoring, and configured
+    `[[route]]` entries) until the first edit saves it; **Reset to default**
+    (`ResetRouter`, `tesseractl router reset`) returns to it.
+  - Portal `/router` grid with keyboard navigation (arrow keys, Home/End),
+    crosspoint and port editors (`/router/crosspoint`, `/router/port`), phone
+    destination-card layout, and **Patch cards to the network** (adds TX/RX
+    channels with confirmation, labels them, and patches `card_in → network_tx`
+    or `network_rx → card_out` in one flow).
+  - CLI: `tesseractl router show|patch|unpatch|gain|mute|port-gain|port-mute|set --file|reset`.
+- **Sound-card bridges (`/audio`, `tesseractl bridge`).**
+  - Runtime bridge management (`SetCardBridge`, `RemoveCardBridge`) alongside
+    `[[bridge]]` drop-ins, with in-place channel renaming and device channel
+    growth on `/audio`.
+  - Channel slicing: `card_first_channel` (CLI `--card-first`, portal **First
+    card input / output**) selects a contiguous slice of a multi-channel card
+    (for example USB channels 15–16 for an Allen & Heath CQ's Main L/R mix).
+  - `local_only = true` bridges open a sound card for the host router only
+    (`card_in` / `card_out` ports), keeping it off the network until patched.
+    The Audio page can convert an existing network bridge to or from
+    `local_only` while preserving its signal path.
+  - Low-latency card periods (`--low-latency` / 96 frames, 2 ms at 48 kHz).
+- **Local monitoring (`monitor_rx_from_tx`, `SetMonitor`, `tesseractl monitor`).**
+  - Mixes a device's local TX inputs into its RX host outputs after TX channel
+    gain and mute, with `monitor_delay_us = 0` (`auto`) as default. Superseded
+    by the host router for arbitrary mixes; when a router grid is saved,
+    `SetMonitor` updates that device's TX-tap → `host_out` crosspoints.
+- **Levels and daemon-owned host volume (`[host_volume]`, `tesseractl volume`).**
+  - Per-channel input gain and mute (`SetChannelGain`, `SetChannelMute`,
+    `tesseractl gain|mute|unmute`), post-mix RX output stage (`SetOutputGain`,
+    `SetOutputMute`, `tesseractl output-gain|output-mute`), and router port /
+    crosspoint levels (`SetPortGain`, `SetPortMute`, `SetCrosspointGain`,
+    `SetCrosspointMute`).
+  - `[host_volume]` (`card`, `control`, `min_db`, `max_db`) hands the speaker
+    amplifier's ALSA simple mixer control to `tesserad` (using alsa-lib's mixer
+    API rather than `amixer`; needs `tesserad` built with `alsa-bridge`), with
+    persistence in `state.toml`, live hardware readback, automatic reapply when
+    a card reappears, and `tesseractl volume show|set|mute`.
+  - The speaker bundle installer writes `/etc/tessera/config.d/60-host-volume.toml`
+    alongside the portal's `[appliance.volume]`; on first start with a daemon
+    that has no saved host volume yet, the portal hands its saved
+    `/var/lib/tessera-web/volume.json` value over once and stops calling
+    `amixer`.
+- **Hardware control surfaces (`/surfaces`, `tesseractl surfaces`, `tesseractl surface`).**
+  - Outbound transports: USB HID (`/dev/hidraw*`), USB MIDI (ALSA rawmidi
+    `/dev/snd/midi*`, opened read-write once), and **MIDI over TCP**
+    (`tcp_midi`, raw MIDI both ways on a TCP connection `tesserad` opens with
+    reconnect back-off, e.g. Allen & Heath CQ on port `51325`). Tessera
+    connects out only and never opens a listener. Writes go through a writer
+    thread per device (whole messages, never blocking the daemon); a write
+    error ends the session. A lost device is found from its device errors
+    (USB) or TCP keep-alive (about 6 s); an idle desk is never dropped for
+    being silent.
+  - Shareable TOML/JSON [surface profiles](docs/surface-profiles.md) with
+    piecewise-linear fader laws (`[curves]`), built-in Allen & Heath CQ series
+    profile (`allen-heath-cq.toml`), shipped directory
+    `/usr/share/tessera/surfaces/`, operator directory
+    `/etc/tessera/surfaces.d/`, portal import/export, and `Query::SurfaceProfiles`.
+  - Interactive **Learn a control** (`Query::LearnControl`, `tesseractl surface
+    learn`) for HID and MIDI, plus `tesseractl surface set --file` (JSON
+    `SurfaceSpec`), `tesseractl surface tcp-midi`, and `tesseractl surfaces --json`.
+  - Mapping actions: channel gain/mute, RX output gain/mute, host volume/mute,
+    router port gain/mute, crosspoint gain/mute, and **Follow** (the control
+    acts exactly like a control on another surface: that control's bindings
+    apply with its surface as the origin, chains apply through, and its motor
+    moves, in dB through each surface's own fader law; mutual pairs are
+    allowed without echo loops, longer cycles are refused, and a follow
+    binding owns no level itself).
+  - Button modes: toggle, momentary (hold to mute), and push-to-talk.
+  - Fader priority: a connected non-motorized fader owns the level it drives
+    (`Gain`, `HostVolume`, `PortGain`, `CrosspointGain`; portal shows it
+    read-only and other origins get `GainOwned` or `LevelOwned`). Mute is never
+    owned, and motorized faders own nothing and follow changes made elsewhere.
+- **Mixer panels (`/mixer`, `/mixer/edit`, `tesseractl mixer`).**
+  - Default mixing desk of channels in use plus Main L/R (`host_volume` when
+    daemon-owned, else portal `[appliance.volume]`, else RX output stage), with
+    live vertical faders on desktop and horizontal strips on phones.
+  - Custom saved panels (`MixerSpec`, `SetMixer`, `RemoveMixer`, `Query::Mixers`)
+    with any number of faders or buttons targeting channels, host volume,
+    router ports, or crosspoints, groups, master strips, reorder, and derived
+    hardware-control links (`StripControl::links_to`, created via `SetSurface`
+    then `SetMixer`).
+  - CLI: `tesseractl mixer list|set --file|remove`.
+- **Control contract (`tessera-control-types`, additive, wire version 1).**
+  - New commands: `SetOutputGain`, `SetOutputMute`, `SetCardBridge`,
+    `RemoveCardBridge`, `SetMonitor`, `SetRouter`, `ResetRouter`,
+    `SetCrosspoint`, `RemoveCrosspoint`, `SetCrosspointGain`,
+    `SetCrosspointMute`, `SetPortGain`, `SetPortMute`, `SetHostVolume`,
+    `SetHostMute`, `SetMixer`, `RemoveMixer`.
+  - New queries/replies: `Surfaces`, `LearnControl`, `SurfaceProfiles`,
+    `Router`, `Mixers`.
+  - New events: `OutputGainChanged`, `OutputMuteChanged`, `RouterChanged`,
+    `CrosspointGainChanged`, `CrosspointMuteChanged`, `PortGainChanged`,
+    `PortMuteChanged`, `HostVolumeChanged`, `MixerChanged`.
+  - New errors: `LevelOwned`, `InvalidMixer`.
+  - New status fields: `Status.host_volume`, `ChannelStatus.output_gain`,
+    `ChannelStatus.output_muted`, `ChannelStatus.output_gain_owner`,
+    `DeviceStatus.monitor_rx_from_tx`, `DeviceStatus.monitor_delay_us`,
+    `BridgeStatus.card_first_channel`, `BridgeStatus.local_only`.
+  - Surface connection epochs: `SurfaceStatus.connection_epoch` and the
+    optional `epoch` of `ReportSurfaceConnection` (absent from JSON when not
+    set). A report is refused for a disabled surface or an old epoch, so a
+    quick disable/enable or source change cannot leave a fader's ownership
+    lost or bring back an old connection.
+  - `SurfaceSpec` and `NamedCurve` are `#[non_exhaustive]`: build them with
+    `SurfaceSpec::new` (and `with_enabled`) and `NamedCurve::new` (Rust API
+    only; the JSON and TOML forms are unchanged).
+
+### Changed
+
+- **Monitored and card inputs reach host outputs without a network flow.**
+  Because the host router mixes directly into host outputs on every engine
+  tick, local monitoring (`SetMonitor`) and card inputs patched to `host_out`
+  now play locally even when no network RX flow is active on that channel.
+- **`SetOutputGain` obeys `HostOut` port ownership.** While an `OutputGain`
+  surface binding still owns nothing, a connected non-motorized fader bound to
+  `PortGain` on a `HostOut` port now owns that host output's level:
+  `SetOutputGain` (and `SetPortGain`) from other origins is refused with
+  `LevelOwned` and `ChannelStatus::output_gain_owner` names the surface.
+- **`[discovery] browse_devices` now defaults to `true`** (was `false`), so the
+  portal's **Network routing** page lists devices on the segment without extra
+  configuration. Set `browse_devices = false` in `/etc/tessera/config.d/` to
+  opt out.
+- **`tesserad.service` runs with `SupplementaryGroups=audio`** so sound-card
+  bridges, `[host_volume]`, and rawmidi control surfaces can open `/dev/snd/*`
+  without adding a manual systemd drop-in.
+- **Surface profile files refuse unknown keys everywhere.** Controls, `midi`
+  addresses, and `[curves]` points now use strict parsing (`deny_unknown_fields`)
+  just like top-level fields, `[match]`, and `[[binding]]`; typos such as
+  `motorised` or `lable` are rejected with the key name and file path instead
+  of being silently ignored.
+- **Local monitoring delay defaults to `0` (`auto`)** (`monitor_delay_us = 0`
+  and `SetMonitor` default), choosing the lowest safe delay for a feeding
+  capture bridge automatically.
+- **Control values stay unknown until reported.** Surface control tiles show
+  *touch it to see it* (and CLI prints `-`) until the hardware reports a value
+  (or Tessera moves a motorized fader there: the position it was sent to), and
+  saving a surface spec re-evaluates its faders.
+- **Portal navigation**: the inter-device routing matrix is labelled **Network
+  routing** (`/routing`) to distinguish it from the host **Router** (`/router`).
+
+### Fixed
+
+- **Portal sliders now send all hidden form fields.** In-place live posts from
+  sliders, momentary buttons, and `data-live-post` forms in `/live.js` now
+  include the form's hidden fields (such as `stage=output`, `port`, and `xp`).
+  Previously, dragging an RX **Output (after the mix)** slider on `/devices` or
+  an output-stage **Main L/R** fader on `/mixer` sent only `db`, which applied
+  the change to channel input gain instead of output level.
+- **Network routing matrix (`/routing`) fixes:**
+  - Static `[[flow]]` entries now appear in the matrix as receiving (or waiting
+    / no media), read-only, naming the config flow ID (and unmatched static
+    flows appear in the input header); collapsed-band counts include them.
+  - Channel bridge annotations come only from **enabled** bridges (preferring a
+    running bridge), so a disabled bridge no longer labels channels carried by
+    another bridge.
+  - All local RX inputs of this host are listed with their configured channel
+    labels even if the runtime reports a shorter page.
+  - Plain-language reasons explain when a receiver cannot be routed (for
+    example `operation_unavailable` explains that the compatibility runtime is
+    not registered while local-mix cells stay clickable).
+- **Device page level tables** stack vertically until the viewport is wide
+  enough for both RX and TX tables without clipping.
+- **Rawmidi devices** are opened once read-write instead of opening separate
+  read and write handles.
+- **Fader priority holds in the corners:** `ClearConfiguration` keeps an RX
+  output level owned by a `port_gain` fader on its host output (as it keeps
+  owned channel gains); unpatching an owned crosspoint and patching it again
+  at another gain from another origin is refused with `LevelOwned`; and
+  narrowing `[host_volume]` no longer blocks editing the other strips of a
+  saved mixer panel whose host strip has its own range.
+
+### Upgrade notes
+
+- **Packages:** upgrade `tessera`, `tessera-alsa`, `tessera-web`, `tessera-dsp`
+  (and `tessera-pw` if installed) together, or run `tessera-bundle install`
+  with the new archive. Restart `tesserad` when an audio interruption is
+  acceptable.
+- **Speaker volume handoff:** running the 0.6.0 speaker bundle installer writes
+  `/etc/tessera/config.d/60-host-volume.toml` once (leaving `web.d/60-speaker.toml`
+  and `/var/lib/tessera-web/volume.json` in place). When `tesserad` starts with
+  `[host_volume]` and no saved volume yet, `tessera-web` sends its saved
+  `volume.json` value once via `SetHostVolume` and stops calling `amixer`.
+- **Existing speakers without the installer:** to hand amplifier volume to
+  `tesserad` manually, add `[host_volume]` (`card`, `control`, `min_db`,
+  `max_db`) to `/etc/tessera/config.d/60-host-volume.toml` and reload
+  `tesserad` (requires `tesserad` built with `alsa-bridge`).
+- **Custom profiles:** check any hand-written files in `/etc/tessera/surfaces.d/`
+  for unknown keys; invalid files are reported and skipped at load.
+- **Rollback to 0.5.x:** back up `/var/lib/tessera/state.toml` first. An older
+  daemon ignores the new `state.toml` sections (`[router]`, `[host_volume]`,
+  `[[mixer]]`, `[[surface]]`, `rx_output_*`) and drops them on its next write
+  while keeping subscriptions, bridges, and monitor lists. Remove any
+  0.6.0-only keys (`[host_volume]`, `[[route]]`, `local_only`,
+  `card_first_channel`) from `/etc/tessera/config.d/*.toml` before starting a
+  0.5.x daemon, because unknown configuration keys are errors. On a speaker,
+  the kept `[appliance.volume]` and `volume.json` let a rolled-back portal
+  resume controlling the amplifier. With the bundle: run the 0.6.0 bundle's
+  `uninstall --yes` (not `--purge`) first: it removes
+  `config.d/60-host-volume.toml`, keeps a copy of the daemon state as
+  `/var/lib/tessera/state.toml.<version>` and prints the downgrade steps (the
+  0.5.x installer refuses while a newer version is installed); then install
+  with the 0.5.x bundle. To return to 0.6.0, install it, stop `tesserad`, copy
+  the kept `state.toml.<version>` back and start it. Details:
+  `packaging/bundle/README.md`.
+
+### Not in 0.6.0 (roadmap)
+
+- **Inbound MIDI port on Tessera** (exposing a rawmidi gadget, RTP-MIDI or TCP
+  listener for external software to control Tessera) is not implemented in 0.6.0;
+  Tessera connects out to control surfaces only.
+- **RTP-MIDI client** (`rtp_midi`), per-port delay/metering, router scenes, and
+  fixed-ratio sample-rate conversion for bridges whose card cannot match the
+  device rate remain future work.
+
 ## 0.5.2
 
 Tessera 0.5.2 is a packaging release. The daemon, the CLI and the portal are

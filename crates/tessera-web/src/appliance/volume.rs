@@ -28,13 +28,15 @@ use axum::response::{IntoResponse, Redirect, Response};
 use maud::{Markup, html};
 use serde::{Deserialize, Serialize};
 
-use crate::Shared;
-use crate::appliance::Appliance;
 use crate::appliance::camilla::{fill_class, parse_form_db, signed_db, snap_db};
 use crate::appliance::files::{read_regular, write_atomic};
 use crate::appliance::services::{Runner, sanitize};
+use crate::backend::HubMsg;
 use crate::config::VolumeConfig;
 use crate::pages::{is_live, live_answer, need_post};
+use crate::{AppState, Shared};
+use tessera_control_types::{Command, Event, Gain, HostVolumeStatus, Query, Reply, RequestBody};
+use tesseractl::client::ClientError;
 
 /// Absolute path of `amixer`.
 pub const AMIXER: &str = "/usr/bin/amixer";
@@ -275,8 +277,14 @@ pub enum Restored {
     Touched,
     /// The card or control never answered; the last reason.
     GaveUp(String),
-    /// The state file or `amixer sset` failed.
+    /// The state file, `amixer sset` or the hand-over to tesserad failed.
     Failed(String),
+    /// tesserad sets the volume; it had its own value or the portal had
+    /// none for it: nothing to do.
+    Daemon,
+    /// tesserad sets the volume from now on and took the portal's saved
+    /// value (dB), once.
+    Migrated(f64),
 }
 
 /// Set the saved volume again, once the card answers. `touched` is set by
@@ -344,14 +352,350 @@ pub async fn restore(
     Restored::GaveUp(last)
 }
 
-/// Start the restore on a task of its own, so the portal serves meanwhile.
-pub fn spawn_restore(a: Arc<Appliance>) {
-    let Some(cfg) = a.config.volume.clone() else {
+/// After a start without tesserad: how often the portal asks again
+/// whether tesserad sets the volume now (until it answers).
+pub const LATER_WAIT: Wait = Wait {
+    every: Duration::from_secs(10),
+    tries: u32::MAX,
+};
+
+/// Start the restore on a task of its own, so the portal serves meanwhile:
+/// [`start`]. When tesserad could not be reached, the portal has restored
+/// its own value and keeps asking ([`hand_over_later`]); once tesserad
+/// sets the volume, the portal keeps `volume.json` at its level
+/// ([`mirror`]).
+pub fn spawn_restore(st: Arc<AppState>) {
+    if st
+        .appliance
+        .as_ref()
+        .and_then(|a| a.config.volume.as_ref())
+        .is_none()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        // Subscribed first: no change is missed while the hand-over runs.
+        let events = st.hub.subscribe();
+        let (first, reached) = start(&st, START_WAIT).await;
+        let daemon = if reached {
+            matches!(first, Restored::Daemon | Restored::Migrated(_))
+        } else {
+            matches!(
+                hand_over_later(&st, LATER_WAIT).await,
+                Restored::Daemon | Restored::Migrated(_)
+            )
+        };
+        if daemon {
+            mirror(&st, events).await;
+        }
+    });
+}
+
+/// The host volume the daemon owns (`Status::host_volume`): `Ok(None)`
+/// when it reports none, `Err` when it cannot be asked.
+async fn daemon_volume(st: &AppState) -> Result<Option<HostVolumeStatus>, ClientError> {
+    match crate::call(st, RequestBody::Query(Query::Status)).await {
+        Ok(Reply::Status(s)) => Ok(s.host_volume),
+        Ok(other) => Err(ClientError::Protocol(format!(
+            "unexpected reply: {other:?}"
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// At start: who sets the amplifier's volume? Once the daemon owns it
+/// (`Status::host_volume`), the portal stops using `amixer` and, once,
+/// hands it the value it saved (`volume.json`) when the daemon has none
+/// saved yet and names the same card and control ([`migrate`]). While the
+/// daemon has no host volume (or cannot be reached within `wait`), the
+/// portal restores its saved value itself as before ([`restore`]).
+pub async fn restore_or_migrate(st: &AppState, wait: Wait) -> Restored {
+    start(st, wait).await.0
+}
+
+/// [`restore_or_migrate`], and whether tesserad answered: `false` when it
+/// could not be reached (or not understood) within `wait`, so the portal
+/// restored its own value and should hand it over later
+/// ([`hand_over_later`]).
+pub async fn start(st: &AppState, wait: Wait) -> (Restored, bool) {
+    let Some(a) = st.appliance.as_ref() else {
+        return (Restored::Nothing, true);
+    };
+    let Some(cfg) = a.config.volume.as_ref() else {
+        return (Restored::Nothing, true);
+    };
+    let tries = wait.tries.max(1);
+    let mut reached = false;
+    for attempt in 0..tries {
+        match daemon_volume(st).await {
+            Ok(Some(hv)) => return (migrate(st, cfg, &hv).await, true),
+            Ok(None) => {
+                reached = true;
+                break;
+            }
+            Err(ClientError::Connect { .. }) if attempt + 1 < tries => {
+                if attempt == 0 {
+                    tracing::info!("waiting for tesserad to know who sets the amplifier's volume");
+                }
+                tokio::time::sleep(wait.every).await;
+            }
+            Err(e) => {
+                tracing::warn!(%e, "tesserad cannot say whether it sets the amplifier's volume: the portal restores its own and asks again later");
+                break;
+            }
+        }
+    }
+    (
+        restore(&*a.runner, cfg, &a.volume_touched, wait).await,
+        reached,
+    )
+}
+
+/// After a start without tesserad: ask every `wait.every` until it
+/// answers, then hand the portal's saved value over as at start
+/// ([`migrate`]). The value is the one saved last, so a volume set with
+/// `amixer` meanwhile is the one handed over. A tesserad that does not set
+/// the volume leaves it to the portal (`Nothing`); never answering within
+/// `wait`: `GaveUp`.
+pub async fn hand_over_later(st: &AppState, wait: Wait) -> Restored {
+    let Some(cfg) = st.appliance.as_ref().and_then(|a| a.config.volume.as_ref()) else {
+        return Restored::Nothing;
+    };
+    let mut last = String::new();
+    for attempt in 0..wait.tries.max(1) {
+        if attempt > 0 {
+            tokio::time::sleep(wait.every).await;
+        }
+        match daemon_volume(st).await {
+            Ok(Some(hv)) => return migrate(st, cfg, &hv).await,
+            Ok(None) => return Restored::Nothing,
+            Err(e) => last = crate::explain(&e),
+        }
+    }
+    Restored::GaveUp(last)
+}
+
+/// Once tesserad sets the volume: keep the portal's `volume.json` at the
+/// level tesserad reports (`HostVolumeChanged`, and after a gap in the
+/// events or a configuration reload its status), so that a rollback to a
+/// portal or daemon without the hand-over restores the current level, not
+/// the one of the hand-over. Only while tesserad's control is the portal's
+/// (same card and control): that is checked at start and again after every
+/// reload or gap, so a reload that names another card never has its level
+/// written under the portal's card. A level of `off` (a mute step) is not
+/// written. Returns when the event stream closes.
+pub async fn mirror(st: &AppState, mut events: tokio::sync::broadcast::Receiver<HubMsg>) {
+    use tokio::sync::broadcast::error::RecvError;
+    let Some(cfg) = st.appliance.as_ref().and_then(|a| a.config.volume.as_ref()) else {
         return;
     };
-    tokio::spawn(async move {
-        restore(&*a.runner, &cfg, &a.volume_touched, START_WAIT).await;
-    });
+    // Is tesserad's control the portal's? `None`: not known (tesserad
+    // could not be asked); asked again before a level is written.
+    let check = || async {
+        match daemon_volume(st).await {
+            Ok(Some(hv)) => {
+                let same = hv.card == cfg.card && hv.control == cfg.control;
+                Some((same, same.then_some(hv.gain).flatten()))
+            }
+            Ok(None) => Some((false, None)),
+            Err(_) => None,
+        }
+    };
+    // The level now, and whether this control is the portal's at all.
+    let mut ours = match check().await {
+        Some((same, gain)) => {
+            if same {
+                keep(cfg, gain).await;
+            }
+            Some(same)
+        }
+        None => None,
+    };
+    loop {
+        match events.recv().await {
+            Ok(HubMsg::Event(Event::HostVolumeChanged { gain, .. })) => {
+                if ours.is_none() {
+                    ours = check().await.map(|(same, _)| same);
+                }
+                if ours == Some(true) {
+                    keep(cfg, gain).await;
+                }
+            }
+            Ok(
+                HubMsg::Event(Event::ConfigReloaded | Event::ConfigReloadedWithOrigin { .. })
+                | HubMsg::Resync,
+            )
+            | Err(RecvError::Lagged(_)) => {
+                ours = match check().await {
+                    Some((same, gain)) => {
+                        if same {
+                            keep(cfg, gain).await;
+                        }
+                        Some(same)
+                    }
+                    None => None,
+                };
+            }
+            Ok(HubMsg::Event(_)) => {}
+            Err(RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Write tesserad's level into `volume.json` (nothing for none or `off`,
+/// or when the file has it already). The file is read and written off the
+/// async workers.
+async fn keep(cfg: &VolumeConfig, gain: Option<Gain>) {
+    let Some(mdb) = gain.and_then(Gain::milli_db) else {
+        return;
+    };
+    let db = f64::from(mdb) / 1000.0;
+    let cfg = cfg.clone();
+    let wrote = tokio::task::spawn_blocking(move || {
+        if matches!(load(&cfg), Ok(Some(v)) if (v - db).abs() < 1e-6) {
+            return Ok(false);
+        }
+        save(&cfg, db).map(|()| true)
+    })
+    .await;
+    match wrote {
+        Ok(Ok(true)) => tracing::debug!(db, "volume.json follows tesserad's volume"),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => tracing::warn!(%e, "volume.json cannot follow tesserad's volume"),
+        Err(e) => tracing::warn!(%e, "volume.json cannot follow tesserad's volume"),
+    }
+}
+
+/// Hand the portal's saved volume to the daemon, once: only when the
+/// daemon has none saved (`gain: None`), for the same card and control.
+/// From then on the daemon restores it; the portal's file is left as it is
+/// (an older daemon after a rollback still finds it), and [`mirror`] keeps
+/// it at the level tesserad sets.
+pub async fn migrate(st: &AppState, cfg: &VolumeConfig, hv: &HostVolumeStatus) -> Restored {
+    if hv.gain.is_some() {
+        return Restored::Daemon;
+    }
+    if hv.card != cfg.card || hv.control != cfg.control {
+        tracing::warn!(portal_card = %cfg.card, daemon_card = %hv.card, "the portal's saved volume is for another card or control: not handed to tesserad");
+        return Restored::Daemon;
+    }
+    let loaded = {
+        let cfg = cfg.clone();
+        tokio::task::spawn_blocking(move || load(&cfg))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|loaded| loaded)
+    };
+    let db = match loaded {
+        Ok(Some(db)) => snap_db(
+            db,
+            f64::from(hv.min_mdb) / 1000.0,
+            f64::from(hv.max_mdb) / 1000.0,
+        ),
+        Ok(None) => return Restored::Daemon,
+        Err(e) => return Restored::Failed(e),
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let gain = Gain::MilliDb((db * 1000.0).round() as i32);
+    match crate::call(st, RequestBody::Command(Command::SetHostVolume { gain })).await {
+        Ok(_) => {
+            tracing::info!(
+                db,
+                "the portal's saved volume was handed to tesserad, which sets it from now on"
+            );
+            Restored::Migrated(db)
+        }
+        Err(e) => {
+            tracing::warn!(%e, "the portal's saved volume could not be handed to tesserad");
+            Restored::Failed(crate::explain(&e))
+        }
+    }
+}
+
+/// The Volume pane when tesserad sets the host volume: the same slider,
+/// posting `SetHostVolume` (`/host/volume`), and the daemon's mute
+/// (`/host/mute`). A non-motorized surface fader that owns the volume
+/// makes the slider read-only, with a link to it.
+#[must_use]
+pub fn host_pane(hv: &HostVolumeStatus, csrf: &str) -> Markup {
+    let (min, max) = (
+        f64::from(hv.min_mdb) / 1000.0,
+        f64::from(hv.max_mdb) / 1000.0,
+    );
+    let mid = (min + max) / 2.0;
+    let now = hv
+        .reading
+        .map(|r| r.gain)
+        .or(hv.gain)
+        .and_then(Gain::milli_db)
+        .map(|m| f64::from(m) / 1000.0);
+    let shown = now.unwrap_or(min).clamp(min, max);
+    html! {
+        div.pane id="volume" {
+            h2 { "Volume " span.n { "speaker output" } }
+            form.vol.live.locked[hv.gain_owner.is_some()] method="post" action="/host/volume" data-live-slider="volume" {
+                input type="hidden" name="csrf" value=(csrf);
+                input type="hidden" name="back" value=(VOLUME_ANCHOR);
+                div.readout {
+                    output.big for="volume-db" { @if let Some(v) = now { (signed_db(v)) } @else { "\u{2013}" } small { "dB" } }
+                    div.sub {
+                        (format!("{} dB is full scale", signed_db(max)))
+                        @if now.is_none() { " \u{b7} not set yet: tesserad leaves the card as it is" }
+                    }
+                }
+                div.slider {
+                    input id="volume-db" type="range" name="db" min=(min) max=(max) step="0.5" value=(format!("{shown:.1}"))
+                        class=(fill_class(shown, min, max)) aria-label="Volume, dB"
+                        aria-valuetext=(now.map_or_else(|| "not set".to_owned(), |v| format!("{} dB", signed_db(v))))
+                        aria-describedby=[hv.gain_owner.as_ref().map(|_| "volume-owner")]
+                        disabled[hv.gain_owner.is_some()];
+                    div.ticks { span { (signed_db(min)) } span { (signed_db(mid)) } span { (signed_db(max)) } }
+                }
+                div.apply {
+                    @if let Some(o) = &hv.gain_owner {
+                        span.owned id="volume-owner" { "Locked: set by the " a href=(crate::pages::surfaces::surface_anchor(o)) { bdi { (o) } " fader" } }
+                    } @else {
+                        button.btn.primary.nojs type="submit" { "Apply" }
+                    }
+                    span.note role="status" aria-live="polite" data-live-local {}
+                }
+            }
+            div.press {
+                form.inline method="post" action="/host/mute" data-live-post {
+                    input type="hidden" name="csrf" value=(csrf);
+                    input type="hidden" name="back" value=(VOLUME_ANCHOR);
+                    input type="hidden" name="muted" value=(if hv.muted { "false" } else { "true" });
+                    button.mute.on[hv.muted] type="submit" aria-pressed=(if hv.muted { "true" } else { "false" }) aria-label="Mute the speaker" {
+                        (if hv.muted { "Muted" } else { "Mute" })
+                    }
+                }
+                span.note data-live-local {}
+            }
+            @if let Some(p) = &hv.problem { p.flash.bad role="alert" { "The volume: " (p) } }
+            @if hv.reading.is_some_and(|r| r.muted) && !hv.muted {
+                p.flash.bad role="alert" { "The card's playback switch is off: nothing is heard at any volume. Mute and unmute once to switch it on." }
+            }
+        }
+    }
+}
+
+/// The daemon owns the host volume: an old form (a page loaded before)
+/// posting to the portal's amixer path is turned into the daemon's
+/// command, so the two never set the card against each other.
+async fn forward(
+    st: &Shared,
+    headers: &HeaderMap,
+    token: &str,
+    session: &str,
+    cmd: Command,
+    ok: String,
+    back: &str,
+) -> Response {
+    let kind = cmd.kind();
+    let r = crate::call(st, RequestBody::Command(cmd)).await;
+    tracing::info!(session = %session, command = kind, ok = r.is_ok(), "page command (portal volume forwarded)");
+    let r = r.map(|_| ok).map_err(|e| crate::pages::refusal(&e));
+    crate::pages::answer(st, token, headers, back, r, serde_json::json!({}))
 }
 
 /// Stderr words of `amixer` for a card it cannot find or open. A card the
@@ -465,6 +809,10 @@ pub struct VolumeForm {
     /// or `1` on release and from the plain form (set and store).
     #[serde(default)]
     commit: String,
+    /// Where to return without the script: only the Mixer page
+    /// ([`crate::mixer::back_to`]); otherwise the Volume pane.
+    #[serde(default)]
+    back: String,
 }
 
 /// The form's `commit`: `true` (the default, the plain form has no field),
@@ -490,6 +838,29 @@ pub async fn post(
         Ok(v) => v,
         Err(r) => return r,
     };
+    if let Ok(Some(hv)) = daemon_volume(&st).await {
+        let back = crate::mixer::back_to(&f.back).unwrap_or_else(|| VOLUME_ANCHOR.to_owned());
+        let Some(db) = parse_form_db(&f.db) else {
+            return (StatusCode::BAD_REQUEST, "db must be a finite number").into_response();
+        };
+        let db = snap_db(
+            db,
+            f64::from(hv.min_mdb) / 1000.0,
+            f64::from(hv.max_mdb) / 1000.0,
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let gain = Gain::MilliDb((db * 1000.0).round() as i32);
+        return forward(
+            &st,
+            &headers,
+            &token,
+            &s.id,
+            Command::SetHostVolume { gain },
+            format!("Volume {} dB.", signed_db(db)),
+            &back,
+        )
+        .await;
+    }
     let Some((a, cfg)) = st
         .appliance
         .as_ref()
@@ -529,7 +900,8 @@ pub async fn post(
         );
     }
     st.set_flash(&token, r.is_ok(), text);
-    Redirect::to(VOLUME_ANCHOR).into_response()
+    Redirect::to(&crate::mixer::back_to(&f.back).unwrap_or_else(|| VOLUME_ANCHOR.to_owned()))
+        .into_response()
 }
 
 /// The unmute form's field.
@@ -537,6 +909,10 @@ pub async fn post(
 pub struct UnmuteForm {
     #[serde(default)]
     csrf: String,
+    /// Where to return: only the Mixer page ([`crate::mixer::back_to`]);
+    /// otherwise the Volume pane.
+    #[serde(default)]
+    back: String,
 }
 
 /// `POST /speaker/volume/unmute`: switch the card's playback switch on, then back to
@@ -550,6 +926,19 @@ pub async fn post_unmute(
         Ok(v) => v,
         Err(r) => return r,
     };
+    if let Ok(Some(_)) = daemon_volume(&st).await {
+        let back = crate::mixer::back_to(&f.back).unwrap_or_else(|| VOLUME_ANCHOR.to_owned());
+        return forward(
+            &st,
+            &headers,
+            &token,
+            &s.id,
+            Command::SetHostMute { muted: false },
+            "The output is unmuted.".into(),
+            &back,
+        )
+        .await;
+    }
     let Some((a, cfg)) = st
         .appliance
         .as_ref()
@@ -564,7 +953,8 @@ pub async fn post_unmute(
         Err(m) => m.clone(),
     };
     st.set_flash(&token, r.is_ok(), text);
-    Redirect::to(VOLUME_ANCHOR).into_response()
+    Redirect::to(&crate::mixer::back_to(&f.back).unwrap_or_else(|| VOLUME_ANCHOR.to_owned()))
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1044,6 +1434,7 @@ mod tests {
             csrf: csrf.into(),
             db: db.into(),
             commit: commit.into(),
+            back: String::new(),
         };
         // No session: the login page; a wrong token: 403. Nothing is run.
         let r = post(

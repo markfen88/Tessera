@@ -31,3 +31,6 @@ pub mod plugin;
 pub mod bridge;
 
 pub use error::Error;
+
+#[cfg(feature = "mixer")]
+pub mod mixer;

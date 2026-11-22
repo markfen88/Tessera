@@ -36,7 +36,7 @@ configuration files are the other input: a reload is itself a command
 
 ## Stability
 
-`tessera-control-types` (`crates/tessera-control-types`, version 0.5.2) is the
+`tessera-control-types` (`crates/tessera-control-types`, version 0.6.0) is the
 typed public integration contract. Its rules:
 
 - Changes are **additive**. Most enums and structs are `#[non_exhaustive]`
@@ -180,20 +180,89 @@ The shapes above are the `tessera-control-types` `Request` and `Response` envelo
 | `set_clock_priority` | `priority` (0 to 255, lower wins) | `clock set-priority` |
 | `set_primary_interface` | `interface` (a name, or `null` to clear) | `network primary` |
 | `reload_config` | none | `config reload` |
-| `clear_configuration` | `device`, `keep_network` (default `false`); every value set at run time for the device returns to the configuration (name, labels, subscriptions, rate, encoding, latency, clock role and priority, its controller flows, and the primary interface selection unless `keep_network`); refused unless `[control] allow_factory_reset = true` | none (network controllers' factory reset and clear configuration) |
+| `clear_configuration` | `device`, `keep_network` (default `false`); every value set at run time for the device returns to the configuration (name, labels, channel gain and RX output level (except where a connected control surface fader owns them) and mute, subscriptions, rate, encoding, latency, clock role and priority, its controller flows, and the primary interface selection unless `keep_network`); refused unless `[control] allow_factory_reset = true` | none (network controllers' factory reset and clear configuration) |
 | `lock_access` | `device`, `pin` (exactly four digits); refused if already locked | `access lock` |
 | `unlock_access` | `device`, `pin`; a wrong PIN is `incorrect_pin`; after five, unlocking from that kind of client pauses for 60 s | `access unlock` |
 | `reset_access_lock` | `device`; unlock without the PIN, only from a local administrator on the control socket (the portal and network controllers get `permission_denied`) | `access reset` |
 | `route_receiver` | `expectation` (from a receiver page), `change` (`connect`, `replace` or `disconnect`, with source references from the routing inventory); one receiver change, checked again and never retried | `routing execute` |
+| `set_channel_mute` | `target` (`device`, `direction` (`rx`/`tx`), `channels`: 1-based, at least one), `muted`; never owned by a control surface (provisional 0.x) | `mute`, `unmute` |
+| `set_channel_gain` | `target` (as above), `gain` (`"off"` or `{"milli_db":N}`, −96000 to 12000; 0 is unity); refused with `gain_owned` for a channel whose gain the fader (without a motor) of a connected control surface sets, unless the surface itself sends it (provisional 0.x) | `gain` |
+| `set_output_mute` | `target` (RX channels), `muted`; output stage after the local mix, never owned (provisional 0.x) | `output-mute` |
+| `set_output_gain` | `target` (RX channels), `gain`; output stage (`HostOut` level). Refused with `level_owned` while a connected non-motorized `port_gain` fader owns that `host_out` port (`output_gain` bindings do not own it) (provisional 0.x) | `output-gain` |
+| `set_card_bridge` | `bridge` (`CardBridgeSpec`: `name`, `enabled`, `device`, `card`, `direction`, `first_channel`, `channels`, `card_first_channel`, `local_only`, `period_frames`); replaces a runtime bridge of that name, refused with `locked` for a `[[bridge]]` in config files (provisional 0.x) | `bridge add` |
+| `remove_card_bridge` | `name`; removes a runtime card bridge (`not_found` if absent) (provisional 0.x) | `bridge remove` |
+| `set_monitor` | `device`, `rx_from_tx` (array of 1-based TX channels, 0 = none), `delay_us` (default 0 = auto) (provisional 0.x) | `monitor` |
+| `set_surface` | `surface` (`SurfaceSpec`: `name`, `enabled`, `source` (`hidraw`, `midi`, or `tcp_midi`), `controls`, `bindings`); adds or replaces a control surface. Bindings support `gain`/`mute`, `output_gain`/`output_mute`, `host_volume`/`host_mute`, `port_gain`/`port_mute`, `crosspoint_gain`/`crosspoint_mute`, and `follow` (the control acts exactly like the followed control: the daemon applies that control's bindings with the followed surface as origin, through chains, and moves the followed desk's control; a `follow` binding owns no level itself) (provisional 0.x) | `surface set`, `surface tcp-midi` |
+| `remove_surface` | `name`; `not_found` if there is none | `surface remove` |
+| `report_surface_connection` | `name`, `connected`, `epoch` (optional: the surface's `connection_epoch` from `surfaces`); the daemon's own report that a surface's device was opened or lost (origin `internal` only, else `permission_denied`). `connected: true` is refused with `invalid` for a disabled surface and for an `epoch` that is no longer current (field `epoch`: read `surfaces` again); `connected: false` with an old `epoch` changes nothing. Decides fader ownership; never saved | none |
+| `set_router` | `router` (`RouterSpec`: `crosspoints`, `labels`); replaces the saved host-router grid and local port labels (only labels that differ from the default are saved; only new or changed labels are checked); refuses loops through taps and bridge-implied pairs (provisional 0.x) | `router set` |
+| `reset_router` | none; forgets the saved grid so the default grid (identity, monitoring, `[[route]]`) applies again; port labels and levels stay (provisional 0.x) | `router reset` |
+| `set_crosspoint` | `crosspoint` (`source`, `destination`, `gain`, `muted`); adds or replaces one crosspoint (saves the default grid first if none is saved) (provisional 0.x) | `router patch` |
+| `remove_crosspoint` | `source`, `destination`; removes one crosspoint from the saved grid (provisional 0.x) | `router unpatch` |
+| `set_crosspoint_gain` | `crosspoints` (array of `CrosspointKey`), `gain`; refused with `level_owned` when owned by a non-motorized fader (provisional 0.x) | `router gain` |
+| `set_crosspoint_mute` | `crosspoints`, `muted`; never owned (provisional 0.x) | `router mute` |
+| `set_port_gain` | `ports` (array of `RouterPort`), `gain`; on network ports and `host_out`, updates channel gain / output level; refused with `gain_owned` / `level_owned` when owned (provisional 0.x) | `router port-gain` |
+| `set_port_mute` | `ports`, `muted`; never owned (provisional 0.x) | `router port-mute` |
+| `set_host_volume` | `gain` (`"off"` or within `[host_volume]` range); `unsupported` without `[host_volume]`, `level_owned` when owned by a fader (provisional 0.x) | `volume set` |
+| `set_host_mute` | `muted`; never owned (provisional 0.x) | `volume mute` |
+| `set_mixer` | `mixer` (`MixerSpec`: `id`, `title`, `strips`); adds or replaces a saved mixer panel; changes no audio, creates no surface binding; `invalid_mixer` on validation failure (provisional 0.x) | `mixer set` |
+| `remove_mixer` | `id`; removes a saved mixer panel (`not_found` if absent) (provisional 0.x) | `mixer remove` |
+| `set_port_label` | `port` (an `app_out`, `host_out`, `card_in` or `card_out` port), `label` (1 to 31 ASCII bytes without `=`, `.` or `@`; `null` or absent: the default label again). Only this label is checked; the grid and other labels are kept. A new label needs a port that exists. Network channels use `set_channel_label` | `router label` |
+
+Router, host volume and surfaces under the device access lock: a router
+command is refused with `access_locked` when it names a port of a locked
+device or would change the effective crosspoints (patched or not, gain,
+mute), labels or levels of one; `set_router` and `reset_router` are judged by
+that change alone (an empty `set_router` on the default grid is refused while
+the device it routes is locked; resending the grid unchanged with a new card
+label is not). `set_host_volume`, `set_host_mute` and a `set_surface` /
+`remove_surface` whose bindings, old or new, drive the host volume or mute
+(directly or through `follow` bindings) are refused while any device is
+locked. Mixer panels change no audio and are not covered.
+
+Fader priority covers every level a non-motorized fader owns: besides
+`set_channel_gain`, `set_port_gain`, `set_crosspoint_gain` and
+`set_host_volume`, a `set_router`, `reset_router`, `set_crosspoint` or
+`set_monitor` that would change the gain of an owned crosspoint (one that
+stays patched) is refused with `level_owned` unless the owning surface sends
+it, and so is one that patches again, at another gain, an owned crosspoint
+that was unpatched while its fader owned it (the gain it had then is
+remembered until it is patched again; runtime, never saved). Patching,
+unpatching and mute are otherwise never owned. A `follow` binding drives
+the followed control's bindings as the followed surface, so fader priority
+judges it as that surface.
 
 `device` is the device key (`[[device]] id`), not its name. Examples:
 
 ```json
 {"set_latency":{"device":"main","latency":6000}}
 {"set_channel_label":{"device":"main","direction":"rx","channel":3,"label":null}}
+{"set_channel_gain":{"target":{"device":"main","direction":"tx","channels":[1,2]},"gain":{"milli_db":-6000}}}
 {"set_primary_interface":{"interface":"enp4s0"}}
 "reload_config"
 ```
+
+A gain (in `set_channel_gain`, `channel_gain_changed` and a channel's `gain` in
+`devices`) travels in one of two shapes: the
+string `"off"` (silence, a fader at the bottom of its travel) or an object
+`{"milli_db": N}` with N an integer from −96000 to 12000 thousandths of a dB
+(`{"milli_db": 0}` is unity, the default; `{"milli_db": -6000}` is −6 dB).
+There is no float form and no `-inf`: a value outside the range is refused
+with `invalid` (field `gain`); below −96 dB, use `"off"`.
+
+Gain ownership (provisional 0.x): only channels the device has now are owned;
+a surface binding whose channels are gone (the count shrank) owns nothing and
+is kept, so the surface can still be disabled, edited or removed (targets are
+checked for enabled surfaces only, and a target the enabled surface already
+has saved is not checked again). A `set_surface` that adds a surface, changes
+its `source`, or enables or disables it ends its connection and gives it a new
+`connection_epoch` (in `surfaces`; runtime, never saved): the daemon reports
+the connection again, under the new epoch, once the device is open, also when
+two such edits came too fast for it to close the device in between.
+`clear_configuration` keeps the channel gains and RX output levels a
+connected fader owns (router port levels, crosspoint gains and the host
+volume are not device settings and stay as they are). A dry run or impact preview of
+`set_channel_gain` on an owned channel answers `gain_owned` like the command.
 
 A key listed in `locked` in the configuration is refused with `locked`. A
 value outside its bounds is refused with `invalid` and the field and reason.
@@ -205,9 +274,11 @@ With the native device role (`--native-device`) the daemon requests a flow for
 each subscription itself (see Status below and
 [interoperability.md](interoperability.md#native-device-role)).
 
-There is no command for host flows or bridges: they are configuration, and
-`reload_config` applies them. The flows a controller sets up are the exception:
-`set_protocol_flows` replaces that set as a whole.
+There is no command for host `[[flow]]` entries: they are configuration, and
+`reload_config` applies them. Controller flows (`set_protocol_flows`) and
+runtime card bridges (`set_card_bridge` / `remove_card_bridge`) are commands
+(bridges declared in configuration files stay file-owned and cannot be edited
+by command).
 
 ---
 
@@ -215,11 +286,16 @@ There is no command for host flows or bridges: they are configuration, and
 
 | Query | Reply | `tesseractl` |
 |-------|-------|--------------|
-| `"status"` | `{"status": Status}` | `status` |
+| `"status"` | `{"status": Status}` | `status`, `volume show` |
 | `{"device":{"device":"main"}}` | `{"device": DeviceStatus}` | `status --device main` |
 | `"metrics"` | `{"metrics": Metrics}` | `metrics` |
 | `"effective_config"` | `{"effective_config": "<TOML text>"}`: the merged files with the values stored at run time applied | `config show --effective` |
-| `"bridges"` | `{"bridges": [BridgeStatus, ...]}` | `bridges` |
+| `"bridges"` | `{"bridges": [BridgeStatus, ...]}` | `bridges`, `bridge list` |
+| `"surfaces"` | `{"surfaces": SurfacesReport}`: detected devices and configured control surfaces with live values (provisional 0.x) | `surfaces` |
+| `{"learn_control":{"device":ID,"timeout_ms":N,"moving_up":B}}` | `{"learned_control": LearnedControl or null}` (administrators only; provisional 0.x) | `surface learn` |
+| `"surface_profiles"` | `{"surface_profiles": [SurfaceProfileInfo, ...]}`: built-in and installed profiles (provisional 0.x) | none (used by portal) |
+| `"router"` | `{"router": RouterReport}`: every port, level, and effective or saved crosspoint (provisional 0.x) | `router show` |
+| `"mixers"` | `{"mixers": [MixerSpec, ...]}`: saved mixer panels in id order (provisional 0.x) | `mixer list` |
 
 Other replies: `"done"` (a command succeeded; also the acknowledgement of
 `subscribe_events`), `{"event": Event}` and `{"lagged":{"dropped":N}}` on an
@@ -250,9 +326,22 @@ response per event, all with the subscription request's `id`:
 | `runtime_value_changed` | `field` (full path), `origin`; runtime intent queued for `state.toml` |
 | `access_lock_changed` | `device`, `locked`, `origin`; carries no PIN |
 | `receiver_operation_changed` | `result`: progress of a `route_receiver` operation (no audio assertion) |
+| `channel_mute_changed` | `target` (the channels that changed), `muted`, `origin` |
+| `channel_gain_changed` | `target` (the channels that changed), `gain`, `origin` |
+| `output_mute_changed` | `target` (RX channels), `muted`, `origin` |
+| `output_gain_changed` | `target` (RX channels), `gain`, `origin` |
+| `surfaces_changed` | `origin`; a control surface was added, replaced, removed, connected or lost (re-read `surfaces`) |
+| `router_changed` | `origin`; the host-router grid, labels, or available ports changed (re-read `router`) |
+| `crosspoint_gain_changed` | `crosspoints`, `gain`, `origin` |
+| `crosspoint_mute_changed` | `crosspoints`, `muted`, `origin` |
+| `port_gain_changed` | `ports` (local ports: `app_out`, `card_in`, `card_out`), `gain`, `origin` |
+| `port_mute_changed` | `ports` (local ports), `muted`, `origin` |
+| `host_volume_changed` | `gain` (`Gain` or `null`), `muted`, `origin` |
+| `mixer_changed` | `id` (panel id, also on removal), `origin` |
 
 `origin` is `{"cli":{"uid":N}}`, `"config"`, `"internal"`,
-`{"protocol":{"peer":"..."}}` or `{"api":{"principal":"..."}}`. The compatibility
+`{"protocol":{"peer":"..."}}`, `{"api":{"principal":"..."}}` or
+`{"surface":{"name":"..."}}` (a control surface's buttons and faders). The compatibility
 adapter uses peer `controller-compatibility`: its historical command supplies
 no remote controller address. Other socket commands, including the portal's,
 arrive as `cli` with the caller's uid. `protocol_command` is accepted only for
@@ -324,6 +413,11 @@ and gets `lagged`; re-read `status` then.
 | `{"unsupported":{"what":W}}` | not supported by this daemon | 501 |
 | `{"internal":{"message":M}}` | a bug or an internal failure | 500 |
 | `{"confirmation_required":{"impact":I}}` | the change restarts something: confirm it (see Envelopes) | 409 |
+| `{"access_locked":{"device":D}}` | the device access lock refuses the change | 409 |
+| `"incorrect_pin"` | `unlock_access` with the wrong four-digit PIN | 403 |
+| `{"gain_owned":{"device":D,"direction":R,"channel":C,"surface":S}}` | the channel's gain is set by the fader of connected control surface `S`; nothing changed, mute is still available | 409 |
+| `{"level_owned":{"what":W,"surface":S}}` | a host volume, router port level, host output level or crosspoint gain is set by the non-motorized fader of connected surface `S`; mute is still available | 500 *(portal maps unrecognised variants to 500)* |
+| `{"invalid_mixer":{"reason":R}}` | a `set_mixer` panel failed validation | 500 *(portal maps unrecognised variants to 500)* |
 | `{"response_too_large":{"size":N,"limit":L,"key":"control.max_frame_bytes"}}` | the reply did not fit the daemon's frame limit; raise the key | 502 |
 
 `tesseractl` prints the error's text form (`sample_rate is locked by the
@@ -338,12 +432,13 @@ configuration`) and exits with 1, or with 4 for `permission_denied`.
 | Field | Content |
 |-------|---------|
 | `version` | daemon version |
-| `devices` | `DeviceStatus` per device: `key`, `name`, `sample_rate`, `encoding`, `latency`, `rx_channels` and `tx_channels` (`channel`, `label`), `subscriptions`, `locked`, `access_locked` (`true` while the device access lock is set, absent when open), and `formats` (absent from older daemons): `sample_rates` and `encodings`, the values the device can be set to now (exactly what `set_sample_rate` and `set_encoding` accept, the current value included, ascending; a network controller is offered the same lists), and `sample_rate_pin` / `encoding_pin`, null while another value is accepted, else why not: `"configuration"` (`locked`), `{"bridge":{"name":N,"sample_rate":HZ}}` (an enabled `[[bridge]]` pins the rate) or `"unsupported"` |
+| `devices` | `DeviceStatus` per device: `key`, `name`, `sample_rate`, `encoding`, `latency`, `rx_channels` and `tx_channels` (`channel`, `label`, `gain`, `muted`, `gain_owner`, and on RX `output_gain`, `output_muted`, `output_gain_owner`: the connected `PortGain` surface on `HostOut`), `subscriptions`, `locked`, `access_locked` (`true` while the device access lock is set, absent when open), `monitor_rx_from_tx`, `monitor_delay_us`, and `formats` (absent from older daemons): `sample_rates` and `encodings`, the values the device can be set to now (exactly what `set_sample_rate` and `set_encoding` accept, the current value included, ascending; a network controller is offered the same lists), and `sample_rate_pin` / `encoding_pin`, null while another value is accepted, else why not: `"configuration"` (`locked`), `{"bridge":{"name":N,"sample_rate":HZ}}` (an enabled `[[bridge]]` pins the rate) or `"unsupported"` |
 | `clocks` | `ClockStatus` per interface: `interface`, `state` (`free_running`, `listening`, `acquiring`, `locked`, `holdover`, `leader`), `timestamping` (`hardware`/`software`), `offset_ns`, `rate_ppb`, `grandmaster`, `epoch`, `runner_starts`, `commands_applied`, `commands_rejected` |
 | `clock_settings` | `role`, `priority`, `locked` (may be absent from older daemons) |
 | `network` | `NetworkStatus`: `primary`, `source` (`locked`, `selected`, `configured`, `automatic`, `fallback`), `selected`, `locked`, `allow_wireless`, `interfaces` (`name`, `mac`, `ipv4`, `carrier`, `wireless`, `is_virtual`, `usable`, `reason`); may be absent |
 | `warnings` | human-readable health warnings |
 | `bridges` | `BridgeStatus` per `[[bridge]]` (empty without bridges) |
+| `host_volume` | `HostVolumeStatus` when `[host_volume]` is configured (absent otherwise): `card`, `control`, `min_mdb`, `max_mdb`, saved `gain`/`muted`, last hardware `reading` (`gain`, `muted`), fader `gain_owner` (`owner` is still read), `problem` |
 
 `SubscriptionStatus`: `rx_channel`, `tx_channel`, `tx_device`, `state`,
 `effective_latency`. The type defines these states:
@@ -398,7 +493,7 @@ are at most about a second old.
 
 | Field | Meaning |
 |-------|---------|
-| `name`, `device`, `card`, `direction` (`playback`/`capture`), `first_channel`, `channels` | identity |
+| `name`, `device`, `card`, `direction` (`playback`/`capture`), `first_channel`, `channels`, `card_first_channel`, `local_only` | identity and channel mapping (`card_first_channel` defaults to 1; `local_only`: opened for the host router only) |
 | `state` | `starting`, `running`, `reopening` (retrying with back-off, see `last_error`), `failed` (until the configuration changes), `disabled` |
 | `fill_frames` | frames queued in the card |
 | `position_error_frames` | the loop's error against the media clock (playback: positive is behind) |
@@ -425,6 +520,10 @@ small objects:
 | `status --device KEY` | `DeviceStatus` (`{"key": ..., "latency": ..., ...}`) |
 | `metrics` | `Metrics` (`{"daemon": ..., "engine": ..., "flows": [...], ...}`) |
 | `bridges` | an array of `BridgeStatus` (`[]` without bridges) |
+| `surfaces` | `SurfacesReport` (`{"detected": [...], "surfaces": [...]}`) |
+| `router show` | `RouterReport` (`{"saved": ..., "ports": [...], "crosspoints": [...]}`) |
+| `volume show` | `HostVolumeStatus` or `null` |
+| `mixer list` | an array of `MixerSpec` (`[]` when no panel is saved) |
 | a successful change | `{"ok":true}` (`tesseractl`'s own) |
 | `clock show` | `{"settings": ClockSettings or null, "clocks": [ClockStatus, ...]}` (`tesseractl`'s own) |
 | `network show` | `NetworkStatus` or `null` |

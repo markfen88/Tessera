@@ -112,6 +112,15 @@ pub struct RoutingReceiverChannel {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub expectation: Option<ReceiverExpectation>,
+    /// A flow from the receiving host's own configuration (`[[flow]]`) that
+    /// carries this input, outside any controller subscription. Read-only
+    /// here: it changes only with the configuration. Only this host's own
+    /// receiver reports it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub config_flow: Option<ConfigFlowFeed>,
 }
 impl RoutingReceiverChannel {
     #[must_use]
@@ -127,6 +136,59 @@ impl RoutingReceiverChannel {
             source,
             raw_status,
             expectation: None,
+            config_flow: None,
+        }
+    }
+}
+
+/// A configuration flow feeding one receiver input, as the receiving host
+/// sees it. The source is matched by the flow's peer address against a
+/// discovered device's advertised address, and by channel order (wire
+/// position `n` is that device's TX channel `n`); it is not verified audio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct ConfigFlowFeed {
+    /// `[[flow]] id`.
+    pub id: String,
+    /// The flow's permitted sender (or its multicast group), when set.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub peer: Option<String>,
+    /// This input's 1-based position on the wire.
+    pub position: u16,
+    /// The discovered TX channel at that position of the peer, when exactly
+    /// one discovered device advertises the peer address and that channel.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub source: Option<RoutingSourceRef>,
+    /// The names of that source, for display.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub source_names: Option<ReceiverSelection>,
+    /// Local packet activity of the flow (`receiving`, `no_media`, …).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub media: Option<SubscriptionState>,
+}
+impl ConfigFlowFeed {
+    #[must_use]
+    pub fn new(id: impl Into<String>, position: u16) -> Self {
+        Self {
+            id: id.into(),
+            peer: None,
+            position,
+            source: None,
+            source_names: None,
+            media: None,
         }
     }
 }

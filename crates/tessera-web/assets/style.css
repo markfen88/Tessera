@@ -80,6 +80,21 @@ ul { margin: 0 0 10px; padding-left: 20px; }
 .nav a { padding: 6px 12px; border-radius: 999px; color: var(--muted); font-size: 14px; font-weight: 500; }
 .nav a:hover { color: var(--text); }
 .nav a.cur { background: var(--surface-3); color: var(--text); }
+.nav .navgroup { display: flex; flex-wrap: wrap; gap: 4px; padding-left: 4px; border-left: 1px solid var(--border); }
+.nav a[aria-current="page"] { background: var(--surface-3); color: var(--text); }
+/* The phone's menu button: the same links in their groups. */
+.navmenu { display: none; }
+.navmenu > summary { display: inline-flex; align-items: center; gap: 8px; list-style: none; cursor: pointer; padding: 8px 14px; min-height: 44px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); font-size: 15px; font-weight: 600; }
+.navmenu > summary::-webkit-details-marker { display: none; }
+.navmenu > summary:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.navmenu > summary .where { font-weight: 500; color: var(--muted); }
+.navmenu .burger { display: grid; gap: 3px; width: 16px; }
+.navmenu .burger i { display: block; height: 2px; border-radius: 1px; background: currentColor; }
+.navmenu nav { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 6px 16px; }
+.navmenu .navhead { margin: 0 0 2px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+.navmenu ul { list-style: none; margin: 0; padding: 0; }
+.navmenu li a { display: block; padding: 8px 6px; min-height: 40px; border-radius: 8px; color: var(--text); }
+.navmenu li a.cur { background: var(--surface-3); font-weight: 600; }
 .seg { display: flex; padding: 3px; border-radius: 999px; background: var(--surface); border: 1px solid var(--border); margin: 0; }
 .seg button { border: 0; background: transparent; color: var(--muted); padding: 5px 10px; border-radius: 999px; font-size: 13px; cursor: pointer; }
 .seg button:hover { color: var(--text); }
@@ -100,6 +115,7 @@ form.logout { margin: 0; }
 .state .sub { display: block; }
 .card > :last-child { margin-bottom: 0; }
 .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+.level-cols { grid-template-columns: repeat(auto-fit, minmax(min(100%, 680px), 1fr)); }
 
 /* flash messages */
 .flash { padding: 10px 14px; border-radius: 12px; border: 1px solid; margin: 0 0 14px; font-size: 14px; }
@@ -286,7 +302,8 @@ svg.signal .legend { fill: var(--muted); font-size: 12px; }
 /* phones */
 @media (max-width: 719px) {
   .app { padding: 12px 12px 20px; }
-  .nav { margin-left: 0; width: 100%; justify-content: center; }
+  .nav { display: none; }
+  .navmenu { display: block; width: 100%; }
   .chips { margin-left: 0; }
   .vol, .master .vol { grid-template-columns: 1fr; }
   .master .panes { grid-template-columns: 1fr; gap: 22px; }
@@ -313,9 +330,12 @@ svg.signal .legend { fill: var(--muted); font-size: 12px; }
 .routing-stale { margin-top: 12px; }
 .routing-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); margin: 12px 0 10px; }
 .routing-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+/* A sentence in the legend flows as text: its full stop stays by its link. */
+.routing-legend > span.legend-note { display: block; }
 .route-dot { font-style: normal; width: 18px; height: 18px; border: 1px solid var(--border-strong); border-radius: 3px; display: inline-grid; place-items: center; font-size: 12px; }
 .receiving { color: var(--ok); } .confirmed { color: var(--accent); } .no-media { color: var(--warn); }
 .pending { color: var(--warn); } .unavailable { color: var(--faint); }
+.route-dot.local-mix { border-style: dashed; color: var(--warn); }
 .routing-board {
   --rt-band: 112px;     /* receiver device band height */
   --rt-chan: 76px;      /* receiver channel header height */
@@ -397,7 +417,12 @@ svg.signal .legend { fill: var(--muted); font-size: 12px; }
 .route-cell.confirmed { background: var(--accent-soft); border-color: var(--accent); }
 .route-cell.no-media { background: var(--warn-soft); border-color: var(--warn); }
 .route-cell.unavailable { border-color: transparent; cursor: not-allowed; font-size: 13px; }
+.route-cell.local-mix { border-style: dashed; color: var(--muted); }
+.route-cell.local-mix.on { background: var(--warn-soft); border: 1px solid var(--warn); color: var(--text); }
+a.route-cell.local-mix.readonly { text-decoration: none; cursor: pointer; }
+.routing-feed { color: var(--muted); font-size: 12px; }
 .route-cell:disabled { cursor: not-allowed; }
+.route-cell.config-flow { border-style: dashed; cursor: help; }
 .route-cell:hover:not(:disabled), .route-cell:focus-visible { border-color: var(--accent-2); outline: 2px solid var(--accent-2); outline-offset: 1px; background: var(--accent-soft); }
 .routing-matrix tr:has(.route-cell:hover, .route-cell:focus-visible) .routing-tx-channel { background: var(--surface-3); }
 .routing-matrix tr:has(.route-cell:hover, .route-cell:focus-visible) .routing-crosspoint { background: color-mix(in srgb, var(--surface) 88%, var(--accent)); }
@@ -439,3 +464,304 @@ svg.signal .legend { fill: var(--muted); font-size: 12px; }
   .routing-scroll { max-height: 60vh; }
   .routing-heading .actions { width: 100%; }
 }
+
+/* Channel gain and mute (Device page): a pill toggle and a slider with its
+   dB readout. A slider whose gain a surface fader sets is read-only. */
+.mute { border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--muted); padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.mute:hover:not(:disabled) { color: var(--text); border-color: var(--bad); }
+.mute.on { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+.mute:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+td .note:empty { display: none; }
+td.gain-cell { min-width: 230px; }
+form.gain { display: grid; grid-template-columns: minmax(120px, 1fr) 6.5em auto; gap: 2px 10px; align-items: center; margin: 0; }
+form.gain .readout { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; white-space: nowrap; }
+form.gain .owned, form.gain .note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+form.gain .note:empty { display: none; }
+form.gain .nojs { grid-row: 1; grid-column: 3; }
+form.gain input[type=range]:disabled { cursor: not-allowed; }
+/* Locked (a surface fader owns the gain): a hatched grey track, a hollow
+   grey thumb and a framed note naming the fader, so it never reads as a
+   slider that is merely pale. */
+form.gain.locked { padding: 4px 8px; border: 1px dashed var(--border-strong); border-radius: 10px; background: var(--surface-2); }
+form.gain.locked input[type=range]::-webkit-slider-runnable-track { background: repeating-linear-gradient(135deg, var(--track) 0 6px, transparent 6px 10px); }
+form.gain.locked input[type=range]::-moz-range-track { background: repeating-linear-gradient(135deg, var(--track) 0 6px, transparent 6px 10px); }
+form.gain.locked input[type=range]::-moz-range-progress { background: var(--faint); }
+form.gain.locked input[type=range]::-webkit-slider-thumb { background: var(--surface-3); border: 2px solid var(--faint); box-shadow: none; }
+form.gain.locked input[type=range]::-moz-range-thumb { background: var(--surface-3); border: 2px solid var(--faint); box-shadow: none; }
+form.gain.locked .readout { color: var(--muted); }
+form.gain.locked .owned { color: var(--text); font-weight: 600; }
+form.gain.locked .owned a { color: var(--accent); text-decoration: underline; }
+
+/* Control surfaces: a card per surface, a tile per control with its live
+   value (a meter for faders, a lamp for buttons) and its mappings. */
+.surface-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.surface-actions { display: flex; gap: 10px 18px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.surface-actions form.inline { gap: 10px; }
+.surface-actions .note:empty { display: none; }
+.controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); grid-auto-flow: row dense; gap: 12px; margin-bottom: 6px; align-items: start; }
+/* A control whose mapping or advanced form is open takes the whole row, so
+   its neighbours keep their size. */
+.control:has(details.edit[open]) { grid-column: 1 / -1; }
+.controls-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 0 0 10px; }
+.controls-filter fieldset { border: 0; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.controls-filter .count { color: var(--muted); font-size: 13px; }
+.control { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; background: var(--surface-2); min-width: 0; }
+.control-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.control-name { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.control-name .tag { margin-left: 2px; }
+.fader { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.fader .val { font-weight: 600; color: var(--text); }
+.fader .raw { font-size: 11px; color: var(--faint); }
+meter { width: 140px; height: 10px; border: 0; border-radius: 999px; background: var(--track); }
+meter::-webkit-meter-bar { background: var(--track); border: 0; border-radius: 999px; height: 10px; }
+meter::-webkit-meter-optimum-value { background: var(--accent); border-radius: 999px; }
+meter::-moz-meter-bar { background: var(--accent); border-radius: 999px; }
+.led { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.led::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--track); }
+.led.on { color: var(--text); font-weight: 600; }
+.led.on::before { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+ul.bindings { list-style: none; padding: 0; margin: 6px 0; display: grid; gap: 6px; }
+ul.bindings li { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 14px; }
+ul.bindings .words { flex: 1 1 200px; }
+ul.bindings details.edit { margin: 0; }
+ul.bindings details.edit[open] { flex-basis: 100%; order: 3; }
+details.edit { margin-top: 6px; }
+details.edit > summary, details.manual > summary { cursor: pointer; color: var(--accent); font-size: 13px; font-weight: 600; }
+details.manual { margin-top: 12px; }
+details.edit[open] > form, details.manual[open] > form { margin-top: 10px; }
+fieldset { border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px 10px; margin: 0 0 10px; min-width: 0; }
+legend { color: var(--muted); font-size: 13px; padding: 0 4px; }
+label.check, form.fields label.check { display: flex; flex-direction: row; align-items: center; gap: 6px; font-size: 14px; color: var(--text); padding: 3px 0; cursor: pointer; }
+input[type=checkbox] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); flex: none; }
+form.fields fieldset { flex-basis: 100%; }
+fieldset.target { margin: 6px 0; }
+fieldset.target legend label.check { font-weight: 600; }
+fieldset.target .chans { display: flex; flex-wrap: wrap; gap: 2px 16px; }
+/* A group whose RX/TX button is not chosen: its boxes are faded, and a box
+   ticked there is called out (the server refuses such ticks; the script
+   chooses the group as soon as one of its boxes is ticked). */
+fieldset.target:not(:has(input[type=radio]:checked)) .chans { opacity: .45; }
+fieldset.target:not(:has(input[type=radio]:checked)):has(input[type=checkbox]:checked) { border-color: var(--warn); }
+fieldset.target:not(:has(input[type=radio]:checked)):has(input[type=checkbox]:checked)::after { content: "Not chosen: these ticks are not used. Choose this group, or untick them."; display: block; color: var(--warn); font-size: 13px; margin-top: 4px; }
+label.check > span { min-width: 0; }
+/* A choice that cannot be taken: greyed, its reason in the label. The
+   radio is drawn (a dashed, filled ring), not merely faded: a faded native
+   radio all but disappears. */
+label.check.unavailable { cursor: not-allowed; color: var(--muted); align-items: flex-start; }
+label.check.unavailable input[type=radio]:disabled { appearance: none; flex: none; width: 18px; height: 18px; margin: 1px 0 0; border: 2px dashed var(--border-strong); border-radius: 50%; background: var(--surface-2); opacity: 1; cursor: not-allowed; }
+[data-kinds][hidden] { display: none !important; }
+fieldset.range { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+fieldset.range label, form.binding > label, .mapping > label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 13px; }
+form.fields > .mapping, form.fields > details { flex-basis: 100%; }
+.mapping h3 { margin: 4px 0 2px; }
+.mapping > p.muted { margin: 0 0 6px; }
+details.advanced > summary { cursor: pointer; color: var(--accent); font-size: 13px; font-weight: 600; }
+details.advanced > .fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 10px; }
+details.advanced > .fields label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 13px; }
+details.advanced > .fields > p { flex-basis: 100%; margin: 0; }
+/* Sound cards on the Surfaces page: audio devices, listed for reference. */
+tr.audio td { color: var(--muted); }
+form.binding > label { margin-bottom: 10px; max-width: 200px; }
+form.learn fieldset { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+form.learn .note { margin-top: 6px; font-size: 14px; }
+@media (max-width: 719px) {
+  .controls { grid-template-columns: 1fr; }
+  /* The level tables: one card per channel, its name and mute on top, each
+     level a labelled full-width slider, so nothing scrolls out of view. */
+  table.levels thead { display: none; }
+  table.levels, table.levels tbody, table.levels tr, table.levels td { display: block; width: 100%; }
+  table.levels tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; }
+  table.levels td { border-top: 0; padding: 2px 0; }
+  table.levels td.chan { font-weight: 600; overflow-wrap: anywhere; }
+  table.levels td.mute-cell { width: auto; }
+  table.levels td.gain-cell { grid-column: 1 / -1; }
+  table.levels td[data-label]::before { content: attr(data-label); display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+  table.levels form.gain { grid-template-columns: minmax(0, 1fr) 6em auto; }
+  /* The devices table: one card per row, each cell a labelled line. */
+  table.stack thead { display: none; }
+  table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
+  table.stack tr { border: 1px solid var(--border); border-radius: 10px; padding: 6px 10px; margin-bottom: 8px; }
+  table.stack td, table.stack thead + tbody tr:first-child td { display: flex; gap: 12px; justify-content: space-between; align-items: center; border-top: 0; padding: 4px 0; text-align: right; overflow-wrap: anywhere; }
+  table.stack td::before { content: attr(data-label); flex: none; text-align: left; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; }
+  table.stack td:empty { display: none; }
+  table.stack form.inline { flex-wrap: wrap; justify-content: flex-end; }
+  form.gain { grid-template-columns: 1fr auto; }
+  td.gain-cell { min-width: 170px; }
+  meter { width: 100px; }
+}
+
+/* Mixer: groups of channel strips side by side, scrolling inside their card
+   when they do not fit. A strip is a column: its buttons, a tall vertical
+   fader with a dB scale (an SVG beside it) and the readout, the linked
+   surface controls, and the label at the bottom like a scribble strip.
+   Main is drawn apart, in the accent colour. On a phone each strip is a
+   row with a horizontal fader. */
+.master .mixer-link { margin-top: 14px; align-items: center; gap: 12px; }
+.mixer .desk { display: flex; gap: 16px; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
+.mixer .group { flex: none; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.mixer .group > h3, .mixer details.group > summary { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; color: var(--muted); }
+.mixer details.group > summary { cursor: pointer; padding: 0 0 4px; }
+.mixer details.group > summary .n { margin-left: 6px; color: var(--faint); font-weight: 500; }
+.mixer details.group > summary:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.mixer .group.main { margin-left: auto; padding-left: 16px; border-left: 2px solid var(--border-strong); }
+.mixer .strips { display: flex; gap: 8px; }
+.strip { --fader-h: 300px; width: 104px; flex: none; display: flex; flex-direction: column; gap: 8px; padding: 10px 8px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); min-width: 0; }
+.strip.master { width: 128px; border-color: var(--accent); background: linear-gradient(180deg, var(--accent-soft), var(--surface-2) 45%); }
+.strip .scribble { order: 9; margin-top: auto; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 4px; border-radius: 8px; background: var(--surface-3); border: 1px solid var(--border-strong); text-align: center; min-width: 0; }
+.strip .scribble .label { font-weight: 650; font-size: 13px; line-height: 1.2; overflow-wrap: anywhere; }
+.strip .scribble .detail { font-size: 11px; color: var(--muted); font-family: var(--mono); display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; max-width: 100%; }
+.strip .buttons { display: grid; gap: 6px; }
+.strip .buttons.empty { min-height: 44px; }
+.strip .press { display: grid; gap: 2px; }
+.strip .press form { margin: 0; }
+.strip .note { font-size: 11px; text-align: center; min-height: 0; overflow-wrap: anywhere; }
+.strip .note:empty { display: none; }
+.strip .mute { width: 100%; min-height: 44px; border-radius: 10px; font-size: 14px; }
+.strip .mute.mixed { border-style: dashed; color: var(--bad); }
+.strip .problem { order: 6; font-size: 11px; color: var(--warn); margin: 0; overflow-wrap: anywhere; }
+.strip > form.inline { order: 7; margin: 0; }
+.strip > form.inline .btn { width: 100%; white-space: normal; }
+.strip form.fader { display: flex; flex-direction: column; align-items: center; gap: 6px; margin: 0; }
+.strip .track { display: grid; grid-template-columns: minmax(0, 1fr) 44px minmax(0, .4fr); width: 100%; height: var(--fader-h); }
+.strip .scale { grid-column: 1; width: 100%; height: calc(var(--fader-h) - 20px); margin-top: 10px; overflow: visible; }
+.strip .scale line { stroke: var(--faint); stroke-width: 1; }
+.strip .scale text { fill: var(--muted); font-size: 10px; font-family: var(--mono); text-anchor: end; dominant-baseline: middle; }
+.strip form.fader input[type=range] { grid-column: 2; writing-mode: vertical-lr; direction: rtl; width: 44px; height: 100%; }
+.strip form.fader input[type=range]::-webkit-slider-runnable-track { width: 8px; height: 100%; margin: 0 auto; background: linear-gradient(0deg, var(--accent) 0 var(--fill), var(--track) var(--fill)); }
+.strip form.fader input[type=range]::-moz-range-track { width: 8px; height: 100%; }
+.strip form.fader input[type=range]::-moz-range-progress { width: 8px; }
+.strip form.fader input[type=range]::-webkit-slider-thumb { width: 38px; height: 20px; border-radius: 6px; margin-top: 0; margin-left: -15px; background: linear-gradient(var(--knob) 0 44%, var(--text) 44% 56%, var(--knob) 56%); }
+.strip form.fader input[type=range]::-moz-range-thumb { width: 38px; height: 20px; border-radius: 6px; background: linear-gradient(var(--knob) 0 44%, var(--text) 44% 56%, var(--knob) 56%); }
+.strip form.fader input[type=range]:disabled { cursor: not-allowed; }
+.strip .readout { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.strip .owned { font-size: 11px; text-align: center; color: var(--text); font-weight: 600; }
+.strip .owned a { color: var(--accent); text-decoration: underline; }
+/* Locked (a surface fader owns the gain): hatched track, hollow grey cap. */
+.strip form.fader.locked .track { border: 1px dashed var(--border-strong); border-radius: 10px; }
+.strip form.fader.locked input[type=range]::-webkit-slider-runnable-track { background: repeating-linear-gradient(135deg, var(--track) 0 6px, transparent 6px 10px); }
+.strip form.fader.locked input[type=range]::-moz-range-track { background: repeating-linear-gradient(135deg, var(--track) 0 6px, transparent 6px 10px); }
+.strip form.fader.locked input[type=range]::-moz-range-progress { background: var(--faint); }
+.strip form.fader.locked input[type=range]::-webkit-slider-thumb { background: var(--surface-3); border-color: var(--faint); box-shadow: none; }
+.strip form.fader.locked input[type=range]::-moz-range-thumb { background: var(--surface-3); border-color: var(--faint); box-shadow: none; }
+.strip form.fader.locked .readout { color: var(--muted); }
+.strip .links { order: 8; list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.strip a.link { display: block; font-size: 11px; color: var(--muted); padding: 3px 7px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); overflow-wrap: break-word; hyphens: manual; line-height: 1.3; text-align: left; }
+.strip a.link:hover { color: var(--text); text-decoration: none; border-color: var(--accent); }
+.strip a.link:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.strip a.link .dot { display: inline-block; vertical-align: middle; margin-right: 4px; }
+.strip a.link.off .dot { background: var(--faint); }
+@media (max-width: 639px) {
+  .mixer .desk { flex-direction: column; align-items: stretch; overflow-x: visible; }
+  .mixer .group, .mixer .strips { width: 100%; }
+  .mixer .strips { flex-direction: column; }
+  .mixer .group.main { margin-left: 0; padding-left: 0; border-left: 0; padding-top: 12px; border-top: 2px solid var(--border-strong); }
+  .strip, .strip.master { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px 10px; padding: 8px 10px; }
+  .strip.master { background: var(--accent-soft); }
+  .strip .scribble { grid-column: 1; grid-row: 1; order: 0; margin: 0; align-items: flex-start; text-align: left; background: none; border: 0; padding: 0; }
+  .strip .buttons { grid-column: 2; grid-row: 1; display: flex; }
+  .strip .buttons.empty { display: none; }
+  .strip .mute { width: auto; min-width: 72px; }
+  .strip form.fader { grid-column: 1 / -1; grid-row: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 10px; }
+  .strip .track { display: block; height: auto; }
+  .strip .scale { display: none; }
+  .strip form.fader input[type=range] { writing-mode: horizontal-tb; direction: ltr; width: 100%; height: 44px; }
+  .strip form.fader input[type=range]::-webkit-slider-runnable-track { width: auto; height: 8px; margin: 0; background: linear-gradient(90deg, var(--accent) 0 var(--fill), var(--track) var(--fill)); }
+  .strip form.fader input[type=range]::-moz-range-track { width: auto; height: 8px; }
+  .strip form.fader input[type=range]::-moz-range-progress { width: auto; height: 8px; }
+  .strip form.fader input[type=range]::-webkit-slider-thumb { width: 20px; height: 36px; margin-left: 0; margin-top: -14px; background: linear-gradient(90deg, var(--knob) 0 44%, var(--text) 44% 56%, var(--knob) 56%); }
+  .strip form.fader input[type=range]::-moz-range-thumb { width: 20px; height: 36px; background: linear-gradient(90deg, var(--knob) 0 44%, var(--text) 44% 56%, var(--knob) 56%); }
+  .strip .readout { min-width: 5.5em; text-align: right; font-size: 12px; }
+  .strip form.fader .note, .strip form.fader .owned, .strip form.fader .nojs { grid-column: 1 / -1; }
+  .strip .problem, .strip .links, .strip > form.inline { grid-column: 1 / -1; }
+  .strip .links { display: flex; flex-wrap: wrap; }
+}
+/* A momentary button: held with a pointer or a key, never scrolled or
+   long-pressed into a menu. */
+[data-momentary] button { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.strip .mute.held { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+
+/* Router: sources in rows, destinations in columns; a patched crosspoint
+   is a filled square with its gain, an empty one a faint "+". Origins are
+   told by the square's edge (data-origin), a bridge-implied one is
+   read-only (dashed), an inactive one faded. On a phone the grid gives way
+   to a list per destination. */
+.router-scroll { max-height: 75vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.router-grid { border-collapse: separate; border-spacing: 0; font-size: 12px; width: auto; }
+.router-grid th, .router-grid td { border: 0; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 0; text-transform: none; letter-spacing: 0; color: var(--text); background: var(--surface); }
+.router-grid thead th, .router-grid thead td { position: sticky; top: 0; z-index: 3; background: var(--surface-2); }
+.router-grid thead tr:nth-child(2) th { top: 28px; }
+.router-grid .corner { position: sticky; left: 0; z-index: 4; min-width: 150px; padding: 6px 8px; vertical-align: bottom; }
+.router-grid .dgroup { padding: 4px 8px; height: 28px; text-align: left; font-weight: 600; color: var(--muted); border-left: 2px solid var(--border-strong); white-space: nowrap; }
+.router-grid .dport { writing-mode: vertical-rl; transform: rotate(180deg); height: 120px; max-height: 120px; padding: 6px 4px; text-align: left; white-space: nowrap; overflow: hidden; }
+.router-grid tbody th { position: sticky; left: 0; z-index: 2; background: var(--surface-2); padding: 4px 8px; text-align: left; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.router-grid .sgroup th { padding: 6px 8px; font-weight: 600; color: var(--muted); background: var(--surface-3); border-top: 2px solid var(--border-strong); }
+.router-grid a.port { color: inherit; }
+.router-grid a.port.off { color: var(--faint); text-decoration: line-through; }
+.router-grid .xp-cell { width: 34px; min-width: 34px; height: 30px; text-align: center; vertical-align: middle; }
+.router-grid .xp-cell.na { background: var(--surface-3); }
+.router-grid .xp-form { margin: 0; }
+.xp { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 22px; border-radius: 6px; border: 1px dashed var(--border-strong); background: transparent; color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; cursor: pointer; padding: 0; text-decoration: none; }
+button.xp:hover, button.xp:focus-visible { color: var(--accent); border-color: var(--accent); }
+.xp.on { border: 2px solid var(--accent); background: var(--accent-soft); color: var(--text); font-weight: 650; }
+.xp.on[data-origin="default"] { border-color: var(--border-strong); }
+.xp.on[data-origin="configured"] { border-color: var(--warn); }
+.xp.on[data-origin="monitor"] { border-color: var(--ok); }
+.xp.on.bridge { border-style: dashed; cursor: default; }
+.xp.on.muted { color: var(--bad); background: var(--bad-soft); }
+.xp.inactive { opacity: .45; }
+.xp:focus-visible, a.port:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 1px; }
+.router-grid tr:has(.xp:hover, .xp:focus-visible) th.sport { background: var(--accent-soft); }
+.router .legend { list-style: none; display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 0; margin: 12px 0 0; font-size: 12px; color: var(--muted); }
+.router .legend li { display: flex; align-items: center; gap: 6px; }
+/* Up to ten destinations (.wide): the grid takes the card's width and the
+   destination headers are horizontal and wrap; more are rotated. A port
+   header shows its name and, when that says something else, where it is. */
+.router-grid.wide { width: 100%; font-size: 13px; }
+.router-grid.wide .dport { writing-mode: horizontal-tb; transform: none; height: auto; max-height: none; min-width: 92px; max-width: 200px; padding: 6px 8px; white-space: normal; overflow-wrap: anywhere; vertical-align: bottom; }
+.router-grid.wide .corner { width: 240px; }
+.router-grid.wide tbody th { max-width: 300px; }
+.router-grid.wide .xp-cell { height: 40px; min-width: 56px; }
+.router-grid.wide .xp { width: min(100%, 56px); height: 30px; font-size: 12px; }
+.router-grid .port .name { display: block; }
+.router-grid .port .where { display: block; font-size: 11px; color: var(--muted); font-weight: 400; }
+.router-grid:not(.wide) .dport .where { display: none; }
+.router-grid tbody th .port .name, .router-grid tbody th .port .where { overflow: hidden; text-overflow: ellipsis; }
+.router-grid .sgroup .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+.router-note:empty, .dialog-note:empty { display: none; }
+.router-note, .dialog-note { margin: 6px 0; }
+.router-list .feeds li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 8px; padding: 4px 0; }
+.router-list .feeds { list-style: none; padding-left: 0; }
+.router-list .feed-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.router-list .feed-actions form { margin: 0; }
+.router-list h3 .port .where { margin-left: 6px; font-size: 12px; color: var(--muted); font-weight: 400; }
+.router-dialog { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 32px); border: 1px solid var(--border-strong); border-radius: var(--r-sm); padding: 14px 16px; background: var(--surface); color: var(--text); }
+.router-dialog::backdrop { background: rgba(0, 0, 0, .4); }
+.router-dialog .dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.router-dialog .dialog-head h2 { margin: 0; text-transform: none; letter-spacing: 0; font-size: 16px; color: var(--text); }
+.router-dialog .dialog-head h2 .n { font-weight: 500; color: var(--muted); margin-left: 2px; }
+.router-list { display: none; }
+.router-list .dest { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; }
+.router-list h3 { margin: 0 0 4px; font-size: 14px; }
+.router-list h3 .n { margin-left: 6px; }
+.router-list .feeds { margin: 0 0 6px; }
+.router-list .feeds li.off { color: var(--faint); }
+.router-list form.inline { flex-wrap: wrap; }
+.router-list select { max-width: 100%; }
+@media (max-width: 700px) {
+  .router-scroll { display: none; }
+  .router-list { display: block; }
+}
+.patch .patch-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.editor-controls { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; margin: 8px 0 12px; }
+.editor-controls form.gain { min-width: 260px; }
+.tag.bad { color: var(--bad); background: var(--bad-soft); }
+
+/* Mixer panels: tabs between saved panels; the editor's strip list. */
+.panel-tabs { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
+.panel-tabs a.cur { background: var(--accent-soft); border-color: var(--accent); }
+.strip-list { padding-left: 22px; margin: 0; display: grid; gap: 10px; }
+.strip-item { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+.strip-item .links { list-style: none; padding: 0; margin: 6px 0; display: grid; gap: 4px; font-size: 13px; }
+.strip-form .chans { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.panel-list { padding-left: 18px; }
+#volume .press { margin-top: 10px; }

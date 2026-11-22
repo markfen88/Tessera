@@ -6,7 +6,10 @@
 //! band. A collapsed device band shows read-only route counts in place of its
 //! channels; the counts never submit anything.
 use super::*;
-use tessera_control_types::RoutingReceiverPage;
+use tessera_control_types::{
+    BridgeDirection, BridgeState, BridgeStatus, Channel, ConfigFlowFeed, CrosspointKey, RouterPort,
+    RouterReport, RoutingReceiverPage,
+};
 
 struct ReceiverGroup {
     endpoint: EndpointRef,
@@ -17,10 +20,16 @@ struct ReceiverGroup {
     problem: Option<String>,
     /// Opening the receiver can read (more of) its inputs.
     can_read: bool,
+    /// `page` is what the receiver answered. `false`: this host's inputs
+    /// listed from the daemon's status because its receiver did not
+    /// answer; their selections are unknown and nothing here changes them.
+    observed: bool,
 }
 
 /// Sources are paged in rows of this many channels.
 const SOURCES_PER_PAGE: usize = 16;
+/// Inputs of this host's receiver shown when its page is completed here.
+const LOCAL_ROWS: usize = 64;
 
 pub(super) async fn show(
     st: &Shared,
@@ -46,6 +55,19 @@ pub(super) async fn show(
                 )
             });
             let status = status_of(st).await.ok();
+            // A saved router grid holds the local taps: the local-mix cells
+            // then show it and link to the Router page (Audio page rule).
+            let router = crate::ports::router_of(st)
+                .await
+                .ok()
+                .filter(|r| r.saved && !r.read_only);
+            let bridges = match call(st, RequestBody::Query(Query::Bridges)).await {
+                Ok(Reply::Bridges(b)) => b,
+                _ => status
+                    .as_ref()
+                    .map(|s| s.bridges.clone())
+                    .unwrap_or_default(),
+            };
             let mut groups = Vec::new();
             // Bound network waits per document; remaining devices have an
             // explicit read link. Never guess unadvertised receiver channels.
@@ -58,6 +80,7 @@ pub(super) async fn show(
                     page: None,
                     problem: None,
                     can_read: device.rx_channels != Some(0),
+                    observed: true,
                 };
                 if device.rx_channels == Some(0) {
                     group.problem = Some("No receive inputs".into());
@@ -73,9 +96,20 @@ pub(super) async fn show(
                     )
                     .await
                     {
-                        Ok(Reply::RoutingReceiver(page)) => group.page = Some(page),
+                        Ok(Reply::RoutingReceiver(mut page)) => {
+                            if let Some(key) = &group.local {
+                                complete_local(&mut page, key, status.as_ref());
+                            }
+                            group.page = Some(page);
+                        }
                         Err(e) => group.problem = Some(explain(&e)),
                         _ => group.problem = Some("Receiver observations unavailable".into()),
+                    }
+                    if group.page.is_none() {
+                        if let Some(key) = &group.local {
+                            group.page = unread_local(&group, key, status.as_ref());
+                            group.observed = group.page.is_none();
+                        }
                     }
                 }
                 groups.push(group);
@@ -100,14 +134,15 @@ pub(super) async fn show(
                     div.actions {
                         (view_switch())
                         a.btn.sm href="/routing" { "Refresh" }
+                        a.btn.sm href="/audio" { "Sound cards and local routing" }
                         a.btn.sm href="/routing/recovery" { "Recover uncertain operation" }
                         a.btn.sm href="/routing/carrier-recovery" { "Review restart recovery" }
                     }
                 }
-                @if !inventory.complete { p.flash.bad { "Discovery is incomplete. Refresh before changing a route." } }
+                (discovery_notice(&inventory))
                 (stale_notice())
-                (legend())
-                div.routing-desktop { (grid(&groups, visible, status.as_ref())) }
+                (legend(router.is_some()))
+                div.routing-desktop { (grid(&groups, visible, status.as_ref(), router.as_ref(), &bridges)) }
                 (receiver_notes(&groups))
                 (receiver_list(&groups, &sources))
                 @if sources.len() > SOURCES_PER_PAGE { nav.actions aria-label="Source channel pages" {
@@ -139,6 +174,86 @@ pub(super) async fn show(
         view("Routing matrix", "/routing").every(10),
         &body,
     )
+}
+
+/// This host's own receiver lists every one of its inputs, with the labels
+/// its configuration gives them. The daemon completes the page itself; an
+/// older daemon passes on what its compatibility runtime answered, which can
+/// be fewer, generically named inputs. Added inputs carry no expectation, so
+/// they are read-only (local monitoring needs none).
+fn complete_local(page: &mut RoutingReceiverPage, key: &DeviceKey, status: Option<&Status>) {
+    let Some(device) = status.and_then(|s| s.devices.iter().find(|d| &d.key == key)) else {
+        return;
+    };
+    // Only an absent or generic name (`RX 3`) gives way to the configured one.
+    for row in &mut page.channels {
+        let generic = format!("RX {}", row.id);
+        if row.label.as_deref().is_some_and(|l| l != generic) {
+            continue;
+        }
+        if let Some(c) = device
+            .rx_channels
+            .iter()
+            .find(|c| c.channel.get() == row.id)
+        {
+            row.label = Some(c.label.clone());
+        }
+    }
+    if page.next_first.is_some() {
+        return;
+    }
+    let last = page.channels.iter().map(|c| c.id).max().unwrap_or(0);
+    for c in device.rx_channels.iter().filter(|c| c.channel.get() > last) {
+        if page.channels.len() >= LOCAL_ROWS {
+            break;
+        }
+        page.channels.push(RoutingReceiverChannel::new(
+            c.channel.get(),
+            Some(c.label.clone()),
+            None,
+            0,
+        ));
+    }
+}
+
+/// Why the inputs of an unread local receiver are read-only (its page's
+/// `operation_unavailable`, set here, never by the daemon).
+const LOCAL_UNREAD: &str = "this host's routing runtime did not answer";
+
+/// This host's receive inputs from the daemon's status, when its own
+/// receiver did not answer (its routing runtime is not running, for example
+/// on a host that does not take the native role): read-only rows with no
+/// selection, so the matrix still lists them, local mix cells work, and the
+/// reason is said once. `None` when the status does not list the device or
+/// it has no receive channels.
+fn unread_local(
+    group: &ReceiverGroup,
+    key: &DeviceKey,
+    status: Option<&Status>,
+) -> Option<RoutingReceiverPage> {
+    let device = status?.devices.iter().find(|d| &d.key == key)?;
+    if device.rx_channels.is_empty() {
+        return None;
+    }
+    let mut page = RoutingReceiverPage::new(group.endpoint.clone(), group.label.clone(), 1, 0);
+    page.operation_unavailable = Some(LOCAL_UNREAD.into());
+    page.channels = device
+        .rx_channels
+        .iter()
+        .take(LOCAL_ROWS)
+        .map(|c| RoutingReceiverChannel::new(c.channel.get(), Some(c.label.clone()), None, 0))
+        .collect();
+    Some(page)
+}
+
+/// What an RX input's column says it receives: the receiver's answer, or
+/// that it was not read.
+fn selection_words(group: &ReceiverGroup, row: &RoutingReceiverChannel) -> String {
+    if group.observed {
+        selected(row)
+    } else {
+        "Selection not read (the receiver did not answer)".into()
+    }
 }
 
 fn view_switch() -> Markup {
@@ -183,7 +298,7 @@ fn corner(receivers: usize, transmitters: usize) -> Markup {
     } }
 }
 
-fn legend() -> Markup {
+fn legend(router_saved: bool) -> Markup {
     html! { div.routing-legend aria-label="Route states" {
         span { i.route-dot.receiving { "✓" } " Receiving" }
         span { i.route-dot.confirmed { "✓" } " Receiver-confirmed" }
@@ -191,6 +306,10 @@ fn legend() -> Markup {
         span { i.route-dot.empty { "+" } " Empty" }
         span { i.route-dot.unavailable { "×" } " Unavailable" }
         span { i.route-dot.pending { "…" } " Pending" }
+        span { i.route-dot.local-mix { "◉" } " Local mix: this host's own input also plays on its output" }
+        // A sentence, not a legend chip: it flows as text, so the full stop
+        // keeps to its link (a chip's flex gap would part them).
+        @if router_saved { span.legend-note { "Local mix is part of the saved router grid: read-only here, " a href="/router" { "change it on the Router page" } "." } }
         span { i.route-dot.route-sum { "2" } " Routes in a collapsed band" }
     } }
 }
@@ -204,10 +323,11 @@ pub(super) fn single(receiver: &RoutingReceiverPage, sources: &[SourceChoice]) -
         page: Some(receiver.clone()),
         problem: None,
         can_read: false,
+        observed: true,
     }];
     html! { div.routing-board data-routing-board {
-        (view_switch()) (stale_notice()) (legend())
-        div.routing-desktop { (grid(&groups, sources, None)) }
+        (view_switch()) (stale_notice()) (legend(false))
+        div.routing-desktop { (grid(&groups, sources, None, None, &[])) }
         (receiver_notes(&groups))
         (receiver_list(&groups, sources))
         (dialog())
@@ -288,11 +408,112 @@ fn columns_of(group: &ReceiverGroup) -> Vec<Column<'_>> {
     }
 }
 
-/// Whether a receiver input's reported source is one of these channels.
+/// Whether a receiver input's reported source, or the configuration flow
+/// feeding it, is one of these channels.
 fn fed_by(row: &RoutingReceiverChannel, sources: &[SourceChoice]) -> bool {
     row.source
         .as_ref()
         .is_some_and(|selected| sources.iter().any(|s| s.matches(selected)))
+        || sources.iter().any(|s| config_fed(row, s))
+}
+
+/// Whether the configuration flow feeding `row` comes from `source`: the
+/// daemon matched its peer address and channel order to that TX channel.
+fn config_fed(row: &RoutingReceiverChannel, source: &SourceChoice) -> bool {
+    row.config_flow
+        .as_ref()
+        .and_then(|f| f.source.as_ref())
+        .is_some_and(|r| {
+            r.endpoint.id == source.reference.endpoint.id && r.channel == source.reference.channel
+        })
+}
+
+/// The media word of a configuration flow and its cell state.
+fn flow_state(flow: &ConfigFlowFeed) -> (&'static str, &'static str, &'static str) {
+    match &flow.media {
+        Some(SubscriptionState::Receiving) => ("receiving", "✓", "Receiving"),
+        Some(SubscriptionState::InProgress) | None => ("pending", "…", "Waiting for media"),
+        Some(_) => ("no-media", "!", "No media"),
+    }
+}
+
+/// A crosspoint fed by a configuration flow (`[[flow]]`): shown like a route,
+/// never changed here. It changes only with the receiver's configuration.
+fn config_cell(
+    page: &RoutingReceiverPage,
+    row: &RoutingReceiverChannel,
+    source: &SourceChoice,
+    flow: &ConfigFlowFeed,
+) -> Markup {
+    let (class, symbol, state) = flow_state(flow);
+    let description = format!(
+        "{} / {} → {} / {} (input {}). {state} from the configuration (config flow {}). Read only: change it in the receiver's configuration",
+        source.device,
+        source.channel,
+        page.label,
+        row.label.as_deref().unwrap_or("Input"),
+        row.id,
+        flow.id,
+    );
+    html! { span.routing-cell-form data-config-flow=(flow.id) {
+        button class=(format!("route-cell {class} config-flow")) type="button" disabled data-allowed="false" aria-label=(description) title=(description) aria-pressed="true" {
+            span aria-hidden="true" { (symbol) } span.sr { (state) " (config flow, read only)" }
+        }
+    } }
+}
+
+/// The RX header's note for an input fed by a configuration flow whose
+/// source is not a discovered channel: where it comes from.
+fn config_note(row: &RoutingReceiverChannel) -> Option<String> {
+    let flow = row.config_flow.as_ref()?;
+    if flow.source.is_some() {
+        return None;
+    }
+    let (_, _, state) = flow_state(flow);
+    let state = state.to_ascii_lowercase();
+    Some(match &flow.peer {
+        Some(peer) => format!("{state} from {peer} (config flow)"),
+        None => format!("{state} (config flow {})", flow.id),
+    })
+}
+
+/// Plain words for why routes on a receiver cannot be changed here, with the
+/// daemon's reason kept visible for support.
+fn unavailable_words(reason: &str, local: bool) -> String {
+    let mix = if local {
+        "; local mix cells still work"
+    } else {
+        ""
+    };
+    if reason == LOCAL_UNREAD {
+        format!(
+            "Routes can't be changed from here: this host's routing runtime isn't running or didn't answer. Its inputs are listed from the daemon's status, without their selections{mix}."
+        )
+    } else if reason.contains("registered runtime is not ready for receiver execution") {
+        format!(
+            "Routes can't be changed from here yet: the compatibility runtime isn't registered{mix}."
+        )
+    } else if reason.contains("protected carriers in the local callback domain") {
+        format!(
+            "Routes can't be changed from here yet: a configuration flow ([[flow]]) feeds this receiver{mix}."
+        )
+    } else if reason.contains("uncertain operation") {
+        format!(
+            "Routes can't be changed until the uncertain operation is recovered (Recover uncertain operation){mix}."
+        )
+    } else if reason.contains("locked") {
+        format!("Routes can't be changed: the receiver is locked{mix}.")
+    } else {
+        format!("Routes on this receiver can't be changed from here{mix}.")
+    }
+}
+
+pub(super) fn unavailable_note(reason: &str, local: bool) -> Markup {
+    html! { span.routing-reason {
+        (unavailable_words(reason, local))
+        // The portal's own reason is already in the words.
+        @if reason != LOCAL_UNREAD { " " span.muted { "Reason: " code { (reason) } } }
+    } }
 }
 
 fn routes_into(page: &RoutingReceiverPage, sources: &[SourceChoice]) -> usize {
@@ -321,12 +542,21 @@ fn band_title(group: &ReceiverGroup) -> String {
         .and_then(|p| p.operation_unavailable.as_ref())
     {
         title.push_str(" · ");
+        title.push_str(&unavailable_words(reason, group.local.is_some()));
+        title.push_str(" (");
         title.push_str(reason);
+        title.push(')');
     }
     title
 }
 
-fn grid(groups: &[ReceiverGroup], sources: &[SourceChoice], status: Option<&Status>) -> Markup {
+fn grid(
+    groups: &[ReceiverGroup],
+    sources: &[SourceChoice],
+    status: Option<&Status>,
+    router: Option<&RouterReport>,
+    bridges: &[BridgeStatus],
+) -> Markup {
     let tx_groups = source_groups(sources);
     let rx_columns: Vec<Vec<Column<'_>>> = groups.iter().map(columns_of).collect();
     html! { div.routing-scroll tabindex="0" aria-label="Audio routing crosspoints" {
@@ -349,7 +579,7 @@ fn grid(groups: &[ReceiverGroup], sources: &[SourceChoice], status: Option<&Stat
                 }
                 tr {
                     @for (group, columns) in groups.iter().zip(&rx_columns) {
-                        @for (index, column) in columns.iter().enumerate() { (rx_header(column, index == 0)) }
+                        @for (index, column) in columns.iter().enumerate() { (rx_header(column, index == 0, bridges)) }
                         @if let Some(page) = &group.page { @if !page.channels.is_empty() {
                             th.routing-rx-channel.routing-rx-summary.routing-group-start scope="col" hidden data-rx-summary=(group.endpoint.id) title=(format!("{}: {} inputs (collapsed)", group.label, page.channels.len())) {
                                 span.routing-vlabel { (page.channels.len()) " inputs" }
@@ -383,13 +613,20 @@ fn grid(groups: &[ReceiverGroup], sources: &[SourceChoice], status: Option<&Stat
                         th.routing-tx-channel scope="row" title=(format!("{} / {}", source.device, source.channel)) {
                             span.routing-tree aria-hidden="true" {}
                             bdi { (source.channel) }
+                            @if let Some(feed) = local_key(groups, source).and_then(|k| feed_label(bridges, k, BridgeDirection::Capture, source.reference.channel)) {
+                                " " span.routing-feed { "\u{b7} " (feed) }
+                            }
                         }
                         @for (group, columns) in groups.iter().zip(&rx_columns) {
                             @for (index, column) in columns.iter().enumerate() {
                                 @match column {
                                     Column::Input { page, row, .. } => {
                                         td.routing-crosspoint.routing-group-start[index == 0] data-rx=(group.endpoint.id) data-rx-channel=(row.id) {
-                                            (cell(page, row, source, media(group, row, status)))
+                                            @match (group.local.as_ref().filter(|_| group.endpoint.id == source.reference.endpoint.id), row.config_flow.as_ref().filter(|_| config_fed(row, source))) {
+                                                (Some(key), _) => { (local_cell(key, row, source, status, router)) },
+                                                (None, Some(flow)) => { (config_cell(page, row, source, flow)) },
+                                                (None, None) => { (cell(page, row, source, media(group, row, status))) },
+                                            }
                                         }
                                     },
                                     Column::Void { .. } => { (void_cell(group, index == 0)) },
@@ -406,25 +643,34 @@ fn grid(groups: &[ReceiverGroup], sources: &[SourceChoice], status: Option<&Stat
     } }
 }
 
-fn rx_header(column: &Column<'_>, first: bool) -> Markup {
+fn rx_header(column: &Column<'_>, first: bool, bridges: &[BridgeStatus]) -> Markup {
     let group = column.group();
     match column {
         Column::Input { row, .. } => {
             let label = row.label.as_deref().unwrap_or("Input");
+            let feed = group
+                .local
+                .as_ref()
+                .and_then(|k| feed_label(bridges, k, BridgeDirection::Playback, u32::from(row.id)));
+            // An unread input has no receiver status to show.
+            let raw = if group.observed {
+                format!(" · receiver status (raw) 0x{:08x}", row.raw_status)
+            } else {
+                String::new()
+            };
             let title = format!(
-                "{} / {} (input {}) · {} · receiver status (raw) 0x{:08x}",
+                "{} / {} (input {}) · {}{raw}",
                 group.label,
                 label,
                 row.id,
-                selected(row),
-                row.raw_status
+                selection_words(group, row)
             );
             html! {
                 th.routing-rx-channel.routing-group-start[first] scope="col" data-rx=(group.endpoint.id) data-rx-channel=(row.id)
                     data-search=(format!("{} {}", group.label, label))
                     data-route-key=(format!("{}:{}", group.endpoint.id, row.id)) data-selection=(serde_json::to_string(&row.source).unwrap()) title=(title) {
-                    span.routing-vlabel { bdi { (label) } }
-                    span.sr { (selected(row)) }
+                    span.routing-vlabel { bdi { (label) } @if let Some(f) = &feed { " " span.routing-feed { "\u{2192} " (f) } } @if let Some(note) = config_note(row) { " " span.routing-feed.routing-config-flow { (note) } } }
+                    span.sr { (selection_words(group, row)) }
                     span.routing-external hidden { span aria-hidden="true" { "!" } span.sr { "Changed externally" } }
                 }
             }
@@ -561,6 +807,158 @@ fn cell(
     } }
 }
 
+/// The host's device key when `source` is one of this host's own TX
+/// channels.
+fn local_key<'a>(groups: &'a [ReceiverGroup], source: &SourceChoice) -> Option<&'a DeviceKey> {
+    groups
+        .iter()
+        .find(|g| g.endpoint.id == source.reference.endpoint.id)
+        .and_then(|g| g.local.as_ref())
+}
+
+/// A card's short name from its PCM: `hw:CARD=CQ12T,DEV=0` → `CQ12T`.
+fn card_short(pcm: &str) -> &str {
+    pcm.split([':', ','])
+        .find_map(|part| part.strip_prefix("CARD="))
+        .unwrap_or(pcm)
+}
+
+/// What a card bridge does with channel `channel` of the host's device
+/// `key`: `CQ12T in 1` (a TX channel fed by a card input) or `CQ12T out 3`
+/// (an RX channel played on a card output).
+///
+/// Only an enabled bridge feeds a channel: a disabled one on the same
+/// channels (a spare card kept in the configuration) is not named. A running
+/// bridge is named before one that is starting or reopening. A bridge kept
+/// for local routing (`local_only`) carries no device channels, so it never
+/// names one. The card channel counts from the bridge's first card channel:
+/// a bridge on card channels 15–16 names TX 1 `CQ12T in 15`.
+fn feed_label(
+    bridges: &[BridgeStatus],
+    key: &DeviceKey,
+    direction: BridgeDirection,
+    channel: u32,
+) -> Option<String> {
+    let b = bridges
+        .iter()
+        .filter(|b| {
+            b.device == *key
+                && b.direction == direction
+                && b.state != BridgeState::Disabled
+                && !b.local_only
+                && channel >= u32::from(b.first_channel)
+                && channel < u32::from(b.first_channel) + u32::from(b.channels)
+        })
+        .min_by_key(|b| b.state != BridgeState::Running)?;
+    let n = channel - u32::from(b.first_channel) + u32::from(b.card_first_channel.max(1));
+    let card = card_short(&b.card);
+    Some(match direction {
+        BridgeDirection::Capture => format!("{card} in {n}"),
+        _ => format!("{card} out {n}"),
+    })
+}
+
+/// A local-mix cell once a router grid is saved: the grid's tap of this TX
+/// channel into the host output of this RX channel, read-only here and a
+/// link to that crosspoint on the Router page (as on the Audio page).
+fn local_cell_saved(
+    key: &DeviceKey,
+    row: &RoutingReceiverChannel,
+    source: &SourceChoice,
+    r: &RouterReport,
+) -> Markup {
+    let rx_label = row.label.as_deref().unwrap_or("Input");
+    let (Some(tx), Some(rx)) = (
+        u16::try_from(source.reference.channel)
+            .ok()
+            .and_then(Channel::new),
+        Channel::new(row.id),
+    ) else {
+        return html! { button.route-cell.local-mix type="button" disabled data-allowed="false" aria-label="Local mix: not a channel" { "○" } };
+    };
+    let k = CrosspointKey::new(
+        RouterPort::NetworkTx {
+            device: key.clone(),
+            channel: tx,
+        },
+        RouterPort::HostOut {
+            device: key.clone(),
+            channel: rx,
+        },
+    );
+    let active = crate::ports::crosspoint(r, &k).is_some();
+    let description = if active {
+        format!(
+            "{} plays on {rx_label} (RX {}) through the router's grid; change it on the Router page",
+            source.channel, row.id
+        )
+    } else {
+        format!(
+            "{} does not play on {rx_label} (RX {}); patch it on the Router page",
+            source.channel, row.id
+        )
+    };
+    html! {
+        a class=(if active { "route-cell local-mix readonly on" } else { "route-cell local-mix readonly" })
+            href=(format!("/router#{}", crate::ports::xp_id(&k))) data-allowed="true"
+            aria-label=(description) title=(description) {
+            span aria-hidden="true" { (if active { "◉" } else { "○" }) }
+            span.sr { (if active { "Local mix on (Router)" } else { "Local mix off (Router)" }) }
+        }
+    }
+}
+
+/// A crosspoint of this host's own TX channel and its own RX channel: not a
+/// network route (a device never receives its own transmission) but local
+/// monitoring, `SetMonitor`, reviewed like a route.
+fn local_cell(
+    key: &DeviceKey,
+    row: &RoutingReceiverChannel,
+    source: &SourceChoice,
+    status: Option<&Status>,
+    router: Option<&RouterReport>,
+) -> Markup {
+    if let Some(r) = router {
+        return local_cell_saved(key, row, source, r);
+    }
+    let tx = u16::try_from(source.reference.channel).unwrap_or(0);
+    let current = status
+        .and_then(|s| s.devices.iter().find(|d| &d.key == key))
+        .and_then(|d| {
+            d.monitor_rx_from_tx
+                .get(usize::from(row.id).wrapping_sub(1))
+                .copied()
+        })
+        .unwrap_or(0);
+    let active = tx != 0 && current == tx;
+    let rx_label = row.label.as_deref().unwrap_or("Input");
+    let description = if active {
+        format!(
+            "Stop playing {} on {rx_label} (RX {}). Local mix is on",
+            source.channel, row.id
+        )
+    } else if current != 0 {
+        format!(
+            "Play {} on {rx_label} (RX {}) instead of TX {current} (local mix)",
+            source.channel, row.id
+        )
+    } else {
+        format!(
+            "Also play {} on {rx_label} (RX {}) (local mix)",
+            source.channel, row.id
+        )
+    };
+    html! { form.routing-cell-form method="get" action="/routing/local-review" data-routing-choice {
+        input type="hidden" name="device" value=(key.0);
+        input type="hidden" name="rx" value=(row.id);
+        input type="hidden" name="tx" value=(if active { 0 } else { tx });
+        button class=(if active { "route-cell local-mix on" } else { "route-cell local-mix" }) type="submit" disabled[tx == 0] data-allowed=(tx != 0)
+            aria-label=(description) title=(description) aria-pressed=(active) {
+            span aria-hidden="true" { (if active { "◉" } else { "○" }) } span.sr { (if active { "Local mix on" } else { "Local mix off" }) }
+        }
+    } }
+}
+
 fn open_receiver(endpoint: &EndpointRef, text: &str) -> Markup {
     html! { form.routing-open method="get" action="/routing" {
         input type="hidden" name="endpoint" value=(serde_json::to_string(endpoint).unwrap());
@@ -587,7 +985,7 @@ fn receiver_notes(groups: &[ReceiverGroup]) -> Markup {
             @if let Some(wire_id) = &group.wire_id { " " span.routing-host { "Device ID " (wire_id) } }
             @if let Some(problem) = &group.problem { span.routing-reason { (problem) } }
             @if let Some(page) = &group.page {
-                @if let Some(reason) = &page.operation_unavailable { span.routing-reason { (reason) } }
+                @if let Some(reason) = &page.operation_unavailable { (unavailable_note(reason, group.local.is_some())) }
                 @if page.channels.is_empty() { span.routing-reason { "The receiver returned no channel observations; selections remain unknown." } }
                 @if let Some(first) = page.next_first { form.routing-open method="get" action="/routing" {
                     input type="hidden" name="endpoint" value=(serde_json::to_string(&group.endpoint).unwrap());
@@ -606,11 +1004,11 @@ fn receiver_list(groups: &[ReceiverGroup], sources: &[SourceChoice]) -> Markup {
             summary { (group.label) }
             @if let Some(wire_id) = &group.wire_id { p.muted { "Device ID " (wire_id) } }
             @if let Some(page) = &group.page {
-                @if let Some(reason) = &page.operation_unavailable { p.muted { (reason) } }
+                @if let Some(reason) = &page.operation_unavailable { p.muted { (unavailable_note(reason, group.local.is_some())) } }
                 @for row in &page.channels { article data-list-search=(format!("{} {}", group.label, row.label.as_deref().unwrap_or(""))) {
                     h4 { (row.label.as_deref().unwrap_or("Input")) " (" (row.id) ")" }
-                    p { (selected(row)) }
-                    p.muted { "Receiver status (raw) " (format!("0x{:08x}", row.raw_status)) }
+                    p { (selection_words(group, row)) }
+                    @if group.observed { p.muted { "Receiver status (raw) " (format!("0x{:08x}", row.raw_status)) } }
                     @if row.expectation.is_some() {
                         details { summary { "Choose a source" }
                             @for source in sources.iter().filter(|s| s.available_to(page, row)) { (choice(page, row, Some(source), false)) }

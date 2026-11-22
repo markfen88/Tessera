@@ -5,8 +5,8 @@
 # this file in lexical order; a later file wins. Merging: tables merge key
 # by key; plain values and plain arrays (interfaces, cpu_affinity, ...)
 # replace, except `locked` lists, which add up; [[device]] entries merge
-# by `id` (a drop-in cannot remove a device); [[bridge]] and [[flow]]
-# lists are replaced as a whole by a file that has any. The configuration
+# by `id` (a drop-in cannot remove a device); [[bridge]], [[route]] and
+# [[flow]] lists are replaced as a whole by a file that has any. The configuration
 # guide (/usr/share/doc/tessera/configuration.md where installed,
 # docs/configuration.md in the sources)
 # explains precedence, drop-ins and locks.
@@ -342,10 +342,11 @@
 # (range: true|false; apply: reload; restart scope: none)
 #advertise_devices = true
 #
-# Browse permitted interfaces for the read-only routing catalogue. Does not
-# send routing commands.
+# Browse permitted interfaces for the read-only routing catalogue (the
+# portal's Routing page needs it). Does not send routing commands. `false`
+# opts out.
 # (range: true|false; apply: reload; restart scope: none)
-#browse_devices = false
+#browse_devices = true
 
 #[backends]
 # Which audio-client backends may attach, and the resampler.
@@ -440,6 +441,35 @@
 # none)
 #error_sleep_max_ms = 64
 
+#[host_volume]
+# The host (speaker amplifier) volume: an ALSA mixer control the daemon sets
+# and restores at start, changed at run time by SetHostVolume / SetHostMute
+# (the portal's Main fader, a surface fader bound to host_volume); the value
+# set is stored in state.toml. Off while card is unset. Needs a daemon whose
+# runtime sets the host volume.
+#
+# The ALSA card of the volume control, by its id (amixer -c <card>), so a card
+# that moves to another index after a reboot is still found. Setting it
+# enables the host volume.
+# (range: an ALSA card id or index: letters, digits, _ and -, at most 64
+# bytes; apply: reload; restart scope: none; unset by default, example:)
+#card = "Headphones"
+#
+# The simple mixer control that sets the amplifier's level.
+# (range: a simple mixer control name, 1..=64 bytes; unset: Digital; apply:
+# reload; restart scope: none; unset by default, example:)
+#control = "Digital"
+#
+# Lowest volume offered (the bottom of a fader's travel).
+# (unit: dB; range: -96..max_db; unset: -60; apply: reload; restart scope:
+# none; unset by default, example:)
+#min_db = -60.0
+#
+# Highest volume offered.
+# (unit: dB; range: min_db..=12; unset: 0; apply: reload; restart scope: none;
+# unset by default, example:)
+#max_db = 0.0
+
 #[[device]]
 # A logical device as it appears on the network. Several are allowed; the
 # defaults below apply to each. Values marked live can also be changed at run
@@ -510,6 +540,19 @@
 # May this device transmit multicast flows.
 # (range: true|false; apply: reload; restart scope: none)
 #multicast.allow_tx_multicast = true
+#
+# Local monitoring: RX channel n also plays the TX channel in entry n, after
+# that channel's gain and mute. Overridden by `SetMonitor`.
+# (range: one TX channel (1-based, 0: none) per RX channel; apply: reload;
+# restart scope: none; unset by default, example:)
+#monitor_rx_from_tx = [1, 2]
+#
+# How far behind playback the monitored TX channels are read. 0: auto, the
+# lowest delay at which a feeding capture bridge's audio is reliably there (at
+# the playback position when an audio client feeds them). Overridden by
+# `SetMonitor`.
+# (unit: us; range: 0..=1000000; apply: reload; restart scope: none)
+#monitor_delay_us = 0
 
 #[[bridge]]
 # An in-daemon ALSA hardware-card bridge: moves audio between a card and a
@@ -538,7 +581,7 @@
 # (range: true|false; apply: reload; restart scope: device)
 #enabled = true
 #
-# First device channel carried; card channel 1 is this one.
+# First device channel carried; card channel card_first_channel is this one.
 # (range: >= 1; apply: reload; restart scope: device)
 #first_channel = 1
 #
@@ -547,6 +590,13 @@
 # (unit: channels; range: >= 1; apply: reload; restart scope: device; unset by
 # default, example:)
 #channels = 2
+#
+# First card channel carried (for example 15 for a mixer's main mix on USB
+# channels 15-16). The card is opened with at least card_first_channel +
+# channels - 1 channels (or the count it requires); capture ignores its other
+# channels, playback sends silence on them.
+# (range: >= 1; apply: reload; restart scope: device)
+#card_first_channel = 1
 #
 # The card's rate. Unset: follow the device.
 # (unit: Hz; range: the device's rate; apply: reload; restart scope: device;
@@ -619,6 +669,44 @@
 # (unit: ms; range: error_sleep_min_ms..=1000; apply: reload; restart scope:
 # none; unset by default, example:)
 #error_sleep_max_ms = 64
+#
+# Open the card for the host router only: its channels card_first_channel..
+# become router ports (card_in for capture, card_out for playback) and no
+# device channel is fed or read, so the card stays off the network until a
+# crosspoint patches it there. first_channel is ignored and channels is
+# required. Needs a daemon whose runtime runs the host router.
+# (range: true|false; apply: reload; restart scope: device)
+#local_only = false
+
+#[[route]]
+# A crosspoint of the host router's default grid: source mixed into
+# destination with its own gain. The default grid (each RX channel to the host
+# output of the same number, each application output to the TX channel of the
+# same number, local monitoring, and these entries) applies until a grid is
+# saved at run time (SetRouter, or an edit in the portal), which starts as a
+# copy of it. Ports are inline tables: { kind = "network_rx" | "network_tx" |
+# "app_out" | "host_out", device = "<id>", channel = n } or { kind = "card_in"
+# | "card_out", card = "<ALSA PCM of a bridge>", channel = n }. Needs a daemon
+# whose runtime runs the host router.
+#
+# What is mixed in: network_rx, app_out or card_in, or a destination port
+# (network_tx, host_out, card_out) as a tap of what it carries. Required.
+# (range: a router port table; apply: reload; restart scope: none; required,
+# example:)
+#source = { kind = "network_rx", device = "main", channel = 1 }
+#
+# Where it is mixed into. Required.
+# (range: a network_tx, host_out or card_out port table; apply: reload;
+# restart scope: none; required, example:)
+#destination = { kind = "host_out", device = "main", channel = 2 }
+#
+# Gain of this crosspoint.
+# (unit: dB; range: -96..=12; apply: reload; restart scope: none)
+#gain_db = 0.0
+#
+# Patched but silent.
+# (range: true|false; apply: reload; restart scope: none)
+#muted = false
 
 #[[flow]]
 # PROVISIONAL static audio flow between two tessera instances (test

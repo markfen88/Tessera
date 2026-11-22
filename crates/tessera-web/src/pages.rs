@@ -24,8 +24,12 @@ use crate::signal::{self, Sample};
 use crate::theme::{self, Theme};
 use crate::{Flash, Shared, call, clear_cookie, explain, peer, session_cookie, session_of};
 
+pub(crate) mod audio;
+pub(crate) mod levels;
 pub(crate) mod mapping;
+pub(crate) mod router;
 pub(crate) mod routing;
+pub(crate) mod surfaces;
 
 const RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 const BITS: [u8; 3] = [16, 24, 32];
@@ -126,6 +130,14 @@ async fn drive(st: &Shared, s: &Session, cmds: Vec<Command>) -> Outcome {
                 applied += 1;
                 rest.remove(0);
             }
+            // Removing what is not there (a default crosspoint a new channel
+            // never got) leaves the grid as wanted.
+            Err(ClientError::Command(CommandError::NotFound { .. }))
+                if matches!(rest.first(), Some(Command::RemoveCrosspoint { .. })) =>
+            {
+                applied += 1;
+                rest.remove(0);
+            }
             Err(ClientError::Command(CommandError::ConfirmationRequired { impact })) => {
                 return Outcome::Confirm {
                     impact,
@@ -168,7 +180,7 @@ fn settle(
     }
 }
 
-fn back(st: &Shared, token: &str, to: &str, r: Result<String, String>) -> Response {
+pub(crate) fn back(st: &Shared, token: &str, to: &str, r: Result<String, String>) -> Response {
     match r {
         Ok(m) => st.set_flash(token, true, m),
         Err(m) => st.set_flash(token, false, m),
@@ -207,17 +219,53 @@ pub(crate) fn sub_class(s: &SubscriptionState) -> &'static str {
 /// The pill navigation: path and label, in order. The current page is the
 /// one whose path equals the page's `active`. Appliance mode prepends a
 /// "Speaker" entry and moves the overview ([`crate::appliance::nav`]).
-const NAV: [(&str, &str); 9] = [
+const NAV: [(&str, &str); 13] = [
     ("/", "Overview"),
-    ("/devices", "Device"),
-    ("/routing", "Routing"),
+    ("/mixer", "Mixer"),
+    ("/router", "Router"),
+    ("/audio", "Audio"),
+    ("/surfaces", "Surfaces"),
+    ("/routing", "Network routing"),
     ("/network", "Network"),
     ("/clock", "Clock"),
+    ("/devices", "Device"),
     ("/metrics", "Metrics"),
     ("/events", "Events"),
     ("/config", "Config"),
     ("/services", "Services"),
 ];
+
+/// The navigation's groups, by entry label: local audio, the network, the
+/// system. Entries in none (the overview, the Speaker page) come first.
+fn nav_group(label: &str) -> Option<&'static str> {
+    match label {
+        "Mixer" | "Router" | "Audio" | "Surfaces" => Some("Audio"),
+        "Network routing" | "Network" | "Clock" => Some("Network"),
+        "Device" | "Metrics" | "Events" | "Config" | "Services" => Some("System"),
+        _ => None,
+    }
+}
+
+/// The entries in their groups, in order: `(group, entries)`, the
+/// ungrouped ones first under `None`.
+/// One navigation entry: path and label.
+type NavEntry = (&'static str, &'static str);
+
+/// Entries under their group (`None`: no group).
+type NavGroups<'a> = Vec<(Option<&'static str>, Vec<&'a NavEntry>)>;
+
+fn nav_groups(nav: &[NavEntry]) -> NavGroups<'_> {
+    let mut out: NavGroups<'_> = Vec::new();
+    for e in nav {
+        let g = nav_group(e.1);
+        match out.iter_mut().find(|(x, _)| *x == g) {
+            Some((_, v)) => v.push(e),
+            None => out.push((g, vec![e])),
+        }
+    }
+    out.sort_by_key(|(g, _)| g.is_some());
+    out
+}
 
 /// Pages that answer `GET` besides those in [`NAV`]: where a `POST /theme`
 /// may send the browser back to (the appliance pages exist only in appliance
@@ -279,6 +327,12 @@ impl View<'_> {
         self.refresh = Some(secs);
         self
     }
+
+    /// Load the page's script (in-place forms, pickers) without refreshing.
+    pub(crate) const fn scripted(mut self) -> Self {
+        self.refresh = Some(0);
+        self
+    }
 }
 
 fn top_bar(chrome: &Chrome, active: &str, s: Option<&Session>) -> Markup {
@@ -288,9 +342,44 @@ fn top_bar(chrome: &Chrome, active: &str, s: Option<&Session>) -> Markup {
             // The device's name and address are for operators only.
             @if let Some(s) = s {
                 @if let Some(h) = &chrome.host { span.host { (h) } }
-                nav.nav {
-                    @for (href, label) in &chrome.nav {
-                        a.cur[*href == active] href=(href) { (label) }
+                @let groups = nav_groups(&chrome.nav);
+                // Wide screens: one row, in groups. Narrow ones: a menu
+                // button (a disclosure, no script needed) with the same
+                // links; the stylesheet shows one of the two.
+                nav.nav aria-label="Pages" {
+                    @for (group, entries) in &groups {
+                        @if let Some(g) = group {
+                            span.navgroup role="group" aria-label=(g) {
+                                @for (href, label) in entries {
+                                    a.cur[*href == active] href=(href) aria-current=[(*href == active).then_some("page")] { (label) }
+                                }
+                            }
+                        } @else {
+                            @for (href, label) in entries {
+                                a.cur[*href == active] href=(href) aria-current=[(*href == active).then_some("page")] { (label) }
+                            }
+                        }
+                    }
+                }
+                details.navmenu {
+                    summary {
+                        span.burger aria-hidden="true" { i {} i {} i {} }
+                        "Menu"
+                        @if let Some((_, label)) = chrome.nav.iter().find(|(h, _)| *h == active) {
+                            span.where { " \u{b7} " (label) }
+                        }
+                    }
+                    nav aria-label="Pages" {
+                        @for (group, entries) in &groups {
+                            div.navmenu-group {
+                                @if let Some(g) = group { p.navhead { (g) } }
+                                ul {
+                                    @for (href, label) in entries {
+                                        li { a.cur[*href == active] href=(href) aria-current=[(*href == active).then_some("page")] { (label) } }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 form.seg method="post" action="/theme" {
@@ -314,8 +403,8 @@ fn footer(refresh: Option<u32>) -> Markup {
         footer.foot {
             span { "tessera-web " (tessera_control_types::BUILD_VERSION) }
             @match refresh {
-                Some(r) => { span data-live-status { "live updates every " (r) " s" } }
-                None => { span { "no automatic refresh" } }
+                Some(r) if r > 0 => { span data-live-status { "live updates every " (r) " s" } }
+                _ => { span { "no automatic refresh" } }
             }
             span data-live-clock { "UTC " (hms(SystemTime::now())) }
             a href="/api/v1/status" { "API" }
@@ -871,6 +960,8 @@ fn device_card(d: &DeviceStatus, csrf: &str) -> Markup {
                 &d.tx_channels.len().to_string(),
             ))
 
+            (levels(d, csrf))
+
             @if let Some(locks) = &d.routing_locks {
                 @if !locks.is_empty() { p.muted { "Host routing locks: " (locks.join(", ")) } }
             }
@@ -982,6 +1073,448 @@ fn device_card(d: &DeviceStatus, csrf: &str) -> Markup {
             }
         }
     }
+}
+
+// ---- channel gain and mute ---------------------------------------------------
+
+/// The bottom of a gain slider, dB: this position means off (as the bottom
+/// of a fader's travel does). Exact lower gains come from the command line
+/// or the API; the readout shows them, the slider stops here.
+pub(crate) const SLIDER_OFF_DB: f64 = -80.0;
+/// The top of a gain slider, dB (the contract's ceiling).
+pub(crate) const SLIDER_MAX_DB: f64 = 12.0;
+
+fn dir_word(d: Direction) -> &'static str {
+    match d {
+        Direction::Rx => "rx",
+        Direction::Tx => "tx",
+    }
+}
+
+/// The id of a channel's gain-and-mute row on the Device page: the device
+/// key is part of it, so rows stay unique on a host with several devices.
+fn level_id(key: &str, d: Direction, channel: u16) -> String {
+    format!("level-{}-{}-{channel}", path_segment(key), dir_word(d))
+}
+
+pub(crate) fn parse_dir(s: &str) -> Option<Direction> {
+    match s {
+        "rx" => Some(Direction::Rx),
+        "tx" => Some(Direction::Tx),
+        _ => None,
+    }
+}
+
+/// Signed with one decimal and a real minus, as the page's script formats
+/// a slider while it moves: `−6.0 dB`, `+3.0 dB`, `0.0 dB`, `off`.
+pub(crate) fn slider_text(g: tessera_control_types::Gain) -> String {
+    match g.milli_db() {
+        None => "off".into(),
+        Some(m) => {
+            let tenths = (m.unsigned_abs() + 50) / 100;
+            let body = format!("{}.{}", tenths / 10, tenths % 10);
+            if tenths == 0 {
+                "0.0 dB".into()
+            } else if m < 0 {
+                format!("\u{2212}{body} dB")
+            } else {
+                format!("+{body} dB")
+            }
+        }
+    }
+}
+
+/// Where a gain sits on the slider (off is the bottom).
+pub(crate) fn slider_value(g: tessera_control_types::Gain) -> f64 {
+    g.milli_db().map_or(SLIDER_OFF_DB, |m| {
+        (f64::from(m) / 1000.0).clamp(SLIDER_OFF_DB + 0.5, SLIDER_MAX_DB)
+    })
+}
+
+/// The stylesheet class of a range input's filled part (5 % steps; inline
+/// styles are refused by the content security policy).
+pub(crate) fn fill_class(v: f64, min: f64, max: f64) -> String {
+    let f = if max > min {
+        ((v - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let step = (f * 20.0).round() as u32 * 5;
+    format!("fill-{step}")
+}
+
+/// Per channel: a Mute toggle and a gain slider. A channel whose gain a
+/// connected surface's fader sets shows the slider read-only, with the
+/// surface named; its mute stays available.
+fn levels(d: &DeviceStatus, csrf: &str) -> Markup {
+    let key = &d.key.0;
+    html! {
+        h3 { "Levels and mute" }
+        p.muted {
+            "RX is network → this host; TX is this host → network. "
+            "Input level: the channel's own level (for RX, the network source before the local mix). "
+            "Output level (RX): what the device plays, after the local mix: network audio and monitored local inputs together, like a master fader. "
+            "The bottom of a slider is off. A channel whose input level a control surface's fader sets "
+            "follows that fader while the surface is connected; its mute still works."
+        }
+        div.cols.level-cols {
+            @for (dir, title, chans) in [(Direction::Rx, "Receive (RX · network → this host)", &d.rx_channels), (Direction::Tx, "Transmit (TX · this host → network)", &d.tx_channels)] {
+                @if !chans.is_empty() {
+                    div {
+                        h4 { (title) }
+                        div.table { table.levels {
+                            thead { tr { th { "Channel" } th { "Mute" } th { "Input level" } @if dir == Direction::Rx { th { "Output (after the mix)" } } } }
+                            tbody {
+                                @for c in chans {
+                                    @let n = c.channel.get();
+                                    @let dw = dir_word(dir);
+                                    @let id = level_id(key, dir, n);
+                                    @let input_id = format!("gain-{}-{dw}-{n}", path_segment(key));
+                                    @let owned_id = format!("owner-{}-{dw}-{n}", path_segment(key));
+                                    @let what = format!("{} {n} ({})", dw.to_uppercase(), c.label);
+                                    @let v = slider_value(c.gain);
+                                    tr id=(id) {
+                                        td.chan { (n) " · " bdi { (c.label) } }
+                                        td.mute-cell {
+                                            form.inline method="post" action=(dev_path(key, "mute")) data-live-post {
+                                                input type="hidden" name="csrf" value=(csrf);
+                                                input type="hidden" name="direction" value=(dw);
+                                                input type="hidden" name="channel" value=(n);
+                                                input type="hidden" name="muted" value=(if c.muted { "false" } else { "true" });
+                                                button.mute.on[c.muted] type="submit"
+                                                    aria-pressed=(if c.muted { "true" } else { "false" })
+                                                    aria-label=(format!("Mute {what}")) { (if c.muted { "Muted" } else { "Mute" }) }
+                                            }
+                                            span.note data-live-local {}
+                                        }
+                                        td.gain-cell data-label="Input level" {
+                                            form.gain.locked[c.gain_owner.is_some()] method="post" action=(dev_path(key, &format!("gain/{dw}/{n}"))) data-live-slider="gain" {
+                                                input type="hidden" name="csrf" value=(csrf);
+                                                label.sr for=(input_id) { "Gain of " (what) }
+                                                input id=(input_id) type="range" name="db"
+                                                    min=(SLIDER_OFF_DB) max=(SLIDER_MAX_DB) step="0.5" value=(v)
+                                                    class=(fill_class(v, SLIDER_OFF_DB, SLIDER_MAX_DB))
+                                                    aria-valuetext=(slider_text(c.gain))
+                                                    aria-describedby=[c.gain_owner.as_ref().map(|_| owned_id.as_str())]
+                                                    disabled[c.gain_owner.is_some()];
+                                                output.readout data-readout for=(input_id) { (slider_text(c.gain)) }
+                                                // The note before what changes with the owner: a refresh
+                                                // that locks the slider keeps the note in place.
+                                                span.note data-live-local {}
+                                                @if let Some(o) = &c.gain_owner {
+                                                    span.owned id=(owned_id) {
+                                                        "Locked: set by the "
+                                                        a href=(surfaces::surface_anchor(o)) { bdi { (o) } " fader" }
+                                                    }
+                                                } @else {
+                                                    button.btn.sm.nojs type="submit" { "Set" }
+                                                }
+                                            }
+                                        }
+                                        @if dir == Direction::Rx { (output_cell(key, n, &what, c, csrf)) }
+                                    }
+                                }
+                            }
+                        } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An RX channel's output stage: its mute and level after the local mix.
+fn output_cell(
+    key: &str,
+    n: u16,
+    what: &str,
+    c: &tessera_control_types::ChannelStatus,
+    csrf: &str,
+) -> Markup {
+    let input_id = format!("ogain-{}-rx-{n}", path_segment(key));
+    let v = slider_value(c.output_gain);
+    html! {
+        td.gain-cell.output data-label="Output (after the mix)" {
+            form.inline method="post" action=(dev_path(key, "mute")) data-live-post {
+                input type="hidden" name="csrf" value=(csrf);
+                input type="hidden" name="stage" value="output";
+                input type="hidden" name="direction" value="rx";
+                input type="hidden" name="channel" value=(n);
+                input type="hidden" name="muted" value=(if c.output_muted { "false" } else { "true" });
+                button.mute.on[c.output_muted] type="submit"
+                    aria-pressed=(if c.output_muted { "true" } else { "false" })
+                    aria-label=(format!("Mute the output of {what}")) { (if c.output_muted { "Output muted" } else { "Mute output" }) }
+                span.note data-live-local {}
+            }
+            form.gain method="post" action=(dev_path(key, &format!("gain/rx/{n}"))) data-live-slider="gain" {
+                input type="hidden" name="csrf" value=(csrf);
+                input type="hidden" name="stage" value="output";
+                label.sr for=(input_id) { "Output level of " (what) }
+                input id=(input_id) type="range" name="db"
+                    min=(SLIDER_OFF_DB) max=(SLIDER_MAX_DB) step="0.5" value=(v)
+                    class=(fill_class(v, SLIDER_OFF_DB, SLIDER_MAX_DB))
+                    aria-valuetext=(slider_text(c.output_gain));
+                output.readout data-readout for=(input_id) { (slider_text(c.output_gain)) }
+                span.note data-live-local {}
+                button.btn.sm.nojs type="submit" { "Set" }
+            }
+        }
+    }
+}
+
+/// Answer a small form: a JSON answer to the page's script
+/// (`X-Tessera-Live`), else a redirect with a message.
+pub(crate) fn answer(
+    st: &Shared,
+    token: &str,
+    headers: &HeaderMap,
+    to: &str,
+    r: Result<String, (StatusCode, String)>,
+    extra: serde_json::Value,
+) -> Response {
+    if is_live(headers) {
+        return match &r {
+            Ok(m) => live_answer(StatusCode::OK, true, m, extra),
+            Err((code, m)) => live_answer(*code, false, m, serde_json::json!({})),
+        };
+    }
+    back(st, token, to, r.map_err(|(_, m)| m))
+}
+
+/// A refusal of the daemon as the status and text of [`answer`].
+pub(crate) fn refusal(e: &ClientError) -> (StatusCode, String) {
+    let code = match e {
+        ClientError::Command(c) => command_error_status(c),
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    (code, explain(e))
+}
+
+/// The mute toggle of one channel.
+#[derive(Debug, Deserialize)]
+pub struct MuteForm {
+    #[serde(default)]
+    csrf: String,
+    /// `output`: the RX output stage (after the local mix).
+    #[serde(default)]
+    stage: String,
+    #[serde(default)]
+    direction: String,
+    /// One channel, or several separated by commas (a mixer strip).
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    muted: String,
+    /// Where to return without the script: only the Mixer page
+    /// ([`crate::mixer::back_to`]); otherwise the Device page.
+    #[serde(default)]
+    back: String,
+}
+
+/// Channels of a form or path: `3`, or `1,2` for one command on several
+/// channels (a mixer strip). Each from 1, none twice, at least one.
+pub(crate) fn parse_channels(s: &str) -> Option<Vec<Channel>> {
+    let mut out: Vec<Channel> = Vec::new();
+    for part in s.split(',') {
+        let c = part.trim().parse::<u16>().ok().and_then(Channel::new)?;
+        if out.contains(&c) {
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// `POST /devices/{key}/mute`: mute or unmute one channel (or the
+/// channels of a mixer strip, with one command).
+pub async fn channel_mute(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Form(f): Form<MuteForm>,
+) -> Response {
+    let (token, s) = match need_post(&st, &headers, &f.csrf) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let dir = parse_dir(&f.direction);
+    let ch = parse_channels(&f.channel);
+    let (Some(direction), Some(channels)) = (dir, ch) else {
+        return answer(
+            &st,
+            &token,
+            &headers,
+            crate::mixer::back_to(&f.back)
+                .as_deref()
+                .unwrap_or("/devices"),
+            Err((
+                StatusCode::BAD_REQUEST,
+                "Name a direction (rx or tx) and a channel from 1.".into(),
+            )),
+            serde_json::json!({}),
+        );
+    };
+    let muted = f.muted == "true";
+    let to = crate::mixer::back_to(&f.back)
+        .unwrap_or_else(|| format!("/devices#{}", level_id(&key, direction, channels[0].get())));
+    let target = tessera_control_types::ChannelSet {
+        device: DeviceKey(key),
+        direction,
+        channels,
+    };
+    let words = output::channel_set_words(&target, output::Style::Typographic);
+    let out = f.stage == "output";
+    if out && direction != Direction::Rx {
+        return answer(
+            &st,
+            &token,
+            &headers,
+            &to,
+            Err((
+                StatusCode::BAD_REQUEST,
+                "Only RX channels have an output stage.".into(),
+            )),
+            serde_json::json!({}),
+        );
+    }
+    let cmd = if out {
+        Command::SetOutputMute { target, muted }
+    } else {
+        Command::SetChannelMute { target, muted }
+    };
+    let kind = cmd.kind();
+    let r = call(&st, RequestBody::Command(cmd)).await;
+    tracing::info!(session = %s.id, command = kind, ok = r.is_ok(), "page command");
+    let r = r
+        .map(|_| {
+            format!(
+                "{words}: {}{}.",
+                if out { "output " } else { "" },
+                if muted { "muted" } else { "unmuted" }
+            )
+        })
+        .map_err(|e| refusal(&e));
+    answer(&st, &token, &headers, &to, r, serde_json::json!({}))
+}
+
+/// The gain slider of one channel.
+#[derive(Debug, Deserialize)]
+pub struct GainForm {
+    #[serde(default)]
+    csrf: String,
+    /// `output`: the RX output stage (after the local mix).
+    #[serde(default)]
+    stage: String,
+    #[serde(default)]
+    db: String,
+    /// Where to return without the script: only the Mixer page
+    /// ([`crate::mixer::back_to`]); otherwise the Device page.
+    #[serde(default)]
+    back: String,
+}
+
+/// The gain a slider position asks for: the bottom is off.
+pub(crate) fn gain_of_slider(db: &str) -> Option<tessera_control_types::Gain> {
+    let v: f64 = db.trim().replace('\u{2212}', "-").parse().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    if v <= SLIDER_OFF_DB {
+        return Some(tessera_control_types::Gain::Off);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let g = tessera_control_types::Gain::MilliDb((v * 1000.0).round().clamp(-1e9, 1e9) as i32);
+    g.is_valid().then_some(g)
+}
+
+/// `POST /devices/{key}/gain/{direction}/{channel}`: set one channel's gain
+/// (or, with `1,2` as the channel, the gain of a mixer strip's channels with
+/// one command).
+pub async fn channel_gain(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Path((key, direction, channel)): Path<(String, String, String)>,
+    Form(f): Form<GainForm>,
+) -> Response {
+    let (token, s) = match need_post(&st, &headers, &f.csrf) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let dir = parse_dir(&direction);
+    let ch = parse_channels(&channel);
+    let (Some(direction), Some(channels)) = (dir, ch) else {
+        return answer(
+            &st,
+            &token,
+            &headers,
+            crate::mixer::back_to(&f.back)
+                .as_deref()
+                .unwrap_or("/devices"),
+            Err((StatusCode::NOT_FOUND, "No such channel.".into())),
+            serde_json::json!({}),
+        );
+    };
+    let to = crate::mixer::back_to(&f.back)
+        .unwrap_or_else(|| format!("/devices#{}", level_id(&key, direction, channels[0].get())));
+    let Some(gain) = gain_of_slider(&f.db) else {
+        return answer(
+            &st,
+            &token,
+            &headers,
+            &to,
+            Err((
+                StatusCode::BAD_REQUEST,
+                "A gain is from \u{2212}96 to +12 dB, or the bottom of the slider for off.".into(),
+            )),
+            serde_json::json!({}),
+        );
+    };
+    let target = tessera_control_types::ChannelSet {
+        device: DeviceKey(key),
+        direction,
+        channels,
+    };
+    let words = output::channel_set_words(&target, output::Style::Typographic);
+    let out = f.stage == "output";
+    if out && direction != Direction::Rx {
+        return answer(
+            &st,
+            &token,
+            &headers,
+            &to,
+            Err((
+                StatusCode::BAD_REQUEST,
+                "Only RX channels have an output stage.".into(),
+            )),
+            serde_json::json!({}),
+        );
+    }
+    let cmd = if out {
+        Command::SetOutputGain { target, gain }
+    } else {
+        Command::SetChannelGain { target, gain }
+    };
+    let kind = cmd.kind();
+    let r = call(&st, RequestBody::Command(cmd)).await;
+    tracing::info!(session = %s.id, command = kind, ok = r.is_ok(), "page command");
+    let r = r
+        .map(|_| {
+            format!(
+                "{words}: {} {}.",
+                if out { "output level" } else { "gain" },
+                slider_text(gain)
+            )
+        })
+        .map_err(|e| refusal(&e));
+    answer(
+        &st,
+        &token,
+        &headers,
+        &to,
+        r,
+        serde_json::json!({ "db": slider_value(gain) }),
+    )
 }
 
 /// The device access lock (`device-lock.md` §9.3 L13): Lock with the PIN
@@ -1159,7 +1692,14 @@ pub async fn devices(State(st): State<Shared>, headers: HeaderMap) -> Response {
         Err(e) => error_box(&e),
         Ok(stt) => html! { div.grid { @for d in &stt.devices { (device_card(d, &s.csrf)) } } },
     };
-    page(&st, &token, &s, &headers, view("Device", "/devices"), &body)
+    page(
+        &st,
+        &token,
+        &s,
+        &headers,
+        view("Device", "/devices").every(5),
+        &body,
+    )
 }
 
 /// The device settings form.
@@ -1340,6 +1880,9 @@ fn command_error_status(e: &CommandError) -> StatusCode {
         CommandError::Locked { .. } => StatusCode::CONFLICT,
         CommandError::NotFound { .. } => StatusCode::NOT_FOUND,
         CommandError::PermissionDenied => StatusCode::FORBIDDEN,
+        CommandError::GainOwned { .. } | CommandError::LevelOwned { .. } => StatusCode::CONFLICT,
+        CommandError::InvalidMixer { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        CommandError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
         CommandError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::BAD_GATEWAY,
     }
@@ -1383,19 +1926,22 @@ async fn channels_error(
         .into_response()
 }
 
-/// A device key as one URL path segment (percent-encoded).
-fn dev_path(key: &str, rest: &str) -> String {
-    let mut out = String::from("/devices/");
-    for b in key.bytes() {
+/// A name as one URL path segment (percent-encoded).
+pub(crate) fn path_segment(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(b));
         } else {
             out.push_str(&format!("%{b:02X}"));
         }
     }
-    out.push('/');
-    out.push_str(rest);
     out
+}
+
+/// A device key as one URL path segment (percent-encoded).
+pub(crate) fn dev_path(key: &str, rest: &str) -> String {
+    format!("/devices/{}/{rest}", path_segment(key))
 }
 
 /// Where a command's page is.
@@ -1405,6 +1951,29 @@ fn landing(c: &Command) -> &'static str {
         Command::SetClockRole { .. } | Command::SetClockPriority { .. } => "/clock",
         Command::ReloadConfig => "/config",
         _ => "/devices",
+    }
+}
+
+/// Where a series of commands lands: the Audio page for a card bridge,
+/// else where its first command belongs.
+fn landing_of(cmds: &[Command]) -> &'static str {
+    if cmds.iter().any(|c| {
+        matches!(
+            c,
+            Command::SetCrosspoint { .. }
+                | Command::RemoveCrosspoint { .. }
+                | Command::SetRouter { .. }
+        )
+    }) {
+        return "/router";
+    }
+    if cmds
+        .iter()
+        .any(|c| matches!(c, Command::SetCardBridge { .. }))
+    {
+        "/audio"
+    } else {
+        cmds.first().map_or("/devices", landing)
     }
 }
 
@@ -1422,6 +1991,8 @@ fn applied_message(c: &Command) -> String {
             "Selection cleared: the configured or automatic interface is used.".into()
         }
         Command::ReloadConfig => "Configuration reloaded.".into(),
+        Command::SetCardBridge { bridge } => format!("Bridge `{}` saved.", bridge.name),
+        Command::SetCrosspoint { .. } => "Crosspoint patched.".into(),
         _ => "The change was applied.".into(),
     }
 }
@@ -1467,7 +2038,7 @@ fn confirm_page(
     changed: bool,
     code: StatusCode,
 ) -> Response {
-    let cancel = pending.first().map_or("/devices", landing);
+    let cancel = landing_of(pending);
     let v = view("Confirm the change", cancel);
     // The digest is what makes "confirm what was shown" safe; without one
     // (a daemon that does not seal its impacts) nothing is offered.
@@ -1563,8 +2134,8 @@ pub async fn confirm(
     if f.token.is_empty() {
         return (StatusCode::BAD_REQUEST, "no impact token; start again").into_response();
     }
+    let to = landing_of(&cmds);
     let first = cmds.remove(0);
-    let to = landing(&first);
     let expect = Some(ImpactToken::new(f.token.clone()));
     let kind = first.kind();
     let r = call(&st, RequestBody::confirmed(first.clone(), expect)).await;

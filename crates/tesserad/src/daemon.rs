@@ -258,6 +258,11 @@ fn environment() -> Environment {
     // A build without the hardware bridge refuses `[[bridge]]` entries at
     // load and reload instead of ignoring them.
     env.bridges_supported = crate::bridge::SUPPORTED;
+    // What this tesserad implements (one definition, shared with
+    // `tesseractl config check`): the host router (`media::router`), the
+    // surface runtime's follow and tcp_midi, and the host volume, which
+    // needs libasound (the `alsa-bridge` build).
+    env.runtime = tessera_state::env::RuntimeSupport::tesserad(crate::host_volume::SUPPORTED);
     env
 }
 
@@ -468,6 +473,7 @@ fn start(
         audio_listener,
         notifier: Arc::clone(notifier),
         devices: cfg.devices.len(),
+        lab_surface_root: opts.lab_surface_root.clone(),
         native: opts.native_device.then(|| {
             let mut settings = crate::native::Settings::new(&opts.native_vendor);
             settings.identify_for = Duration::from_secs(opts.native_identify_secs.max(1));
@@ -514,6 +520,8 @@ struct Parts {
     devices: usize,
     /// The daemon-owned device role (`--native-device`).
     native: Option<crate::native::Settings>,
+    /// `--lab-surface-root` (lab only).
+    lab_surface_root: Option<PathBuf>,
 }
 
 struct Done {
@@ -647,6 +655,22 @@ async fn serve(p: Parts, log: &LogControl) -> Result<Done, String> {
     let tracker = TaskTracker::new();
     let counters = Arc::clone(&p.counters);
 
+    // Channel gain and mute go into the media path before any flow or
+    // bridge starts (the runtime pass below starts them): a channel saved
+    // as muted must never play at unity until the gain task catches up.
+    let seeded = tokio::time::timeout(Duration::from_secs(5), async {
+        while !media::gains::seed(&p.handle, p.media_handle.gains()).await {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if seeded.is_err() {
+        tracing::warn!(
+            "channel gain and mute could not be read before the flows start; \
+             they apply as soon as the state engine answers"
+        );
+    }
+
     let tun = p.settings_rx.borrow().tunables.clone();
     let shared_audio = SharedAudioConfig::new(audio_config(&tun, &p.media_handle));
     let audio_ctx = match &p.audio_listener {
@@ -707,6 +731,41 @@ async fn serve(p: Parts, log: &LogControl) -> Result<Done, String> {
         ));
     }
 
+    // Channel gain and mute in the media path follow the state engine; the
+    // control surfaces turn their buttons and faders into commands.
+    let (sup_gains, restarts) = supervisor::supervise("channel gains", shutdown.clone(), {
+        let (e, b, g, s) = (
+            p.handle.clone(),
+            p.bus.clone(),
+            Arc::clone(p.media_handle.gains()),
+            shutdown.clone(),
+        );
+        move || media::gains::run(e.clone(), b.clone(), Arc::clone(&g), s.clone())
+    });
+    counters.track_restarts(restarts);
+    if let Some(root) = &p.lab_surface_root {
+        tracing::warn!(
+            "lab: control-surface devices are read from {} (scripted nodes allowed)",
+            root.display()
+        );
+    }
+    let (sup_volume, restarts) = supervisor::supervise("host volume", shutdown.clone(), {
+        let (e, b, s) = (p.handle.clone(), p.bus.clone(), shutdown.clone());
+        move || crate::host_volume::run(e.clone(), b.clone(), s.clone())
+    });
+    counters.track_restarts(restarts);
+    let surfaces = Arc::new(crate::surfaces::Surfaces::new(p.lab_surface_root.clone()));
+    let (sup_surfaces, restarts) = supervisor::supervise("surface runtime", shutdown.clone(), {
+        let (sf, e, b, s) = (
+            Arc::clone(&surfaces),
+            p.handle.clone(),
+            p.bus.clone(),
+            shutdown.clone(),
+        );
+        move || crate::surfaces::run(Arc::clone(&sf), e.clone(), b.clone(), s.clone())
+    });
+    counters.track_restarts(restarts);
+
     let limiter = PeerLimiter::new(tun.rate);
     let control_ctx = Arc::new(ControlCtx {
         #[cfg(all(test, feature = "routing-shadow"))]
@@ -725,6 +784,7 @@ async fn serve(p: Parts, log: &LogControl) -> Result<Done, String> {
         ),
         counters: Arc::clone(&counters),
         peerlog: PeerLog::new(Duration::from_secs(5)),
+        surfaces: Some(Arc::clone(&surfaces)),
     });
 
     let control_listener = Arc::new(
@@ -735,7 +795,7 @@ async fn serve(p: Parts, log: &LogControl) -> Result<Done, String> {
         move || control::serve(Arc::clone(&l), Arc::clone(&c), t.clone())
     });
     counters.track_restarts(restarts);
-    let mut supervised = vec![sup_control];
+    let mut supervised = vec![sup_control, sup_gains, sup_volume, sup_surfaces];
     if let (Some(l), Some(ctx)) = (p.audio_listener, &audio_ctx) {
         let l = Arc::new(UnixListener::from_std(l).map_err(|e| io_err("audio socket", e))?);
         let (h, restarts) = supervisor::supervise("audio listener", shutdown.clone(), {

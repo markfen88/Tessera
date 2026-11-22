@@ -4,7 +4,8 @@
 //! one real-time thread per running bridge ([`super::rt_loop`]).
 //!
 //! * **Opening** (control thread, allocation allowed): the card
-//!   ([`AlsaCard::open`], non-blocking), the bridge and its resampler, a ring
+//!   ([`open_card`], non-blocking; opened with every channel it needs, the
+//!   bridge sees the slice it carries), the bridge and its resampler, a ring
 //!   for the bridge's channel range sized like an audio client's
 //!   ([`crate::audio::plan_ring`], with room for the bridge's own reads), the
 //!   media session for the ring's other end (without a wake socket: the
@@ -18,7 +19,8 @@
 //! * **Failures.** A card that is missing, busy or cannot be configured, a
 //!   card that is unplugged while running, or a card that keeps failing
 //!   (an xrun or card error in each of [`TROUBLE_WINDOWS`] consecutive
-//!   seconds) is closed and reopened after a back-off (state `reopening`):
+//!   seconds), or a card that stops moving audio without an error for
+//!   [`stall_after`] (counted as a card error) is closed and reopened after a back-off (state `reopening`):
 //!   `error_backoff_min_ms`, doubling up to `error_backoff_max_ms` (by
 //!   default 0.5 s to 30 s; `error_backoff = false` waits the minimum every
 //!   time), from the bridge's entry over `[defaults.bridge]`, read at each
@@ -47,8 +49,8 @@ use std::time::{Duration, Instant};
 use tessera_audio_ipc::proto::Hello;
 use tessera_audio_ipc::{Direction as RingDir, Ring, SampleFormat};
 use tessera_backend_alsa::bridge::{
-    AlsaCard, Bridge, BridgeConfig as LibConfig, BridgeError, BridgeHandle, BridgeStats,
-    CardParams, CardPcm, ErrorSleep, LocalClock, LoopParams, RxLink, TxLink,
+    Bridge, BridgeConfig as LibConfig, BridgeError, BridgeHandle, BridgeStats, CardParams,
+    ErrorSleep, LocalClock, LoopParams, RxLink, TxLink, open_card,
 };
 use tessera_backend_alsa::clock::OverlayClock;
 use tessera_control_types::{BridgeDirection as WireDir, BridgeState, BridgeStatus, DeviceKey};
@@ -59,13 +61,22 @@ use super::rt_loop::{self, Health, LoopEnd, ThreadSetup};
 use crate::audio::{AudioConfig, SharedAudioConfig, plan_ring};
 use crate::engine_thread::{DeviceInfo, EngineHandle};
 use crate::media::worker::SessionEnd;
-use crate::media::{MediaHandle, SessionSpec};
+use crate::media::{MediaHandle, SessionOwner, SessionSpec};
 use crate::ptp::ClockHandle;
 use crate::sanitize::log_safe;
 
 /// Consecutive one-second windows with an xrun or a card error after which
 /// a running card is closed and reopened.
 pub const TROUBLE_WINDOWS: u32 = 3;
+/// A running card that moves no audio this long (and at least
+/// [`STALL_PERIODS`] periods) is stalled: closed and reopened. A card can
+/// stop delivering without an error (an Allen & Heath CQ stops USB capture
+/// unless playback to it runs as well).
+pub const STALL_AFTER: Duration = Duration::from_millis(500);
+/// See [`STALL_AFTER`].
+pub const STALL_PERIODS: u32 = 25;
+/// A freshly opened card has this long to move its first chunk.
+pub const STALL_AT_START: Duration = Duration::from_secs(3);
 /// A run this long resets the back-off.
 const STABLE: Duration = Duration::from_secs(10);
 /// How often the status is reported to the state engine.
@@ -231,6 +242,9 @@ struct Running {
     last_check: Instant,
     last_trouble: u64,
     trouble: u32,
+    /// The chunk count when it last moved, and when.
+    progress_chunks: u64,
+    progress_at: Instant,
 }
 
 enum Phase {
@@ -315,6 +329,15 @@ impl Totals {
             short: self.short + o.short,
         }
     }
+}
+
+/// How long a running card may move no audio before it counts as stalled:
+/// [`STALL_AFTER`], or [`STALL_PERIODS`] periods if that is longer.
+#[must_use]
+pub fn stall_after(p: &BridgePlan) -> Duration {
+    let periods_ns = u64::from(p.period_frames) * u64::from(STALL_PERIODS) * 1_000_000_000
+        / u64::from(p.rate.max(1));
+    STALL_AFTER.max(Duration::from_nanos(periods_ns))
 }
 
 fn wire_dir(d: BridgeDirection) -> WireDir {
@@ -405,6 +428,8 @@ impl Instance {
         );
         r.first_channel = p.first_channel;
         r.channels = p.channels;
+        r.card_first_channel = p.card_first_channel;
+        r.local_only = p.local_only;
         let running = matches!(self.phase, Phase::Running(_));
         (r.time_constant_s, r.max_correction_ppm) = if running {
             self.applied
@@ -548,7 +573,7 @@ pub fn bridge_ring(
     let hello = Hello {
         direction: if playback { RingDir::Rx } else { RingDir::Tx },
         format: SampleFormat::I32,
-        first_channel: u32::from(p.first_channel),
+        first_channel: u32::from(ring_first(p)),
         channel_count: u32::from(p.channels),
         sample_rate_hz: p.rate,
         max_period_frames: reach,
@@ -561,6 +586,12 @@ pub fn bridge_ring(
         .validate(&audio.limits)
         .map_err(|e| ManagerError::RingTooLarge(e.to_string()))?;
     Ok((params, latency))
+}
+
+/// The first device channel a bridge's ring is planned for: a local-only
+/// bridge has none of its own (its ring is numbered from 1 for sizing).
+fn ring_first(p: &BridgePlan) -> u16 {
+    if p.local_only { 1 } else { p.first_channel }
 }
 
 fn loop_params(p: &BridgePlan) -> LoopParams {
@@ -628,6 +659,7 @@ impl Manager {
             );
             r.first_channel = e.first_channel;
             r.channels = e.channels;
+            r.card_first_channel = e.card_first_channel;
             r.last_error = Some(e.reason.clone());
             rows.push(r);
         }
@@ -688,8 +720,28 @@ impl Manager {
             }
             Phase::Running(run) => {
                 run.handle.reap();
+                let chunks = inst.stats.as_ref().map_or(0, |s| {
+                    stat_of(s, inst.plan.direction == BridgeDirection::Playback).chunks
+                });
+                if chunks != run.progress_chunks {
+                    run.progress_chunks = chunks;
+                    run.progress_at = now;
+                }
+                let quiet = now.duration_since(run.progress_at);
+                let stalled = if chunks == 0 {
+                    quiet >= STALL_AT_START
+                } else {
+                    quiet >= stall_after(&inst.plan)
+                };
                 if run.rt.is_finished() {
                     reopen_why = Some(String::new());
+                } else if stalled {
+                    // Counted as a card error (the status row's counter).
+                    inst.totals.card_errors += 1;
+                    reopen_why = Some(format!(
+                        "the card stopped moving audio without an error (nothing for {} ms); reopening",
+                        quiet.as_millis()
+                    ));
                 } else if now.duration_since(run.last_check) >= Duration::from_secs(1) {
                     run.last_check = now;
                     let t = inst.stats.as_ref().map_or(0, |s| {
@@ -745,7 +797,7 @@ impl Manager {
     }
 
     fn device_info(p: &BridgePlan) -> DeviceInfo {
-        let span = (p.first_channel - 1).saturating_add(p.channels);
+        let span = (ring_first(p) - 1).saturating_add(p.channels);
         DeviceInfo {
             key: p.device.clone(),
             rx_channels: if p.direction == BridgeDirection::Playback {
@@ -820,9 +872,12 @@ impl Manager {
         let params = CardParams {
             period_frames: p.period_frames as usize,
             periods,
+            card_first_channel: u32::from(p.card_first_channel),
             ..CardParams::new(&p.pcm, p.rate, u32::from(p.channels))
         };
-        let card = AlsaCard::open(&params, playback).map_err(ManagerError::Open)?;
+        // Opened with all the channels it needs; the bridge sees only the
+        // slice it carries.
+        let card = open_card(&params, playback).map_err(ManagerError::Open)?;
         let (period, buffer) = (card.period_frames(), card.buffer_frames());
         let cfg = LibConfig {
             quality: p.media_quality(),
@@ -831,7 +886,6 @@ impl Manager {
             prefill_periods: (buffer / period.max(1)).saturating_sub(1).max(1),
             ..LibConfig::default()
         };
-        let card: Box<dyn CardPcm> = Box::new(card);
         let (pb, cap) = if playback {
             (Some(card), None)
         } else {
@@ -872,11 +926,21 @@ impl Manager {
         let spec = SessionSpec {
             id: session,
             device: p.device.clone(),
-            first_channel: u32::from(p.first_channel),
+            // A local-only bridge's ring carries card channels.
+            first_channel: u32::from(if p.local_only {
+                p.card_first_channel
+            } else {
+                p.first_channel
+            }),
             channel_count: u32::from(p.channels),
             format: SampleFormat::I32,
             end,
             wake: None,
+            port: if p.local_only {
+                SessionOwner::Card(p.pcm.clone())
+            } else {
+                SessionOwner::Bridge
+            },
         };
         if !self.deps.media.add_session(spec) {
             return Err(ManagerError::MediaBusy);
@@ -922,6 +986,8 @@ impl Manager {
             last_check: now,
             last_trouble: 0,
             trouble: 0,
+            progress_chunks: 0,
+            progress_at: now,
         }))
     }
 
@@ -1068,6 +1134,8 @@ mod tests {
             direction: tessera_state::config::BridgeDirection::Playback,
             first_channel: 1,
             channels: 2,
+            card_first_channel: 1,
+            local_only: false,
             rate,
             period_frames: rate / 100,
             buffer_frames: rate / 25,
@@ -1091,6 +1159,22 @@ mod tests {
             )
             .error_sleep(&tessera_state::config::BridgeDefaults::default()),
         }
+    }
+
+    #[test]
+    fn a_stall_is_half_a_second_or_25_periods() {
+        // 10 ms periods: 250 ms of periods, so the floor.
+        assert_eq!(
+            super::stall_after(&plan(48_000, 120.0, 200.0)),
+            super::STALL_AFTER
+        );
+        // 100 ms periods: 2.5 s.
+        let mut p = plan(48_000, 120.0, 200.0);
+        p.period_frames = 4_800;
+        assert_eq!(
+            super::stall_after(&p),
+            std::time::Duration::from_millis(2_500)
+        );
     }
 
     /// A reloaded `error_backoff*` / `error_sleep*` for the same card is

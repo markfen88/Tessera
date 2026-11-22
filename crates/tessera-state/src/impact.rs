@@ -286,6 +286,11 @@ pub fn check_channel_counts(
 /// | `Subscribe`, `Unsubscribe` | none | only that RX channel changes |
 /// | `SetClockRole`, `SetClockPriority` | none | sent to the running PTP port as live commands; nothing restarts |
 /// | `LockAccess`, `UnlockAccess`, `ResetAccessLock` | none | only what later commands may change; media is untouched |
+/// | `SetChannelMute`, `SetChannelGain` | none | applied to the running media path in place |
+/// | `SetSurface`, `RemoveSurface`, `ReportSurfaceConnection` | none | the surface runtime opens or closes the device; audio is untouched |
+/// | `SetCardBridge`, `RemoveCardBridge` | none | only that bridge (re)starts; the device and its other channels are untouched |
+/// | `SetMonitor` | none | the monitor mix changes in place |
+/// | `SetOutputGain`, `SetOutputMute` | none | applied to the running media path in place, after the monitor mix |
 /// | `SetSampleRate`, `SetEncoding`, `SetLatency` | device | the device's flows are rebuilt and its audio clients detached (new ring geometry) |
 /// | `SetDeviceChannels` | device | as above, plus channels and their subscriptions go away |
 /// | `SetPrimaryInterface` | device (every device) | the PTP port restarts on the new interface and every flow moves |
@@ -314,7 +319,30 @@ pub fn declared_scope(cmd: &Command) -> RestartScope {
         | Command::SetClockPriority { .. }
         | Command::LockAccess { .. }
         | Command::UnlockAccess { .. }
-        | Command::ResetAccessLock { .. } => RestartScope::None,
+        | Command::ResetAccessLock { .. }
+        | Command::SetChannelMute { .. }
+        | Command::SetChannelGain { .. }
+        | Command::SetSurface { .. }
+        | Command::RemoveSurface { .. }
+        | Command::ReportSurfaceConnection { .. }
+        | Command::SetCardBridge { .. }
+        | Command::RemoveCardBridge { .. }
+        | Command::SetMonitor { .. }
+        | Command::SetOutputGain { .. }
+        | Command::SetOutputMute { .. }
+        | Command::SetRouter { .. }
+        | Command::ResetRouter
+        | Command::SetCrosspoint { .. }
+        | Command::RemoveCrosspoint { .. }
+        | Command::SetCrosspointGain { .. }
+        | Command::SetCrosspointMute { .. }
+        | Command::SetPortGain { .. }
+        | Command::SetPortMute { .. }
+        | Command::SetPortLabel { .. }
+        | Command::SetHostVolume { .. }
+        | Command::SetHostMute { .. }
+        | Command::SetMixer { .. }
+        | Command::RemoveMixer { .. } => RestartScope::None,
         // A command added to control-types later: assume the worst until
         // this table names it.
         _ => RestartScope::Daemon,

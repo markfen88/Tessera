@@ -1,0 +1,26 @@
+[package]
+name = "tessera-surface"
+description = "Hardware control surfaces (mute buttons, faders) mapped to channel gain and mute intents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+autotests = false
+autoexamples = false
+autobenches = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tessera-control-types = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+# Surface profiles are TOML (preferred) or JSON files.
+toml = "1.1"
+serde_json = "1"
+
+[lib]
+test = false
+bench = false
+doctest = false

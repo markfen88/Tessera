@@ -646,6 +646,15 @@ impl DiscoveryManager {
                         .is_err()
                 {
                     snapshot.health.rejected_observations += 1;
+                    // Kept by owner: only that device is incomplete.
+                    let owner = crate::routing_inventory::Rejected::of(&observation);
+                    if !snapshot.rejected.contains(&owner) {
+                        if snapshot.rejected.len() < crate::routing_inventory::MAX_REJECTED {
+                            snapshot.rejected.push(owner);
+                        } else {
+                            snapshot.rejected_unscoped = true;
+                        }
+                    }
                 } else {
                     snapshot.observations.push(observation);
                 }

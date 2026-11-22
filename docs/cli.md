@@ -44,7 +44,11 @@ Usage: tesseractl [OPTIONS] <COMMAND>
 Commands:
   status        Show devices, subscriptions, clocks and warnings
   metrics       Show the daemon's counters and gauges
+  routing       Inspect discovered endpoints, channels and receiver-reported selections
   bridges       Show the in-daemon hardware-card bridges (`[[bridge]]`)
+  bridge        Sound-card bridges: list, add or remove one
+  monitor       Local monitoring: also play local inputs (TX channels) on this device's own outputs (RX channels)
+  flows         Inspect flow counters or replace the controller-managed flow set
   watch         Stream state-change events until interrupted
   set-name      Rename the device
   set-rate      Set the sample rate
@@ -57,6 +61,17 @@ Commands:
   clock         Clock status and settings
   network       Network interfaces and the primary interface
   config        Configuration
+  access        The device access lock: freeze the device's configuration and routing behind a four-digit PIN
+  mute          Mute channels. Mute is never taken over by a control surface
+  unmute        Unmute channels
+  gain          Set the gain of channels, in dB (-96 to +12; 0 is unity) or `off`
+  output-gain   Set the OUTPUT level of RX channels (after the local mix)
+  output-mute   Mute the OUTPUT of RX channels (after the local mix), or unmute with --off
+  surfaces      Show the devices the host has (USB HID interfaces, MIDI ports, sound cards) and the configured control surfaces with their live control values
+  surface       Manage control surfaces (apply JSON specs, add MIDI over TCP, learn controls, enable, disable, remove); map their controls in the web portal or the configuration
+  router        The host router: one grid of crosspoints between network channels and local I/O, with port levels
+  volume        The host (speaker amplifier) volume (`[host_volume]` in the configuration)
+  mixer         Saved mixer panels (the web portal's mixing desk pages)
   completions   Print a shell completion script
   help          Print this message or the help of the given subcommand(s)
 
@@ -185,9 +200,62 @@ One row per `[[bridge]]`: `BRIDGE DEVICE DIR CHANNELS CARD STATE FILL POS ERR
 CORR PPM TREND PPM RATIO XRUNS SLIPS SHORT REOPENS`, then the last error of
 each bridge that has one. `No bridges.` when there are none. The state is
 `starting`, `running`, `reopening`, `failed` or `disabled`, followed by
-`(no rt)` when real-time scheduling was refused. The same rows appear in
+`(no rt)` when real-time scheduling was refused. CHANNELS is `router` for a
+bridge opened for the host router only (`local_only`). The same rows appear in
 `status` and `metrics`; the JSON has every field of `BridgeStatus`
 ([control-interface.md](control-interface.md#bridges)).
+
+#### `bridge`
+
+```text
+Usage: tesseractl bridge list [OPTIONS]
+Usage: tesseractl bridge add [OPTIONS] --card <CARD> --direction <DIRECTION> --channels <CHANNELS> <NAME>
+        (--first <N>, default 1; --card-first <N>, default 1; --period-frames <N> | --low-latency; --disabled; --local-only)
+Usage: tesseractl bridge remove [OPTIONS] <NAME>
+```
+
+Provisional (0.x; from `crates/tesseractl/src/cli.rs`). `bridge list` is `bridges`. `bridge add` saves a sound-card bridge by command (`SetCardBridge`,
+admin rights), or replaces the one with that name: `--direction capture` sends the card's inputs `--card-first`.. to TX channels
+`--first`.. of the device (`-d`, optional with one device), `--direction playback` plays RX channels `--first`.. on
+the card's outputs `--card-first`.. (`--card-first` defaults to 1; set for example `--card-first 15` for an Allen & Heath CQ's Main L/R mix on USB channels 15–16).
+`--card` is the ALSA PCM (`surfaces` lists it under DETAILS). `--low-latency` asks for
+96-frame card periods (2 ms at 48 kHz); `--period-frames` sets another; without either the daemon's default (10 ms)
+applies. `bridge remove` removes a bridge saved this way; a `[[bridge]]` of the configuration files cannot be replaced
+or removed by command (refused, exit 1). The channels must exist on the device: grow it with `set-channels` first (the
+[web portal](web-portal.md#audio) does both in one confirmed step). `--local-only` opens the card for the host router only
+(`local_only = true`): its channels `--card-first`.. become router ports (`in:CARD:N` for capture, `out:CARD:N` for
+playback) and no device channel is fed or read, so the card stays off the network until a crosspoint patches it there
+([`router patch`](#router)). The device still gives the bridge its clock and rate, `--first` is refused, and the device
+needs no free channels. It needs a daemon with the host router (refused otherwise).
+
+```sh
+tesseractl -d speaker bridge add sc3-in --card hw:CARD=SC3,DEV=0 --direction capture --channels 2
+#   bridge sc3-in saved: hw:CARD=SC3,DEV=0 in 1-2 -> speaker TX 1-2
+tesseractl -d speaker bridge add cq-main --card hw:CARD=CQ,DEV=0 --direction capture --card-first 15 --channels 2 --low-latency
+tesseractl -d speaker bridge add cq-local --card hw:CARD=CQ,DEV=0 --direction capture --card-first 15 --channels 2 --local-only
+#   bridge cq-local saved: hw:CARD=CQ,DEV=0 in 15-16 -> host router only
+tesseractl -d speaker bridge add dac --card hw:CARD=DAC,DEV=0 --direction playback --first 3 --channels 2 --low-latency
+tesseractl bridge remove dac
+```
+
+#### `monitor`
+
+```text
+Usage: tesseractl monitor [OPTIONS] <DEVICE> <RX_FROM_TX>   (--delay-ms <MS>)
+```
+
+Local monitoring (`SetMonitor`, admin rights): RX channel 1, 2, ... of the device also plays the TX channel given at
+that place of the comma-separated list (0: none), after that TX channel's gain and mute; `off` (or `none`) switches it
+off. Trailing zeros are dropped. `--delay-ms` (0 to 1000, decimals allowed, or `auto`) is how far behind playback the
+inputs are read; `auto` or 0 (the default) is the lowest delay at which a feeding capture bridge's audio is reliably
+there. Without it the delay in effect is kept. It overrides `[[device]] monitor_rx_from_tx`. `status` shows the map in
+`--json` (`monitor_rx_from_tx`, `monitor_delay_us`).
+
+```sh
+tesseractl monitor speaker 1,2 --delay-ms 20   # speaker: RX 1 plays TX 1, RX 2 plays TX 2
+tesseractl monitor speaker 0,0,1,2             # RX 3-4 play TX 1-2
+tesseractl monitor speaker off
+```
 
 #### `watch`
 
@@ -206,8 +274,22 @@ Options:
 Plus the [global options](#global-options).
 
 Prints one line per state change, made by any client, until `--count` events
-were shown, `--for` seconds passed, or Ctrl-C. When the daemon reports that this
-subscriber fell behind, the human view prints `-- N events were dropped;
+were shown, `--for` seconds passed, or Ctrl-C. The host router, mixer panels and host volume have
+their own lines:
+
+```text
+host router changed (cli uid 1000)
+crosspoint in:hw:CARD=CQ,DEV=0:15 -> host:main:1: gain -6 dB (surface cq)
+crosspoints in:hw:CARD=CQ,DEV=0:15 -> host:main:1, in:hw:CARD=CQ,DEV=0:16 -> host:main:2: muted (cli uid 1000)
+router ports in:hw:CARD=CQ,DEV=0:15, in:hw:CARD=CQ,DEV=0:16: level -3 dB (surface cq)
+router port in:hw:CARD=CQ,DEV=0:15: unmuted (cli uid 1000)
+host volume: -20 dB, muted (surface cq)
+mixer panel speakers changed (cli uid 1000)
+```
+
+A router or mixer line says that something changed; `router show` and `mixer list` show the result.
+
+When the daemon reports that this subscriber fell behind, the human view prints `-- N events were dropped;
 current state follows --` and the current status; the JSON view prints the
 `lagged` reply.
 
@@ -445,8 +527,8 @@ Commands:
   help              Print this message or the help of the given subcommand(s)
 ```
 
-The same operations as the portal's Routing page
-([web-portal.md](web-portal.md#routing)). The subcommands' arguments were not
+The same operations as the portal's Network routing page
+([web-portal.md](web-portal.md#network-routing)). The subcommands' arguments were not
 captured; from the source (`crates/tesseractl/src/cli.rs`):
 
 | Command | Arguments | Effect |
@@ -617,6 +699,255 @@ tesseractl --json status | jq '.devices[] | {key, access_locked}'
 
 `--json status` adds `"access_locked": true` to a locked device (absent when it is open). `watch` prints
 `main: access lock set (cli uid 1000)` and `... removed ...` on each change.
+
+### Channel gain, mute and control surfaces
+
+Provisional (0.x): the contract of these commands may still gain fields.
+
+#### `mute`, `unmute`, `gain`
+
+```text
+Usage: tesseractl mute [OPTIONS] <DEVICE> <DIRECTION> <CHANNELS>
+Usage: tesseractl unmute [OPTIONS] <DEVICE> <DIRECTION> <CHANNELS>
+Usage: tesseractl gain [OPTIONS] <DEVICE> <DIRECTION> <CHANNELS> <GAIN>
+
+Arguments:
+  <DEVICE>     Logical device key (as in `status`)
+  <DIRECTION>  `rx` (network → this host) or `tx` (this host → network)
+  <CHANNELS>   Channels from 1: `1`, `1,2`, `1-4` or `1-2,5`
+  <GAIN>       Gain in dB (for example -6, -6.5 or +3; a `dB` suffix is allowed), or `off` for silence
+```
+
+The device is an argument here (not `--device`), so one line names exactly which channels change. A gain is
+-96 to +12 dB in steps of 0.001 dB (0 is unity), or `off` (silence); a value outside that is a usage error (exit 2)
+and nothing is sent. Both are saved intent (they survive a restart) and need admin rights.
+
+**Fader priority.** While a control surface is connected, the gain of a channel that one of its non-motorized faders
+is bound to is set by that fader only. `gain` is then refused (exit 1) with
+`the gain of main tx channel 1 is set by the sc3 fader; mute still works`. Mute is never taken over: `mute` and
+`unmute` always work. A motorized fader does not take a channel over (the fader follows the new gain), and unplugging
+the surface releases its channels.
+
+```sh
+tesseractl mute main tx 1-2        # main TX 1-2: muted
+tesseractl unmute main tx 1,2
+tesseractl gain main rx 1-2 -6     # main RX 1-2: gain set to -6 dB
+tesseractl gain main rx 3 off
+```
+
+`status --device main` shows a channel's state after its label when it is not unity and unmuted:
+`1  Mic  [muted, -6 dB, gain set by the sc3 fader]`; `--json` has `gain` (`{"milli_db": -6000}` or `"off"`),
+`muted` and `gain_owner` per channel. `watch` prints `main TX 1-2: muted (cli uid 1000)` and
+`main RX 1-2: gain -6 dB (surface sc3)`.
+
+#### `output-gain`, `output-mute`
+
+```text
+Usage: tesseractl output-gain [OPTIONS] <DEVICE> <CHANNELS> <GAIN>
+Usage: tesseractl output-mute [OPTIONS] <DEVICE> <CHANNELS>   (--off to unmute)
+```
+
+The OUTPUT stage of RX channels (`SetOutputGain`, `SetOutputMute`): applied after the local mix, so it scales network
+audio and monitored inputs together, like a master fader; independent of `gain` (the channel's input level). An
+`OutputGain` surface binding does not take over the output level, but a connected non-motorized fader bound to
+`PortGain` on that channel's `host_out` router port does own it (then `output-gain` is refused with `LevelOwned`, exit 1;
+mute still works). The channels are RX channels.
+
+```sh
+tesseractl output-gain speaker 1-2 -6     # speaker RX 1-2: output level set to -6 dB
+tesseractl output-mute speaker 1-2
+tesseractl output-mute speaker 1-2 --off
+```
+
+`status --device` adds `output muted` and `output -6 dB` to a channel's state, and `output level set by the cq fader`
+when a fader owns the output level (`output_gain_owner` in `--json`); `watch` prints
+`speaker RX 1-2: output level -6 dB (...)`.
+
+#### `surfaces`
+
+```text
+Show the devices the host has (USB HID interfaces, sound cards) and the configured control surfaces with their live control values
+
+Usage: tesseractl surfaces [OPTIONS]
+```
+
+First the detected devices (`ID KIND NAME USB IFACE NODE DETAILS USED BY`): the ID, for example `hid:3142:0c33:3`,
+`midi:CQ:0` or `card:SC3`, is what `surface learn` takes; DETAILS has a sound card's inputs, outputs, rates and PCM
+(the `--card` of `bridge add`) and a MIDI port's card. A surface's next line is its source (`USB 3142:0c33,
+interface 3` or `MIDI card CQ, port 0`); a MIDI control shows its message (`[NRPN 40/00 (8192), ch 1]`, NRPN as
+MSB/LSB in hex the way desk manuals write it), a motorized fader says so, and a fader that follows a fader law shows
+its range with `(the desk's fader law)`. Then each configured surface with its state (`connected (<id>)`,
+`not found`, `not connected: <problem>` such as a permission problem, or `disabled`), each control with its live
+value (`128/255` for a fader, `pressed` / `released` for a button, `-` until the device has reported it), and each
+binding in words:
+
+```text
+Surface sc3: connected (hid:3142:0c33:3)
+  source: USB 3142:0c33, interface 3
+  mic-fader  fader  128/255
+    Gain: main TX 1-2, -60..0 dB, owns gain
+  mic-mute  button  released
+    Mute: main TX 1-2, toggle
+```
+
+`--json` prints the `SurfacesReport` ([control-interface.md](control-interface.md)).
+
+#### `surface`
+
+```text
+Usage: tesseractl surface set [OPTIONS] --file <FILE>
+Usage: tesseractl surface remove [OPTIONS] <NAME>
+Usage: tesseractl surface enable [OPTIONS] <NAME>
+Usage: tesseractl surface disable [OPTIONS] <NAME>
+Usage: tesseractl surface learn [OPTIONS] <DETECTED_ID>   (--wait <SECONDS>, default 10, 1 to 30; --fader)
+Usage: tesseractl surface tcp-midi [OPTIONS] <NAME> <HOST> [PORT]
+```
+
+From `crates/tesseractl/src/cli.rs` (admin rights for all six):
+
+* `surface set --file <FILE>`: add or replace a control surface from a JSON
+  file (`-` for standard input) holding a `SurfaceSpec` (`{"name", "enabled",
+  "source", "controls", "bindings"}` — the exact shape of each `surfaces[].spec`
+  element that `tesseractl surfaces --json` prints).
+* `surface remove <NAME>`: remove a configured surface; any levels its faders
+  owned can be set from elsewhere again.
+* `surface enable <NAME>` / `surface disable <NAME>`: turn a configured surface
+  on or off. The command reads the surface's saved spec (`Query::Surfaces`),
+  changes only `enabled` and saves it back (`SetSurface`); controls, mappings
+  and source stay. A disabled surface keeps its entry, but the daemon leaves its
+  device alone and it owns no level. Prints `surface <NAME> enabled` (or
+  `disabled`), or `surface <NAME> is already enabled` without sending anything;
+  `--json` prints `{"ok":true,"changed":<bool>}`. An unknown name exits 2.
+* `surface tcp-midi <NAME> <HOST> [PORT]`: configure a surface read over raw
+  MIDI on a TCP connection `tesserad` opens to `HOST:PORT` (`PORT` defaults to
+  `51325`, the Allen & Heath CQ TCP MIDI port). If surface `<NAME>` already
+  exists, its controls and bindings are preserved and only its source changes;
+  otherwise a new enabled surface with no controls yet is added. Tessera only
+  connects out and never listens.
+* `surface learn <DETECTED_ID>`: watches a detected device for `--wait` seconds
+  (at most 30) and prints the first control that moves, as the suggested HID
+  layout (kind, report id, bit offset, bits, max, inverted or active-low), or
+  for a MIDI device the message (`midi  NRPN 40/02 (8194), ch 1`) and max;
+  `Nothing moved in 10 s.` otherwise, and `null` with `--json`. Keep your hands
+  off the control for the first second (the daemon reads the device at rest to
+  learn its noise), then press a button once, or, with `--fader`, move the
+  fader from the bottom all the way up (that tells an inverted fader). The
+  request waits longer than `--timeout` by the wait.
+
+```sh
+tesseractl surface tcp-midi cq 192.0.2.40
+tesseractl surfaces --json | jq '.surfaces[0].spec' > cq-surface.json
+tesseractl surface set --file cq-surface.json
+tesseractl surface learn hid:3142:0c33:3 --fader --wait 15
+tesseractl surface disable cq
+tesseractl surface enable cq
+tesseractl surface remove cq
+```
+
+### Host router, host volume and mixer panels
+
+Provisional (0.x; from `crates/tesseractl/src/cli.rs`).
+
+#### `router`
+
+```text
+Usage: tesseractl router show [OPTIONS]
+Usage: tesseractl router patch [OPTIONS] <SOURCE> <DESTINATION> [--gain <GAIN>] [--muted]
+Usage: tesseractl router unpatch [OPTIONS] <SOURCE> <DESTINATION>
+Usage: tesseractl router gain [OPTIONS] <SOURCE> <DESTINATION> <GAIN>
+Usage: tesseractl router mute [OPTIONS] <SOURCE> <DESTINATION> [--off]
+Usage: tesseractl router port-gain [OPTIONS] <PORT> <GAIN>
+Usage: tesseractl router port-mute [OPTIONS] <PORT> [--off]
+Usage: tesseractl router set [OPTIONS] --file <FILE>
+Usage: tesseractl router reset [OPTIONS]
+```
+
+Controls the host router grid (`Query::Router`, `SetCrosspoint`,
+`RemoveCrosspoint`, `SetCrosspointGain`, `SetCrosspointMute`, `SetPortGain`,
+`SetPortMute`, `SetRouter`, `ResetRouter`). All subcommands except `show`
+require admin rights.
+
+**Port syntax:** `KIND:NAME:CHANNEL` (1-based channel; both short forms and the
+JSON kind names are accepted):
+
+| Short form | JSON kind | Role | Meaning |
+|---|---|---|---|
+| `rx:<device>:<n>` | `network_rx` | source | Network RX channel `n` (after channel gain/mute) |
+| `tx:<device>:<n>` | `network_tx` | destination (or tap) | Network TX channel `n` |
+| `app:<device>:<n>` | `app_out` | source | Local application playback into channel `n` |
+| `host:<device>:<n>` | `host_out` | destination (or tap) | Local application capture / speaker output `n` |
+| `in:<card>:<n>` | `card_in` | source | Sound-card input `n` (`<card>` is the bridge's ALSA PCM, e.g. `hw:CARD=CQ,DEV=0`) |
+| `out:<card>:<n>` | `card_out` | destination (or tap) | Sound-card output `n` |
+
+A destination port used as `<SOURCE>` is a tap of what that destination
+carries after its own level and mute (loops through taps are refused). When no
+grid is saved yet, the first edit (`patch`, `unpatch`, `gain`, `mute`) saves
+the default grid first and then applies the edit; `router reset` returns to the
+default grid. `router set --file <FILE>` (`-` for standard input) replaces the
+whole saved grid and local port labels from a JSON `RouterSpec`
+(`{"crosspoints": [...], "labels": [...]}`). Crosspoints implied by a network
+card bridge (without `local_only`) are read-only and changed via the bridge.
+
+```sh
+tesseractl router show
+tesseractl router patch in:hw:CARD=CQ,DEV=0:15 host:main:1
+tesseractl router gain in:hw:CARD=CQ,DEV=0:15 host:main:1 -6
+tesseractl router mute in:hw:CARD=CQ,DEV=0:15 host:main:1
+tesseractl router mute in:hw:CARD=CQ,DEV=0:15 host:main:1 --off
+tesseractl router port-gain in:hw:CARD=CQ,DEV=0:15 -3
+tesseractl router port-mute in:hw:CARD=CQ,DEV=0:15
+tesseractl router unpatch in:hw:CARD=CQ,DEV=0:15 host:main:1
+tesseractl router reset
+```
+
+With `--json`, `router show` prints `RouterReport`.
+
+#### `volume`
+
+```text
+Usage: tesseractl volume show [OPTIONS]
+Usage: tesseractl volume set [OPTIONS] <GAIN>
+Usage: tesseractl volume mute [OPTIONS] [--off]
+```
+
+Reads and sets the daemon-owned host (speaker amplifier) volume configured by
+`[host_volume]` in `/etc/tessera/config.d/` (`SetHostVolume`, `SetHostMute`).
+`show` prints the card, control, range, saved value, last hardware reading,
+fader owner and any problem (`--json` prints `HostVolumeStatus` or `null`).
+`set` takes dB within the configured `[min_db, max_db]` range or `off` (bottom
+of the control), and is refused with `LevelOwned` (exit 1) while a connected
+non-motorized surface fader owns the host volume; `mute` / `mute --off` always
+work. `set` and `mute` need admin rights.
+
+```sh
+tesseractl volume show
+tesseractl volume set -18
+tesseractl volume set off
+tesseractl volume mute
+tesseractl volume mute --off
+```
+
+#### `mixer`
+
+```text
+Usage: tesseractl mixer list [OPTIONS]
+Usage: tesseractl mixer set [OPTIONS] --file <FILE>
+Usage: tesseractl mixer remove [OPTIONS] <ID>
+```
+
+Manages saved mixer panels shown on `/mixer` in the web portal (`Query::Mixers`,
+`SetMixer`, `RemoveMixer`). `mixer list` prints each saved panel and its strips
+(`--json` prints the `Vec<MixerSpec>` array). `mixer set --file <FILE>` (`-`
+for standard input, admin rights) adds or replaces a panel from a JSON
+`MixerSpec` (`{"id", "title", "strips"}`). `mixer remove <ID>` (admin rights)
+deletes a saved panel.
+
+```sh
+tesseractl mixer list
+tesseractl mixer list --json | jq '.[0]' > main-panel.json
+tesseractl mixer set --file main-panel.json
+tesseractl mixer remove main
+```
 
 #### `completions`
 

@@ -1,3 +1,20 @@
+tessera (0.6.0-1) unstable; urgency=medium
+
+  Tessera becomes a host audio router. The host is one network device;
+  sound cards, the speaker amplifier and local applications are local I/O
+  that reach the network only when patched. New: the Router page, card
+  bridges with a card channel offset and local-only bridges, control
+  surfaces over USB MIDI, HID and MIDI over TCP with profiles, user-built
+  mixer panels, and the speaker volume set by tesserad ([host_volume]).
+
+  tesserad now runs with the supplementary group audio (sound cards and
+  MIDI ports). The speaker installer writes
+  /etc/tessera/config.d/60-host-volume.toml; a 0.5.x tesserad refuses
+  that table, so uninstall with the 0.6.0 bundle before a downgrade (see
+  the CHANGELOG, "Rollback to 0.5.x").
+
+ -- tessera maintainers <tessera@invalid>  Sun, 22 Nov 2026 10:20:00 +0000
+
 tessera (0.5.2-1) unstable; urgency=medium
 
   A packaging release: tesserad, tesseractl and the portal are those of

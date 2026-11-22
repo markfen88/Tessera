@@ -171,9 +171,10 @@ fn serve(cfg: WebConfig) -> ExitCode {
             Err(error) => { eprintln!("tessera-web: {error}"); return ExitCode::FAILURE; }
         };
         let peer_app = tessera_web::routing_peers::machine_router(state.clone());
-        if let Some(appliance) = &state.appliance {
-            // The amplifier's saved volume, set again as soon as its card is there.
-            tessera_web::appliance::volume::spawn_restore(Arc::clone(appliance));
+        if state.appliance.is_some() {
+            // The amplifier's saved volume, set again as soon as its card is
+            // there, or handed to tesserad once it sets the volume itself.
+            tessera_web::appliance::volume::spawn_restore(Arc::clone(&state));
         } else if cfg.appliance.rate_follow.enabled {
             tracing::warn!("[appliance.rate_follow] is enabled but appliance mode is off: the rate follower does not run");
         }

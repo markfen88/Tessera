@@ -48,6 +48,29 @@ pub(crate) fn glibc_ceiling(dynamic_symbols: &str) -> Option<(u32, u32)> {
         .max()
 }
 
+/// Where the shipped surface profiles live in the tree.
+pub(crate) const SURFACE_PROFILES: &str = "crates/tessera-surface/profiles";
+
+/// The file names of the shipped surface profiles (`*.toml`), sorted. The
+/// tessera package installs them in `/usr/share/tessera/surfaces/`.
+pub(crate) fn surface_profiles(root: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(root.join(SURFACE_PROFILES))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_file() && name.ends_with(".toml") {
+            names.push(name);
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        return Err(Failure::new(format!(
+            "no surface profiles in {SURFACE_PROFILES}"
+        )));
+    }
+    Ok(names)
+}
+
 /// Whether a file is an ELF object (shared library or program).
 pub(crate) fn is_elf(path: &Path) -> bool {
     use std::io::Read;
@@ -110,23 +133,66 @@ pub(crate) fn dependency_floor(entry: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+/// The documentation files of `docs/` that the packages ship (by name, without `.md`) and the
+/// package that ships each.
+pub(crate) const SHIPPED_DOCS: &[(&str, &str)] = &[
+    ("user-guide", "tessera"),
+    ("rt-tuning", "tessera"),
+    ("troubleshooting", "tessera"),
+    ("configuration", "tessera"),
+    ("network-vlans", "tessera"),
+    ("surface-profiles", "tessera"),
+    ("web-portal", "tessera-web"),
+    ("dsp", "tessera-dsp"),
+    ("raspberry-pi-speaker", "tessera-dsp"),
+];
+
+/// Where the images of the documentation are, relative to `docs/` and to the documentation
+/// directory of [`IMAGE_PACKAGE`], which ships every image a shipped document shows.
+pub(crate) const DOC_IMAGES: &str = "images/";
+
+/// The package that ships the images: every other package depends on it.
+pub(crate) const IMAGE_PACKAGE: &str = "tessera";
+
 /// The package that ships a documentation file of `docs/` (by name, without `.md`), if any does.
 /// The links between these files are relative in the repository; an installed copy finds a
 /// sibling in its own directory and any other under `/usr/share/doc/<package>`.
 pub(crate) fn doc_package(name: &str) -> Option<&'static str> {
-    match name {
-        "user-guide" | "rt-tuning" | "troubleshooting" | "configuration" | "network-vlans" => {
-            Some("tessera")
+    SHIPPED_DOCS
+        .iter()
+        .find(|(doc, _)| *doc == name)
+        .map(|(_, package)| *package)
+}
+
+/// The image of `docs/images/` that a link target (what is between the parentheses) of a file of
+/// `docs/` names, as `images/...`, if it names one.
+fn image_link(target: &str) -> Option<&str> {
+    let file = target.split_whitespace().next()?.split(['#', '?']).next()?;
+    let file = file.strip_prefix("./").unwrap_or(file);
+    (file.starts_with(DOC_IMAGES) && !file.split('/').any(|part| part == "..")).then_some(file)
+}
+
+/// The images of `docs/images/` that `text`, a file of `docs/`, links to, as `images/...`.
+pub(crate) fn doc_images(text: &str) -> Vec<String> {
+    let mut images: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("](") {
+        let tail = &rest[at + 2..];
+        let end = tail.find(')').unwrap_or(tail.len());
+        if let Some(file) = image_link(&tail[..end]) {
+            if !images.iter().any(|image| image == file) {
+                images.push(file.to_owned());
+            }
         }
-        "web-portal" => Some("tessera-web"),
-        "dsp" | "raspberry-pi-speaker" => Some("tessera-dsp"),
-        _ => None,
+        rest = &tail[end..];
     }
+    images
 }
 
 /// `text`, a file of `docs/`, as it ships in `package`: a link to another file of `docs/` that
 /// ships becomes the file's place relative to this one (`name.md` beside it, else
-/// `../<package>/name.md`); any other link stays as it is.
+/// `../<package>/name.md`), a link to an image becomes its place in [`IMAGE_PACKAGE`]; any other
+/// link stays as it is.
 pub(crate) fn package_links(text: &str, package: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -147,6 +213,10 @@ pub(crate) fn package_links(text: &str, package: &str) -> String {
                 out.push_str(&format!("{name}.md{anchor}"));
             }
             Some((name, owner)) => out.push_str(&format!("../{owner}/{name}.md{anchor}")),
+            None if package != IMAGE_PACKAGE && image_link(target).is_some() => {
+                let target = target.strip_prefix("./").unwrap_or(target);
+                out.push_str(&format!("../{IMAGE_PACKAGE}/{target}"));
+            }
             None => out.push_str(target),
         }
         rest = &tail[end..];
@@ -655,13 +725,20 @@ impl Build<'_> {
             self.put(stage, source, destination, false)?;
         }
         fs::create_dir_all(stage.join("etc/tessera/config.d"))?;
-        for doc in [
-            "user-guide",
-            "rt-tuning",
-            "troubleshooting",
-            "configuration",
-            "network-vlans",
-        ] {
+        // The shipped surface profiles (the daemon reads
+        // /usr/share/tessera/surfaces/, then /etc/tessera/surfaces.d/).
+        for name in surface_profiles(self.root)? {
+            self.put(
+                stage,
+                &format!("{SURFACE_PROFILES}/{name}"),
+                &format!("usr/share/tessera/surfaces/{name}"),
+                false,
+            )?;
+        }
+        for (doc, _) in SHIPPED_DOCS
+            .iter()
+            .filter(|(_, package)| *package == "tessera")
+        {
             if self.root.join(format!("docs/{doc}.md")).is_file() {
                 self.put_doc(
                     stage,
@@ -670,6 +747,29 @@ impl Build<'_> {
                     "tessera",
                 )?;
             }
+        }
+        // Every image a shipped document shows, whichever package ships the document, at the
+        // same place relative to this directory as to docs/ (package_links points the other
+        // packages' documents here).
+        let mut images = BTreeSet::new();
+        for (doc, _) in SHIPPED_DOCS {
+            if let Ok(text) = fs::read_to_string(self.root.join(format!("docs/{doc}.md"))) {
+                images.extend(doc_images(&text));
+            }
+        }
+        for image in images {
+            let source = format!("docs/{image}");
+            if !self.root.join(&source).is_file() {
+                return Err(Failure::new(format!(
+                    "a shipped document shows {source}, which is missing"
+                )));
+            }
+            self.put(
+                stage,
+                &source,
+                &format!("usr/share/doc/{IMAGE_PACKAGE}/{image}"),
+                false,
+            )?;
         }
         if self.native {
             for (shell, path) in [
@@ -948,6 +1048,14 @@ impl Build<'_> {
             stage,
             "dsp",
             "usr/share/doc/tessera-dsp/README.md",
+            "tessera-dsp",
+        )?;
+        // Also under its own name: the other packages' documents link to
+        // `../tessera-dsp/dsp.md`.
+        self.put_doc(
+            stage,
+            "dsp",
+            "usr/share/doc/tessera-dsp/dsp.md",
             "tessera-dsp",
         )?;
         self.put_doc(
@@ -1272,6 +1380,37 @@ mod tests {
         // Every document the repository links to from the three that are rewritten here is either
         // shipped or left as it is; none is guessed.
         assert_eq!(doc_package("unknown"), None);
+        // The surface profile guide ships beside the user guide.
+        assert_eq!(doc_package("surface-profiles"), Some("tessera"));
+        assert_eq!(
+            package_links("[profiles](surface-profiles.md#bindings)", "tessera-web"),
+            "[profiles](../tessera/surface-profiles.md#bindings)"
+        );
+    }
+
+    #[test]
+    fn images_ship_in_the_tessera_package_and_other_packages_link_there() {
+        let text = "![Grid](images/0.6/grid.png) ![Phone](./images/0.6/phone.png \"phone\") [again](images/0.6/grid.png) [up](../images/x.png) [web](https://e.org/images/x.png) [doc](user-guide.md)";
+        assert_eq!(
+            doc_images(text),
+            ["images/0.6/grid.png", "images/0.6/phone.png"]
+        );
+        assert_eq!(package_links(text, "tessera"), text);
+        assert_eq!(
+            package_links(text, "tessera-web"),
+            "![Grid](../tessera/images/0.6/grid.png) ![Phone](../tessera/images/0.6/phone.png \"phone\") [again](../tessera/images/0.6/grid.png) [up](../images/x.png) [web](https://e.org/images/x.png) [doc](../tessera/user-guide.md)"
+        );
+        // Every image a shipped document shows is in the tree, so build-deb can ship it.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut shown = 0;
+        for (doc, _) in SHIPPED_DOCS {
+            let text = fs::read_to_string(root.join(format!("docs/{doc}.md"))).unwrap();
+            for image in doc_images(&text) {
+                shown += 1;
+                assert!(root.join("docs").join(&image).is_file(), "{doc}: {image}");
+            }
+        }
+        assert!(shown > 0, "no shipped document shows an image");
     }
 
     #[test]

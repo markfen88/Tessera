@@ -178,24 +178,36 @@ unplug). Every key: [configuration.md](configuration.md#hardware-card-bridges-br
    `cargo build --release -p tesserad --features alsa-bridge`, or packages from
    `TESSERA_DAEMON_FEATURES=alsa-bridge cargo xtask build-deb` (the `tessera`
    package then depends on the native ALSA library). A daemon without the feature refuses
-   any `[[bridge]]`. The default package build is still without it
-.
-2. Access to `/dev/snd` for the service user (the unit allows ALSA devices,
-   but the files belong to group `audio`):
-
-   ```sh
-   sudo systemctl edit tesserad.service
-   # [Service]
-   # SupplementaryGroups=audio
-   ```
+   any `[[bridge]]` (and `[host_volume]`). The default package build is still without it.
+2. Access to `/dev/snd` for the service user: the shipped `tesserad.service`
+   unit already sets `DeviceAllow=char-alsa rw` and
+   `SupplementaryGroups=audio`, so packaged installs can open sound cards and
+   rawmidi ports without a manual unit drop-in. If you run `tesserad` under a
+   custom unit, include `SupplementaryGroups=audio`.
 
 ### How it works
 
+- Bridges can be configured in `/etc/tessera/config.d/` (`[[bridge]]`) or added
+  at run time on the portal's [Audio page](web-portal.md#audio) or with
+  `tesseractl bridge add`.
 - Direction `playback` plays the device's RX channels `first_channel ..` on the
   card; `capture` feeds the card's input into the device's TX channels.
-- The card opens non-blocking at exactly the device's rate, with the first of
-  S32, FLOAT, S24, S24_3, S16 it offers; default period 10 ms, buffer 4 periods,
-  3 of them kept queued (30 ms of card latency in playback).
+  `card_first_channel` (default 1) selects which 1-based channel on the card to
+  start at (for example `15` for an Allen & Heath CQ's Main L/R mix on USB
+  15–16): the card opens with enough channels to reach the slice, ignoring
+  unused capture channels and sending silence on unused playback channels.
+- With `local_only = true`, the bridge opens the card for the **host router**
+  only (`card_in` / `card_out` ports); `first_channel` is ignored, `channels`
+  is required, and the card stays off the network until patched on `/router` or
+  via `tesseractl router patch`.
+- The card opens non-blocking at **exactly the device's sample rate** (the
+  resampler compensates clock drift around a ratio of 1, not nominal rate
+  differences), with the first of S32, FLOAT, S24, S24_3, S16 it offers;
+  default period 10 ms (96 frames / 2 ms at 48 kHz with the low-latency
+  option), buffer 4 periods, 3 of them kept queued (30 ms of card latency in
+  playback at default periods). Adding a new PCM definition in
+  `/etc/asound.conf` requires a `tesserad` restart before the daemon can open
+  it.
 - A resampler around a ratio of 1 and a critically damped PI loop follow the
   card's clock. `time_constant_s` (τ, default 120) and `max_correction_ppm`
   (default 200, at most 3000) tune it. The bridge reserves a headroom of

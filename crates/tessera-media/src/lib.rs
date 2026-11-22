@@ -12,6 +12,7 @@
 //! | [`mod@reference`] | PROVISIONAL reference format for tests | core |
 //! | [`counter`] | Atomic metric counters | core |
 //! | [`drift`] | [`Resampler`] trait, PI controller, rate estimator | core |
+//! | [`gain`] | Per-channel RT-safe gain/mute table ([`ChannelGain`]; dB needs `std`, table needs `alloc`) | core |
 //! | `buffer` | Media-time-addressed rings (`MediaBuffer`) | `alloc` |
 //! | `rx` | RX flow engine (`RxFlow`) | `alloc` |
 //! | `tx` | TX flow engine (`TxFlow`) | `alloc` |
@@ -39,8 +40,8 @@
 //! * `alloc`: buffers, flow engines, linear resampler.
 //!
 //! The `rubato` adapter (cubic and sinc quality levels) lives in the separate
-//! `tessera-resample` crate, because rubato needs Rust 1.87 and this crate
-//! stays at the workspace MSRV of 1.85 and builds for `thumbv8m`.
+//! `tessera-resample` crate, which keeps rubato out of this crate: it
+//! builds for `thumbv8m`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
@@ -52,6 +53,7 @@ pub mod convert;
 pub mod counter;
 pub mod drift;
 pub mod error;
+pub mod gain;
 pub mod packet;
 pub mod reference;
 pub mod time;
@@ -73,6 +75,9 @@ pub use drift::{
     DriftCompensator, PiConfig, PiController, ProcessResult, Quality, RateEstimator, Resampler,
 };
 pub use error::{ConfigError, ConvertError, DriftConfigError, FormatError, ResampleError, TxError};
+#[cfg(feature = "alloc")]
+pub use gain::ChannelGains;
+pub use gain::{ChannelGain, GainWord};
 pub use packet::{Decoded, PacketFormat};
 #[cfg(feature = "alloc")]
 pub use rx::{IngestOutcome, RxConfig, RxFlow, RxMetrics, RxSnapshot};

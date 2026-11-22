@@ -144,6 +144,10 @@ pub const CLI_ONLY: &[(&str, &str)] = &[
         "a temporary lab capture setting in the service drop-in, never a product setting",
     ),
     (
+        "lab-surface-root",
+        "lab only (tests, portal screenshots): a fixture directory read instead of the host's devices, never a product setting",
+    ),
+    (
         "native-vendor",
         "the deployment's device-info vendor token, set beside `--native-device` in the same drop-in",
     ),
@@ -228,6 +232,14 @@ pub struct Options {
         requires = "native_lab_capabilities"
     )]
     pub native_lab_lock_listener: bool,
+
+    /// Lab only (tests, portal screenshots), never a product setting: look
+    /// for control-surface devices under this directory instead of `/`
+    /// (`sys/class/hidraw`, `proc/asound`), and accept a regular file of
+    /// scripted input reports as a device node. A flag only (no environment
+    /// variable, so nothing inherited can turn it on) and hidden from `--help`.
+    #[arg(long, hide = true)]
+    pub lab_surface_root: Option<PathBuf>,
 
     /// Listen on `audio.sock` for audio clients (ADR 0007). Overrides
     /// `[audio] socket` (default auto).

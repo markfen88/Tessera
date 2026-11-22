@@ -259,7 +259,7 @@ Exact human-readable output may change; use `--json` for integrations.
 
 ```
 $ tesseractl status
-tessera 0.5.2
+tessera 0.6.0
 
 DEVICE  NAME       RATE      BITS  LATENCY  RX  TX  LOCKED       ACCESS
 main    studio-pc  48000 Hz  24    6000 us  4   2   sample_rate  open
@@ -434,15 +434,19 @@ is tesserad running? use --socket or TESSERA_SOCKET if it listens elsewhere
 
 The portal shows the device in a browser and changes what `tesseractl` can:
 the signal path (network, flows, device, audio clients, highlighted while
-audio moves), the network interface and its selection, device settings
-(name, rate, encoding, latency, labels), subscriptions, the clock, metrics,
-recent events and the configuration in effect. It runs as its own service and
-talks to the daemon through the control socket. Pages are server-rendered with
-a narrow live-update script; the same daemon data is available as JSON under
-`/api/v1/`. Standalone OS networking uses the separate privileged
-`tessera-network` helper and a recoverable Network editor. The pages do not show the sound-card bridges or the
-receiver keepalive counters yet; `/api/v1/status` and `/api/v1/metrics` carry
-them. Reference: `web-portal.md`.
+audio moves), the **Mixer** (`/mixer`) with saved mixing-desk panels, the
+**Router** (`/router`) for local-to-network crosspoints and port levels,
+**Audio** (`/audio`) for sound-card bridges and local monitoring, **Surfaces**
+(`/surfaces`) for USB HID, USB MIDI and MIDI-over-TCP control surfaces,
+**Network routing** (`/routing`) for inter-device connections, the network
+interface and its selection, device settings (name, rate, encoding, latency,
+levels and mute, labels), subscriptions, the clock, metrics, recent events and
+the configuration in effect. It runs as its own service and talks to the daemon
+through the control socket. Pages are server-rendered with a narrow live-update
+script; the same daemon data is available as JSON under `/api/v1/`. Standalone
+OS networking uses the separate privileged `tessera-network` helper and a
+recoverable Network editor. Receiver keepalive counters are only in JSON
+(`/api/v1/metrics`). Reference: [web-portal.md](web-portal.md).
 
 ```sh
 sudo apt install ./tessera-web_*.deb          # a fresh install starts the portal with the password "tessera"
@@ -481,6 +485,204 @@ GET    /api/v1/events      Server-Sent Events: "event" (JSON) and "resync"
 DELETE /api/v1/session     (with X-CSRF-Token)
 ```
 
+## 4c. Host router, levels, control surfaces and mixer panels
+
+Tessera is an audio routing device; network audio interoperable with Dante® is
+one of its capabilities. Two layers keep local hardware cleanly separated from
+what the network sees:
+
+* **Network channels.** The host exposes one logical network device by default
+  (`main`). Its RX (network → this host) and TX (this host → network) channels
+  are what network controllers see, nothing else.
+* **Local I/O.** Sound-card inputs and outputs (opened by card bridges), what
+  local applications play and capture, and the speaker output stay local until
+  a crosspoint patches them to or from a network channel.
+
+The **host router** (`/router`, `tesseractl router …`) sits between the two
+layers. Sources are rows (network RX, application outputs, card inputs, and
+taps of destinations) and destinations are columns (host/speaker outputs,
+network TX, card outputs). Every destination sums every crosspoint patched into
+it, each with its own gain and mute. Until you edit the grid, the **default
+grid** applies (RX *n* → host out *n*, app *n* → TX *n*, local monitoring, and
+any `[[route]]` entries in `/etc/tessera/config.d/`), which preserves 0.5
+behaviour. The first edit saves the default grid and then applies your change;
+**Reset to default** (`tesseractl router reset`) returns to the default grid.
+
+**Levels.** Every signal point has a level and a mute:
+
+| Stage | What it controls | CLI |
+|---|---|---|
+| Channel input | A network RX or TX channel's own level (RX before local mixing) | `tesseractl gain` / `mute` / `unmute` |
+| Output stage | An RX channel's host output (`host_out`), after the mix, like a master | `tesseractl output-gain` / `output-mute` |
+| Router port & crosspoint | Any port level (`card_in`, `card_out`, `app_out`, …) or crosspoint gain | `tesseractl router port-gain\|port-mute\|gain\|mute` |
+| Host (speaker) volume | The amplifier's ALSA mixer control (`[host_volume]` in `config.d/`) | `tesseractl volume show\|set\|mute` |
+
+On a speaker installed with `--profile speaker`, the installer writes
+`/etc/tessera/config.d/60-host-volume.toml` so `tesserad` owns the amplifier's
+ALSA mixer control directly. On first start the portal hands its previously
+saved `volume.json` value over once (leaving `[appliance.volume]` and
+`volume.json` in place so a rollback to an older daemon still works).
+
+**Control surfaces.** `/surfaces` connects out to USB HID interfaces
+(`/dev/hidraw*`), USB MIDI ports (ALSA rawmidi `/dev/snd/midi*`), and desks
+that offer raw MIDI over TCP (such as an Allen & Heath CQ on TCP port `51325`).
+Tessera connects out only and never listens: exposing its own MIDI port to be
+controlled by other software is not in 0.6. Shipped profiles live in
+`/usr/share/tessera/surfaces/` and your own in `/etc/tessera/surfaces.d/`
+([surface-profiles.md](surface-profiles.md)); unknown keys in profile files are
+refused. Controls without a profile can be captured with **Learn a control**
+(`tesseractl surface learn`). Values remain unknown ("touch it to see it")
+until the device reports them (or Tessera moves a motorized fader there).
+While a surface is connected, a **non-motorized fader** owns the level it
+drives (channel gain, host volume, router port level, or crosspoint gain — the
+portal shows it read-only); **mute is never owned**, and **motorized faders**
+own nothing and follow changes made elsewhere.
+
+**Mixer panels.** `/mixer` opens a desk of channel strips (and a horizontal
+strip layout on phones). Until you save a panel, it shows a default desk of
+the channels in use plus Main L/R. Open `/mixer/edit` to build your own panels
+with any number of faders or buttons targeting channels, router ports,
+crosspoints, or host volume, group and reorder strips, mark a master strip, and
+link any strip to a hardware control (the link is derived from the surface's
+binding).
+
+### Worked example: speaker appliance with an Allen & Heath CQ-12T
+
+This setup connects an Allen & Heath CQ-12T mixer by USB (or Ethernet for MIDI
+over TCP) to a Tessera speaker appliance whose network device `main` plays
+network audio from `ndimon` (RX 1–2) through CamillaDSP to the speaker amp.
+
+**Goal:**
+1. Capture the CQ's Main L/R mix (USB channels 15–16) onto network TX 1–2 so
+   other devices can receive it, **and** mix it directly into the speakers
+   (`Speaker L/R`) with no network hop.
+2. Send two network returns (`CQ USB ret 1–2` on RX 3–4) to the CQ.
+3. Drive the speaker volume from the CQ's Main L/R fader, and control `ndimon`
+   (RX 1–2), `CQ Main` (TX 1–2), and `CQ USB ret` (RX 3–4) from CQ channel
+   faders 4, 5, and 6 using the CQ's own fader law.
+
+**Steps:**
+
+1. **Match sample rates.** Ensure the CQ and Tessera device run at the same
+   sample rate (48 kHz or 96 kHz; check `/audio` or `tesseractl status`).
+2. **Grow the device channels** if needed (4 RX, 2 TX):
+
+   ```sh
+   tesseractl -d main set-channels --rx 4 --tx 2
+   tesseractl -d main set-label rx 1 "ndimon L"
+   tesseractl -d main set-label rx 2 "ndimon R"
+   tesseractl -d main set-label rx 3 "CQ USB ret 1"
+   tesseractl -d main set-label rx 4 "CQ USB ret 2"
+   ```
+
+3. **Bridge the CQ's Main L/R (USB 15–16) onto TX 1–2** on `/audio` (setting
+   **First card input** to `15`, **Channels** to `2`, **Low latency** on, and
+   labels `CQ Main L` / `CQ Main R`), or from the CLI:
+
+   ```sh
+   tesseractl -d main bridge add cq-in --card hw:CARD=CQ,DEV=0 \
+     --direction capture --card-first 15 --first 1 --channels 2 --low-latency
+   tesseractl -d main set-label tx 1 "CQ Main L"
+   tesseractl -d main set-label tx 2 "CQ Main R"
+   ```
+
+   *(If you want the CQ to stay off the network until explicitly patched, check
+   **For local routing only** on `/audio` instead and use **Send CQ inputs to
+   the network** on `/router` later.)*
+
+4. **Mix CQ inputs 15–16 into the speakers locally** on `/router` (click **+**
+   at `CQ in 15` × `Speaker L` and `CQ in 16` × `Speaker R`, and optionally
+   rename `host out 1/2` to `Speaker L` / `Speaker R` via their port headers),
+   or from the CLI:
+
+   ```sh
+   tesseractl router patch in:hw:CARD=CQ,DEV=0:15 host:main:1
+   tesseractl router patch in:hw:CARD=CQ,DEV=0:16 host:main:2
+   ```
+
+   The CQ's Main L/R now plays out of the speakers alongside `ndimon L/R`
+   directly inside `tesserad` without waiting for a network flow, while the
+   bridge-implied **B** cells feed `CQ Main L/R` to the network.
+
+   ![Host router grid mixing CQ inputs 15 and 16 into Speaker L and R](images/0.6/router-grid.png)
+
+5. **Add the CQ as a control surface** on `/surfaces`:
+   - Over USB: click **Add as surface** next to the `Allen&Heath CQ` MIDI port
+     (`/dev/snd/midiC*D*`).
+   - Over the network (Ethernet): under **A surface over the network**, enter
+     name `cq`, the desk's IP address, and TCP port `51325` (or run
+     `tesseractl surface tcp-midi cq 192.0.2.40`).
+   - Click **Apply profile** and choose **Allen & Heath CQ series**. All 46
+     NRPN controls and the CQ's 12-point fader law (raw `192` = −89 dB,
+     `12544` = 0 dB, `16320` = +10 dB; raw `0` = off) are added at once.
+     Because the CQ's faders are marked `motorized = true`, they never lock
+     levels in the portal and follow changes made in the browser or CLI.
+
+6. **Map the CQ faders** on `/surfaces` (each fader automatically uses the CQ's
+   fader law from the profile):
+   - **Main LR (`main-lr`)** → **The speaker volume** (`host_volume`, when
+     `[host_volume]` is configured in `config.d/60-host-volume.toml`; or
+     **Output level** of `main` RX 1–2 if using the output stage instead). Map
+     **Main LR mute** to the matching mute.
+   - **Ch 4 (`ip4`)** → **Channels**: `main` RX 1–2 (`ndimon L/R`), input level.
+   - **Ch 5 (`ip5`)** → **Channels**: `main` TX 1–2 (`CQ Main L/R`), input level.
+   - **Ch 6 (`ip6`)** → **Channels**: `main` RX 3–4 (`CQ USB ret 1–2`), input
+     level.
+
+7. **Build a custom Mixer panel** (optional): open `/mixer`, click **Edit
+   panel** → **Save the default panel and edit it**, and add a **Crosspoint
+   gain** strip (`CQ to speakers`) targeting `CQ in 15 → Speaker L` and
+   `CQ in 16 → Speaker R` so you can also balance the CQ's local feed from a
+   browser or phone.
+
+   ![Custom Mixer panel with CQ Main, ndimon, CQ to speakers crosspoint fader and Main L/R](images/0.6/mixer-panel.png)
+
+### To add any DAC or USB audio interface
+
+1. Plug in the DAC or interface. `tesserad` runs in group `audio` out of the
+   box, so it detects the card automatically on `/audio` (and `tesseractl
+   surfaces`). If you added a custom PCM in `/etc/asound.conf`, restart
+   `tesserad` first.
+2. Check that the card supports the Tessera device's sample rate (listed on
+   `/audio`). If not, change the device's rate on `/devices` (`tesseractl
+   set-rate`).
+3. On `/audio`, open **Send its inputs to the network** or **Play network audio
+   on its outputs**:
+   - To keep the card local (for example, to mix a DAC input into the speakers
+     without exposing new network TX channels), tick **For local routing only**
+     (`local_only = true`).
+   - To pick a slice of a multi-channel interface, set **First card input /
+     output** (`card_first_channel`, or `--card-first` in `tesseractl bridge
+     add`).
+   - Tick **Low latency** for 96-frame card periods (2 ms at 48 kHz) when low
+     round-trip delay matters.
+4. On `/router`, patch `card_in` sources to `host_out` (speakers/apps),
+   `card_out`, or `network_tx` (or use **Send `<card>` inputs to the network**
+   / **Feed `<card>` outputs from the network** to add channels and patch in
+   one step).
+
+### To add any MIDI controller
+
+1. Connect a USB MIDI controller (it appears under **Devices on this host** on
+   `/surfaces`), or add a network desk under **A surface over the network**
+   (`tesseractl surface tcp-midi <name> <host> [port]`).
+2. Click **Add as surface**.
+3. If a profile matches your controller (built in, in
+   `/usr/share/tessera/surfaces/`, or dropped into `/etc/tessera/surfaces.d/`),
+   click **Apply profile**. Otherwise click **Learn a control**, keep your
+   hands off for a second, and move a fader from bottom to top (or press a
+   button once) to capture its MIDI message and map it in one form.
+4. Choose what each control drives: channel gain/mute, output stage, speaker
+   volume (`host_volume`/`host_mute`), router port or crosspoint level/mute, or
+   **Follow** another surface's control. Non-motorized faders take ownership of
+   the level they control while connected (mute always stays usable from the
+   portal and CLI).
+5. Optionally open `/mixer/edit` and link strips to the controller's controls so
+   the web desk shows badges for every hardware binding. To save or share your
+   setup, click **Export this surface as a profile** on `/surfaces` (or export
+   the full surface JSON with `tesseractl surfaces --json` and reapply later
+   with `tesseractl surface set --file`).
+
 ## 5. Discovery
 
 With `[discovery] advertise_devices = true` (the default) the daemon announces each logical
@@ -492,7 +694,11 @@ it is on the bus, otherwise a built-in responder; never both), `avahi`,
 `builtin` or `off`. That is why the package **recommends `avahi-daemon`**.
 
 **Status:** advertising is **on by default** (`advertise_devices = true`), because
-the packages also enable the Controller compatibility runtime. The records name
+the packages also enable the Controller compatibility runtime. Device browsing
+(`[discovery] browse_devices`) is also **on by default** (`true`) so the
+portal's **Network routing** page and `tesseractl routing` can list devices on
+the segment; set `browse_devices = false` in `/etc/tessera/config.d/` to opt
+out. The records name
 control ports (ARC 4440, CMC 8800, flow control 4455, plus 10 per further
 device); the runtime serves the first logical device's base ports, or `tesserad`
 itself with the native device role. A controller that finds a device where
@@ -500,7 +706,7 @@ neither is running, or a further logical device, cannot talk to it and shows it
 greyed out.
 The daemon warns once per advertised port that no socket is bound to (see
 `troubleshooting.md`); set `advertise_devices = false` to advertise nothing.
-`tesserad` does not browse for other devices. The record contents follow a
+The record contents follow a
 provisional specification. Multicast DNS must be allowed between the devices
 (UDP 5353 on the media network).
 
@@ -574,20 +780,29 @@ Clients are not filtered by kind.
 
 ### Bridging a sound card (in-daemon ALSA bridge)
 
-On a headless speaker (a Raspberry Pi with a DAC hat) the daemon can drive
-the sound card itself: no PipeWire, no `arecord | ...` pipes. A
-`[[bridge]]` entry connects a card to a device's channels; the card's clock
-is independent of the network's, and the bridge absorbs the difference with
-a resampler and a slow PI loop (reference: `configuration.md`, "Hardware-card
-bridges"). The `speaker` profile of the add-on bundle does **not** use the bridge
-unless installed with `--no-dsp`: by default CamillaDSP owns the card and reads
-`pcm.tessera`, and a card has one owner (`dsp.md`).
+On a headless speaker (a Raspberry Pi with a DAC hat) or a host with a USB
+mixer or audio interface, the daemon can drive the sound card itself: no
+PipeWire, no `arecord | ...` pipes. A bridge connects a card (or a contiguous
+slice of its channels, starting at `card_first_channel`, for example USB
+channels 15–16 of an Allen & Heath CQ) either to a device's network channels or
+to the host router only (`local_only = true`, staying off the network until
+patched). Bridges can be added at run time on `/audio` or with `tesseractl
+bridge add`, or declared in `/etc/tessera/config.d/` as `[[bridge]]` entries.
+The card's clock is independent of the network's, and the bridge absorbs the
+difference with a resampler and a slow PI loop (reference:
+[configuration.md](configuration.md#hardware-card-bridges-bridge)). The card
+must support the Tessera device's sample rate (drift is compensated, not
+nominal rate conversion), and a new PCM added to `/etc/asound.conf` requires a
+`tesserad` restart. The `speaker` profile of the add-on bundle does **not** use
+a playback bridge for the speaker DAC unless installed with `--no-dsp`: by
+default CamillaDSP owns the speaker card and reads `pcm.tessera`, and a card
+has one owner ([dsp.md](dsp.md)).
 
 The bridge is a build option: `tesserad` must be built with the cargo
 feature `alsa-bridge` (it links libasound; needs `libasound2-dev` and
 `pkg-config`). The packages have it only when built with
 `TESSERA_DAEMON_FEATURES=alsa-bridge` (section 10); the default package build
-leaves it out. Add the service user to the `audio` group for card access:
+leaves it out.
 
 ```sh
 cargo build --release -p tesserad --features alsa-bridge
@@ -595,14 +810,9 @@ TESSERA_DAEMON_FEATURES=alsa-bridge cargo xtask build-deb    # packages with the
 ```
 
 A `tesserad` without it refuses a configuration with `[[bridge]]` and says
-so. The service runs as user `tessera`; give it access to the sound devices
-(`/dev/snd/*` belong to group `audio`):
-
-```sh
-sudo systemctl edit tesserad.service
-# [Service]
-# SupplementaryGroups=audio
-```
+so. The shipped `tesserad.service` unit runs with `SupplementaryGroups=audio`
+so user `tessera` can open `/dev/snd/*` cards and MIDI ports without a manual
+unit drop-in.
 
 **Straight to the DAC** (no DSP stage):
 

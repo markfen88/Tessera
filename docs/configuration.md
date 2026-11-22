@@ -148,8 +148,10 @@ Files are applied after `config.toml`, in lexical file-name order; a later file 
     defines devices, only the "`id` is required" error is reported.
 - **`[[bridge]]` entries have no key to merge by** (`device`, `alsa_pcm`, `direction` and `channels` do not identify an entry), so a drop-in that
   contains `[[bridge]]` **replaces the whole bridge list**, and the load prints a warning naming what was replaced.
+- **`[[route]]` entries are replaced as a whole**, like `[[bridge]]`: a drop-in that contains `[[route]]` replaces the default-grid route list of the files before it and the load prints a warning.
 - **`[[flow]]` entries are replaced as a whole**, like `[[bridge]]`: a drop-in that contains `[[flow]]` replaces the flow list of the files before it
   and the load prints a warning. (Static flows are provisional, see "Static flows" below; entries replace as a list.)
+- **`[host_volume]`** is an ordinary table and merges key by key across files; leaving `card` unset disables daemon-owned host volume.
 
 - **Label keys** (`rx_channel_labels`, `tx_channel_labels`) must be canonical decimal channel numbers (`1`, not `01` or `+1`); other
   spellings are a configuration error, so two files can never name one channel in two ways.
@@ -217,7 +219,7 @@ mlock = true                       # mlockall after start-up; a refusal is repor
 [discovery]
 mdns = "auto"                      # auto | avahi | builtin | off
 advertise_devices = true           # advertise devices with mDNS; the packaged Controller runtime serves the advertised ports
-browse_devices = false             # opt-in read-only catalogue; no routing commands
+browse_devices = true              # read-only catalogue for the Routing page; no routing commands (false opts out)
 
 [backends]
 enabled = ["pipewire", "alsa"]     # clients meant to attach; today only "empty = no audio.sock" (with `[audio] socket = "auto"`) is enforced
@@ -264,7 +266,7 @@ port = 5004                        # tx: destination port; rx: local UDP port to
 
 ## Receiver routing
 
-Use **Routing** in the portal ([web-portal.md](web-portal.md#routing)) or
+Use **Network routing** in the portal ([web-portal.md](web-portal.md#network-routing)) or
 `tesseractl routing` ([cli.md](cli.md#routing)) for Connect, Replace and
 Disconnect. The matrix places TX devices/channels down the left and RX
 devices/channels across the top. Expand or collapse devices, filter either axis,
@@ -273,7 +275,8 @@ numbers; custom labels are kept. The receiver-first list is available on narrow
 screens and through **List**. Receiving indicates local packet activity, not
 verified source audio. Channel spaces and mixed case are valid; device names
 follow the separate device-name rules. Discovery browsing
-(`[discovery] browse_devices = true`) must be on for the matrix to list devices.
+(`[discovery] browse_devices`, on by default) must be on for the matrix to list
+devices; `browse_devices = false` turns it off and leaves only the local devices.
 
 Who carries out a change depends on the receiver. A host with the
 [native device role](interoperability.md#native-device-role) stores the selection
@@ -448,17 +451,81 @@ name = "studio-pc"
 sample_rate = 48000
 encoding = 24
 latency_us = 4000
+tx_muted = [1, 2]                  # set_channel_mute; unmuted channels are not listed
 
 [device.main.rx_channel_labels]
 1 = "Vox"
+
+[device.main.tx_channel_gain]      # set_channel_gain; unity (0 dB) is not stored
+3 = "off"
+
+[device.main.tx_channel_gain.1]
+milli_db = -6000
 
 [[device.main.subscription]]
 rx_channel = 1
 tx_channel = "Out 1"
 tx_device = "stagebox-a"
+
+[[surface]]                        # control surfaces (set_surface), in the order added
+name = "cq"
+enabled = true
+source = { kind = "tcp_midi", host = "192.0.2.40", port = 51325 }
+# controls and bindings follow as sub-tables
+
+[router]                           # host router (set_router / set_crosspoint / port levels)
+saved = true
+
+[[router.crosspoint]]
+gain = { milli_db = -6000 }
+muted = false
+[router.crosspoint.source]
+kind = "card_in"
+card = "hw:CARD=CQ,DEV=0"
+channel = 15
+[router.crosspoint.destination]
+kind = "host_out"
+device = "main"
+channel = 1
+
+[[router.label]]
+label = "CQ Main L"
+port = { kind = "card_in", card = "hw:CARD=CQ,DEV=0", channel = 15 }
+
+[[router.level]]
+port = { kind = "card_in", card = "hw:CARD=CQ,DEV=0", channel = 15 }
+gain = { milli_db = -3000 }
+
+[host_volume]                      # saved amplifier volume (set_host_volume / set_host_mute)
+gain = { milli_db = -20000 }
+muted = false
+
+[[mixer]]                          # saved mixer panels (set_mixer)
+id = "main"
+title = "Speaker"
+# strips follow as sub-tables
 ```
 
 Subscriptions are kept by name even when they do not currently resolve.
+Channel gain and mute, the host router grid, saved mixer panels, saved host
+volume and control surfaces are saved here as runtime intent (`[[route]]` in
+configuration files supplies default-grid crosspoints, and `[host_volume]` in
+configuration files names the ALSA card/control/range). Whether a surface is
+connected is never saved; a surface that is plugged in again applies its
+non-motorized faders' positions once reported.
+
+A gain is `"off"` or a table with `milli_db` (−96000 to 12000, thousandths of a dB; 0 is unity and is not stored). On load, a
+hand-edited file is put right, with a warning for each fix: a `*_muted` list is sorted, a channel listed twice is kept once and
+channel 0 is dropped; a gain whose key is not a channel number or whose value is out of range is dropped (the channel is at unity),
+a key such as `01` becomes `1`; a second `[[surface]]` with a name already used is dropped. Mutes and gains on channels beyond the
+current count are kept but inactive, like labels, and apply again if the count grows. Likewise, saved router crosspoints and mixer
+strips whose ports or channels disappear are kept and reported inactive rather than rewritten.
+
+**Rollback.** `schema_version` remains `1`. An older daemon ignores unknown keys in `state.toml` (`[router]`, `[host_volume]`,
+`[[mixer]]`, `[[surface]]`, `rx_muted`, `tx_muted`, `rx_channel_gain`, `tx_channel_gain`, `rx_output_*`) and drops them the next
+time it writes the file, while keeping subscriptions, bridges and monitor lists. Keep a backup of `state.toml` before rolling back.
+In `/etc/tessera/config.d/*.toml`, unknown keys are errors: remove `[host_volume]`, `[[route]]`, `local_only` and `card_first_channel`
+from configuration files before rolling back to a daemon older than 0.6.0.
 
 ## Device access lock
 
@@ -644,8 +711,10 @@ a configuration that has any `[[bridge]]` entry, at start and at reload, with an
 | `device` | required | `id` of the device. |
 | `alsa_pcm` | required | ALSA PCM name of the card: `hw:CARD=<card>,DEV=0`, `hw:Loopback,0,0`, `plughw:1`. Opened non-blocking, interleaved, at exactly the device's rate (the first of S32, FLOAT, S24, S24_3, S16 the card offers). Two bridges may not use the same name in one direction; two *spellings* of one card (`hw:Loopback,0,0` and `hw:CARD=Loopback,DEV=0`) are not recognised as the same: the second one then stays `reopening` with "Device or resource busy". |
 | `direction` | `playback` | `playback` or `capture`; the older `rx` / `tx` mean the same. |
-| `first_channel` | `1` | First device channel (1-based); card channel 1 carries it. |
-| `channels` | the rest of the device's channels | Channel count, which is also the card's. The older form, a list such as `[3, 4]`, is accepted if it is one ascending run. |
+| `first_channel` | `1` | First device channel (1-based); card channel `card_first_channel` carries it. Ignored when `local_only = true`. |
+| `card_first_channel` | `1` | First 1-based channel on the sound card carried (for example `15` for a mixer's main mix on USB channels 15–16). The card is opened with at least `card_first_channel + channels - 1` channels; unused capture channels are ignored and unused playback channels are sent silence. |
+| `channels` | the rest of the device's channels (required when `local_only = true`) | Channel count carried from the card. The older form, a list such as `[3, 4]`, is accepted if it is one ascending run. |
+| `local_only` | `false` | Open the card for the host router only (`card_in` / `card_out` ports); no device channel is fed or read, so the card stays off the network until a crosspoint patches it there. |
 | `sample_rate` | the device's | Must equal the device's rate: the resampler's nominal ratio is 1, it compensates drift, not rate differences. Left out, the bridge follows the device (a rate change restarts it). Set, it pins the rate: `tesseractl set-rate` to another rate is refused while the bridge is enabled, and a reload that pins (or re-enables a bridge pinning) a rate other than the device's *effective* rate (including one set at run time) is refused. A network controller is then offered this rate alone (as not changeable), and the portal and `tesseractl status` name the bridge that fixes it. |
 | `period_frames` | 10 ms at the device rate | Frames per card period (the card may round it). |
 | `buffer_frames` | 4 periods | Card buffer, at least two periods. The bridge keeps all but one period queued (3 of 4 periods by default: 30 ms of card latency at 10 ms periods), so the playback path adds about that to the device latency. |
@@ -738,6 +807,81 @@ How a bridge runs:
   discarded), missing frames (not delivered by the network), short frames (playback: frames the bridge's own resampler did not produce,
   played as silence; 0 when healthy), slips, whether real-time scheduling was refused, and the last error. Gauges are at most about a second
   old.
+
+## Host router (`[[route]]`), local monitoring and host volume (`[host_volume]`)
+
+### Host router (`[[route]]`)
+
+The host router connects local I/O (`app_out`, `host_out`, `card_in`,
+`card_out`) and network channels (`network_rx`, `network_tx`). Every crosspoint
+mixes one source port into one destination port with its own gain and mute, and
+a destination sums every active crosspoint that feeds it.
+
+While no grid is saved in `state.toml`, the **default grid** applies: each
+`network_rx` channel to its matching `host_out`, each `app_out` to its matching
+`network_tx` (unless a network capture bridge feeds it), local monitoring
+(`monitor_rx_from_tx`), and any `[[route]]` entries in `/etc/tessera/config.d/`:
+
+```toml
+# /etc/tessera/config.d/65-routes.toml
+[[bridge]]
+name = "cq"
+device = "main"
+alsa_pcm = "hw:CARD=CQ,DEV=0"
+direction = "capture"
+card_first_channel = 15
+channels = 2
+local_only = true
+
+[[route]]
+source = { kind = "card_in", card = "hw:CARD=CQ,DEV=0", channel = 15 }
+destination = { kind = "host_out", device = "main", channel = 1 }
+gain_db = 0.0
+muted = false
+```
+
+The first runtime router edit (`SetCrosspoint`, `RemoveCrosspoint`, etc.) saves
+the default grid to `state.toml` and then applies the edit; `ResetRouter`
+(`tesseractl router reset`) forgets the saved grid so the default grid (and
+`[[route]]` entries) apply again. Crosspoints implied by a network card bridge
+(without `local_only`) are always active and change only with the bridge. A
+destination port used as a `source` is a tap (after its own level and mute);
+loops through taps are refused.
+
+### Local monitoring (`monitor_rx_from_tx`, `monitor_delay_us`)
+
+On a `[[device]]`, `monitor_rx_from_tx = [1, 2]` mixes local TX channel 1 into
+RX host output 1 and TX channel 2 into RX host output 2 (0 = none), after that
+TX channel's gain and mute. `monitor_delay_us` defaults to `0` (`auto`: the
+lowest delay at which a feeding capture bridge's audio is reliably present, or
+at playback position for an audio client). `SetMonitor` (`tesseractl monitor`)
+overrides both keys in `state.toml`. In 0.6.0, local monitoring is implemented
+as TX-tap → `host_out` crosspoints in the host router, so monitored inputs and
+card inputs reach host outputs even when no network RX flow is running.
+
+### Host volume (`[host_volume]`)
+
+`[host_volume]` hands a host or speaker amplifier's ALSA simple mixer control
+to `tesserad` (needs a daemon built with `alsa-bridge` so it links libasound;
+`tesserad.service` runs with `SupplementaryGroups=audio`):
+
+```toml
+# /etc/tessera/config.d/60-host-volume.toml
+[host_volume]
+card = "Headphones"      # ALSA card id (amixer -c); setting it enables host volume
+control = "Digital"      # simple mixer control (default "Digital")
+min_db = -60             # offered range (defaults -60..0; within -96..=12)
+max_db = 0
+```
+
+Leaving `card` unset disables host volume. When enabled, `SetHostVolume` /
+`SetHostMute` (`tesseractl volume`, the portal's Speaker Volume pane and Mixer
+Main fader, or a control surface bound to `host_volume`/`host_mute`) persist
+the level and mute in `state.toml`, and `tesserad` applies and restores them
+through the ALSA mixer API (and re-applies them if the card reappears). When
+no volume has been saved yet (`gain` absent in `state.toml`), `tesserad` leaves
+the hardware control alone; on a speaker upgraded from 0.5.x, the portal sends
+its previously saved `/var/lib/tessera-web/volume.json` value once.
 
 ## Engine, clock and discovery at run time
 
@@ -845,6 +989,13 @@ daemon itself.
 |---|---|---|
 | `set_device_name`, `set_channel_label` | none | re-announced in place; audio does not stop |
 | `subscribe`, `unsubscribe` | none | only that RX channel changes |
+| `set_channel_mute`, `set_channel_gain`, `set_output_mute`, `set_output_gain` | none | applied to the running audio in place |
+| `set_router`, `reset_router`, `set_crosspoint`, `remove_crosspoint`, `set_crosspoint_gain`, `set_crosspoint_mute`, `set_port_gain`, `set_port_mute` | none | hot-swapped in the host router without stopping audio |
+| `set_host_volume`, `set_host_mute` | none | applied to the ALSA mixer control in place |
+| `set_monitor` | none | updates local monitoring taps in place |
+| `set_card_bridge`, `remove_card_bridge` | none | starts, restarts or stops only that bridge |
+| `set_surface`, `remove_surface` | none | the daemon opens or closes the surface's device; audio is untouched |
+| `set_mixer`, `remove_mixer` | none | saved portal panel layout; changes no audio |
 | `set_clock_role`, `set_clock_priority` | none | sent to the running PTP port as live commands |
 | `set_sample_rate`, `set_encoding`, `set_latency` | device | the device's flows are rebuilt and its audio clients detached (new ring geometry) |
 | `set_device_channels` | device | as above; channels beyond the new counts and their subscriptions are removed |
@@ -992,7 +1143,7 @@ mDNS advertisement of the logical devices.
 | `enabled` | boolean | `true` |  | true\|false | restart | daemon | Discovery at all. false advertises nothing whatever advertise_devices says (--no-discovery). Read at start only. |
 | `mdns` | string | `"auto"` |  | auto\|avahi\|builtin\|off | reload | none | mDNS implementation: auto uses Avahi if it is on the bus, else the built-in responder. |
 | `advertise_devices` | boolean | `true` |  | true\|false | reload | none | Advertise the logical devices. Enabled by default with the packaged Controller compatibility runtime. |
-| `browse_devices` | boolean | `false` |  | true\|false | reload | none | Browse permitted interfaces for the read-only routing catalogue. Does not send routing commands. |
+| `browse_devices` | boolean | `true` |  | true\|false | reload | none | Browse permitted interfaces for the read-only routing catalogue (the portal's Routing page needs it). Does not send routing commands. `false` opts out. |
 
 #### `[backends]`
 
@@ -1034,6 +1185,17 @@ Defaults for every [[bridge]] entry (each entry can override them). Two waits, b
 | `error_sleep_min_ms` | integer | `2` | ms | 1..=error_sleep_max_ms | reload | none | First pause of the bridge thread after a step with an xrun or card error. The floor of 1 ms keeps a card in trouble from making the real-time thread spin. |
 | `error_sleep_max_ms` | integer | `64` | ms | error_sleep_min_ms..=1000 | reload | none | Longest pause of the bridge thread while the trouble lasts. Higher values use less CPU on a broken card but make an xrun recover more slowly (the card is serviced again only after the pause). |
 
+#### `[host_volume]`
+
+The host (speaker amplifier) volume: an ALSA mixer control the daemon sets and restores at start, changed at run time by SetHostVolume / SetHostMute (the portal's Main fader, a surface fader bound to host_volume); the value set is stored in state.toml. Off while card is unset. Needs a daemon whose runtime sets the host volume.
+
+| Key | Type | Default | Unit | Range | Apply | Restart scope | What and why |
+|---|---|---|---|---|---|---|---|
+| `card` | string | unset (e.g. `"Headphones"`) |  | an ALSA card id or index: letters, digits, _ and -, at most 64 bytes | reload | none | The ALSA card of the volume control, by its id (amixer -c <card>), so a card that moves to another index after a reboot is still found. Setting it enables the host volume. |
+| `control` | string | unset (e.g. `"Digital"`) |  | a simple mixer control name, 1..=64 bytes; unset: Digital | reload | none | The simple mixer control that sets the amplifier's level. |
+| `min_db` | float | unset (e.g. `-60.0`) | dB | -96..max_db; unset: -60 | reload | none | Lowest volume offered (the bottom of a fader's travel). |
+| `max_db` | float | unset (e.g. `0.0`) | dB | min_db..=12; unset: 0 | reload | none | Highest volume offered. |
+
 #### `[[device]]`
 
 A logical device as it appears on the network. Several are allowed; the defaults below apply to each. Values marked live can also be changed at run time and are then stored in state.toml (pin them with `locked`).
@@ -1053,6 +1215,8 @@ A logical device as it appears on the network. Several are allowed; the defaults
 | `rx_channel_labels` | table | `{}` |  | { <channel> = "label" } | live | none | Receive channel labels (default RX n). |
 | `tx_channel_labels` | table | `{}` |  | { <channel> = "label" } | live | none | Transmit channel labels (default TX n). |
 | `multicast.allow_tx_multicast` | boolean | `true` |  | true\|false | reload | none | May this device transmit multicast flows. |
+| `monitor_rx_from_tx` | array | unset (e.g. `[1, 2]`) |  | one TX channel (1-based, 0: none) per RX channel | reload | none | Local monitoring: RX channel n also plays the TX channel in entry n, after that channel's gain and mute. Overridden by `SetMonitor`. |
+| `monitor_delay_us` | integer | `0` | us | 0..=1000000 | reload | none | How far behind playback the monitored TX channels are read. 0: auto, the lowest delay at which a feeding capture bridge's audio is reliably there (at the playback position when an audio client feeds them). Overridden by `SetMonitor`. |
 
 #### `[[bridge]]`
 
@@ -1065,8 +1229,9 @@ An in-daemon ALSA hardware-card bridge: moves audio between a card and a contigu
 | `direction` | string | `"playback"` |  | playback\|capture | reload | device | playback: network to card; capture: card to network. |
 | `name` | string | unset (e.g. `"main-playback"`) |  | letters, digits, _ and - | reload | device | Unique name. Unset: <device>-<direction>. |
 | `enabled` | boolean | `true` |  | true\|false | reload | device | false keeps the entry but leaves the card alone. |
-| `first_channel` | integer | `1` |  | >= 1 | reload | device | First device channel carried; card channel 1 is this one. |
+| `first_channel` | integer | `1` |  | >= 1 | reload | device | First device channel carried; card channel card_first_channel is this one. |
 | `channels` | integer | unset (e.g. `2`) | channels | >= 1 | reload | device | Channels carried. Unset: the rest of the device's channels from first_channel on. |
+| `card_first_channel` | integer | `1` |  | >= 1 | reload | device | First card channel carried (for example 15 for a mixer's main mix on USB channels 15-16). The card is opened with at least card_first_channel + channels - 1 channels (or the count it requires); capture ignores its other channels, playback sends silence on them. |
 | `sample_rate` | integer | unset (e.g. `48000`) | Hz | the device's rate | reload | device | The card's rate. Unset: follow the device. |
 | `period_frames` | integer | unset (e.g. `480`) | frames | >= 1 | reload | device | Frames per card period. Unset: 10 ms at the device's rate. |
 | `buffer_frames` | integer | unset (e.g. `1920`) | frames | >= 2 periods | reload | device | Card buffer. Unset: four periods. |
@@ -1081,6 +1246,18 @@ An in-daemon ALSA hardware-card bridge: moves audio between a card and a contigu
 | `error_sleep` | boolean | unset (e.g. `true`) |  | true\|false | reload | none | Override of [defaults.bridge] error_sleep for this bridge. |
 | `error_sleep_min_ms` | integer | unset (e.g. `2`) | ms | 1..=error_sleep_max_ms | reload | none | Override of [defaults.bridge] error_sleep_min_ms for this bridge. |
 | `error_sleep_max_ms` | integer | unset (e.g. `64`) | ms | error_sleep_min_ms..=1000 | reload | none | Override of [defaults.bridge] error_sleep_max_ms for this bridge. |
+| `local_only` | boolean | `false` |  | true\|false | reload | device | Open the card for the host router only: its channels card_first_channel.. become router ports (card_in for capture, card_out for playback) and no device channel is fed or read, so the card stays off the network until a crosspoint patches it there. first_channel is ignored and channels is required. Needs a daemon whose runtime runs the host router. |
+
+#### `[[route]]`
+
+A crosspoint of the host router's default grid: source mixed into destination with its own gain. The default grid (each RX channel to the host output of the same number, each application output to the TX channel of the same number, local monitoring, and these entries) applies until a grid is saved at run time (SetRouter, or an edit in the portal), which starts as a copy of it. Ports are inline tables: { kind = "network_rx" \| "network_tx" \| "app_out" \| "host_out", device = "<id>", channel = n } or { kind = "card_in" \| "card_out", card = "<ALSA PCM of a bridge>", channel = n }. Needs a daemon whose runtime runs the host router.
+
+| Key | Type | Default | Unit | Range | Apply | Restart scope | What and why |
+|---|---|---|---|---|---|---|---|
+| `source` | table | required (e.g. `{ kind = "network_rx", device = "main", channel = 1 }`) |  | a router port table | reload | none | What is mixed in: network_rx, app_out or card_in, or a destination port (network_tx, host_out, card_out) as a tap of what it carries. Required. |
+| `destination` | table | required (e.g. `{ kind = "host_out", device = "main", channel = 2 }`) |  | a network_tx, host_out or card_out port table | reload | none | Where it is mixed into. Required. |
+| `gain_db` | float | `0.0` | dB | -96..=12 | reload | none | Gain of this crosspoint. |
+| `muted` | boolean | `false` |  | true\|false | reload | none | Patched but silent. |
 
 #### `[[flow]]`
 

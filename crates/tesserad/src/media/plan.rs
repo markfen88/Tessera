@@ -21,6 +21,7 @@ use tessera_state::config::{FlowConfig, FlowFormat};
 use tessera_state::model::DeviceModel;
 
 use super::format::AnyFormat;
+use super::gains::FlowGains;
 use super::keepalive::{Keepalive, KeepaliveConfig};
 use super::stats::RxFlowCounters;
 use super::udp::{RxSock, TxSock};
@@ -375,6 +376,8 @@ pub fn build_rx(
             stalled: false,
             keepalive: Keepalive::new(keepalive),
             counters: Arc::clone(&counters),
+            gains: FlowGains::default(),
+            out_gains: FlowGains::default(),
         }),
     })
 }
@@ -429,6 +432,7 @@ pub fn build_tx(p: &FlowPlan, key: u64, device_ix: u32, sock_key: u64) -> Result
             dest: SocketAddrV4::new(dest, p.port),
             send_failures: Arc::clone(&send_failures),
             scratch_f: vec![0.0; p.fpp as usize],
+            gains: FlowGains::default(),
         }),
         metrics,
         send_failures,

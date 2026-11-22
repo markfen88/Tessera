@@ -64,7 +64,7 @@ pub(crate) async fn receivers(
         @match result {
             Ok(Reply::RoutingDevices(devices)) => {
                 p { "Choose a receiving device." }
-                @if !devices.complete { p.muted { "Discovery is incomplete. Some devices may be missing." } }
+                (discovery_notice(&devices))
                 @if devices.devices.is_empty() { p { "No devices are available." } }
                 @for device in devices.devices {
                     form method="get" action="/routing" {
@@ -84,7 +84,7 @@ pub(crate) async fn receivers(
                 @if receiver.channels.is_empty() {
                     p { "The receiver returned no channel observations. Its channel inventory and selections remain unknown." }
                 } @else {
-                    @if let Some(reason) = &receiver.operation_unavailable { (error_box(reason)) }
+                    @if let Some(reason) = &receiver.operation_unavailable { p.flash.bad { (board::unavailable_note(reason, false)) } }
                     (matrix(&receiver, &sources))
                 }
                 p.muted { "Audio status is unverified. Each page is a separate observation. Selections can change between reads." }
@@ -114,7 +114,7 @@ pub(crate) async fn receivers(
         &token,
         &session,
         &headers,
-        view("Routing", "/routing").every(10),
+        view("Network routing", "/routing").every(10),
         &body,
     )
 }
@@ -210,10 +210,23 @@ fn unambiguous_choices(mut choices: Vec<SourceChoice>) -> Vec<SourceChoice> {
 }
 
 fn selected(row: &RoutingReceiverChannel) -> String {
-    row.source.as_ref().map_or_else(
-        || "Receiver reports no source".into(),
-        |s| format!("{} → {}", s.tx_device, s.tx_channel),
-    )
+    let flow = row.config_flow.as_ref().map(|f| {
+        let from = match (&f.source_names, &f.peer) {
+            (Some(s), _) => format!("{} → {}", s.tx_device, s.tx_channel),
+            (None, Some(peer)) => format!("from {peer}"),
+            (None, None) => "from an unknown sender".into(),
+        };
+        format!(
+            "Config flow {}: {from} (read only; change it in the configuration)",
+            f.id
+        )
+    });
+    match (&row.source, flow) {
+        (Some(s), Some(flow)) => format!("{} → {} · {flow}", s.tx_device, s.tx_channel),
+        (Some(s), None) => format!("{} → {}", s.tx_device, s.tx_channel),
+        (None, Some(flow)) => flow,
+        (None, None) => "Receiver reports no source".into(),
+    }
 }
 
 fn change(row: &RoutingReceiverChannel, source: Option<&SourceChoice>) -> Option<ReceiverChange> {
@@ -543,6 +556,74 @@ pub(crate) async fn retire_peer_operation(
         Err(error) => {
             st.set_flash(&token, false, explain(&error));
             Redirect::to("/routing").into_response()
+        }
+    }
+}
+
+/// Why a device cannot be routed yet, in words.
+const fn unavailable_words(r: tessera_control_types::RoutingUnavailableReason) -> &'static str {
+    use tessera_control_types::RoutingUnavailableReason as R;
+    match r {
+        R::ExecutionUnavailable => "its controller runtime is not running",
+        R::InterfaceUnknown => "the network interface it was seen on is unknown",
+        R::InterfaceNotPermitted => "it was seen on an interface routing may not use",
+        R::ReceiverChannelsUnknown => "its receive channels are not known yet",
+        R::AdvertisedChannelsOnly => "only its advertised channels are known",
+        R::ConflictingMetadata => "it advertises conflicting names",
+        R::BundleUnsupported => "its multicast bundle is not supported",
+        R::IncompleteDiscovery => "it has not been fully discovered yet",
+        _ => "it cannot be routed yet",
+    }
+}
+
+/// Devices listed in a notice at most; the rest are counted.
+const NOTICE_DEVICES: usize = 8;
+
+/// What the inventory says about discovery: browsing switched off (no
+/// refresh can change that), starting, failed, or incomplete with what is
+/// missing; nothing when it is complete.
+pub(crate) fn discovery_notice(inv: &tessera_control_types::RoutingDevicePage) -> Markup {
+    use tessera_control_types::RoutingDiscoveryState as S;
+    let missing: Vec<String> = inv
+        .devices
+        .iter()
+        .filter(|d| !d.unavailable.is_empty())
+        .map(|d| {
+            let why: Vec<&str> = d
+                .unavailable
+                .iter()
+                .map(|r| unavailable_words(*r))
+                .collect();
+            format!("{}: {}", d.label, why.join("; "))
+        })
+        .collect();
+    html! {
+        @match inv.discovery.state {
+            S::Disabled => {
+                p.flash.routing-discovery {
+                    "Device browsing is off on this host (" code { "[discovery] browse_devices = false" } "), so other devices aren't listed. Set it to " code { "true" } " in " code { "/etc/tessera/config.d/" } " and reload."
+                }
+            }
+            S::Failed => {
+                p.flash.bad.routing-discovery { "Device browsing failed on this host, so other devices may be missing. The daemon log (" code { "journalctl -u tesserad" } ") says why." }
+            }
+            S::Starting if !inv.complete => {
+                p.flash.routing-discovery { "Device browsing is starting: other devices appear within a few seconds." }
+            }
+            _ if !inv.complete => {
+                div.flash.bad.routing-discovery {
+                    @if missing.is_empty() {
+                        "Discovery is incomplete: some devices are still being resolved. Refresh in a moment before changing a route."
+                    } @else {
+                        "Discovery is incomplete. Not routable yet:"
+                        ul {
+                            @for m in missing.iter().take(NOTICE_DEVICES) { li { (m) } }
+                            @if missing.len() > NOTICE_DEVICES { li { "and " (missing.len() - NOTICE_DEVICES) " more" } }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

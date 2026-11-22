@@ -26,6 +26,13 @@
 //!    holdover, or `free_running_tx` is set (ADR 0005);
 //! 5. on a grid tick: one wake byte to every attached client session.
 //!
+//! **Host router.** With a router plan (`media::router`, swapped in by
+//! [`Cmd::SetRouter`]) covering a device, step 3 delivers each RX channel
+//! into the plan's bus instead of the rings, the plan then mixes every host
+//! and card output into the rings (network RX, application and card inputs,
+//! taps), and step 4's TX flows read what the grid feeds each TX channel.
+//! Without a plan for a device the path is the direct one described above.
+//!
 //! **Never bursts.** A grid tick that was missed by more than a tick skips
 //! forward (counted); TX flows skip to the latest packet that is due
 //! (`TxFlow` counts a late skip); per-tick work is bounded (receive batches,
@@ -55,8 +62,11 @@ use tessera_media::{FrameSource, IngestOutcome, MediaClock, RxFlow, RxMetrics, T
 
 use super::clock::{FrozenClock, OverlayClock};
 use super::format::AnyFormat;
+use super::gains::FlowGains;
 use super::keepalive::Keepalive;
 use super::plan::UNUSED;
+use super::router::RouterPlan;
+pub use super::router::SessionPort;
 use super::stats::{EngineCounters, MediaStats, RxFlowCounters, wake_bucket};
 use super::udp::{RxSock, TxSock};
 use crate::rtsys;
@@ -91,6 +101,10 @@ pub struct SessionRt {
     /// Highest end position read from a TX ring (published at the end of
     /// the tick for the client's metrics).
     pub read_end: u64,
+    /// Whose ring it is: an audio client's or a network card bridge's (device
+    /// channels), or a `local_only` card bridge's (card channels, only the
+    /// router reads or writes it).
+    pub port: SessionPort,
 }
 
 /// A running RX flow.
@@ -130,6 +144,14 @@ pub struct RxRt {
     pub counters: Arc<RxFlowCounters>,
     /// Invalidates queued kernel stamps across wall-clock discontinuities.
     pub stamp_queue: TimestampQueue,
+    /// Gain and mute of each flow channel's device channel, applied after
+    /// the flow engine and before the rings or the router's bus (`gains`
+    /// module).
+    pub gains: FlowGains,
+    /// Output stage of each flow channel's RX device channel, applied before
+    /// the rings when no router plan covers the device (with a plan, the
+    /// router applies it as the host output's level).
+    pub out_gains: FlowGains,
 }
 
 /// A running TX flow.
@@ -154,6 +176,9 @@ pub struct TxRt {
     pub send_failures: Arc<tessera_media::Counter>,
     /// Scratch for `f32` rings (frames per packet long).
     pub scratch_f: Vec<f32>,
+    /// Gain and mute of each wire position's device channel, applied after
+    /// the client ring was read (`gains` module).
+    pub gains: FlowGains,
 }
 
 /// Datagrams read per TX socket and tick looking for receiver keepalives.
@@ -228,6 +253,8 @@ pub enum Cmd {
     Grow(Box<Tables>),
     /// `[clock] free_running_tx`.
     SetFreeRunningTx(bool),
+    /// Swap in a new host router plan (the old one goes back to be freed).
+    SetRouter(Box<RouterPlan>),
     /// Leave the loop after this tick.
     Stop,
 }
@@ -245,6 +272,8 @@ pub enum Retired {
     Session(Box<SessionRt>),
     /// Replaced tables.
     Tables(Box<Tables>),
+    /// A replaced router plan.
+    Router(Box<RouterPlan>),
 }
 
 /// A `Copy` event for the control thread (which logs it, rate-limited).
@@ -347,6 +376,7 @@ pub struct Worker {
     was_idle: bool,
     tx_suppressed: bool,
     stopping: bool,
+    router: Option<Box<RouterPlan>>,
 }
 
 impl std::fmt::Debug for Worker {
@@ -355,12 +385,15 @@ impl std::fmt::Debug for Worker {
     }
 }
 
-/// `FrameSource` over the TX client rings of one device.
+/// `FrameSource` over the TX client rings of one device, or over the host
+/// router's network TX channels when its plan covers the device.
 struct TxSource<'a> {
     sessions: &'a mut [Box<SessionRt>],
     device: u32,
     chan: &'a [u32],
     scratch_f: &'a mut [f32],
+    gains: &'a mut FlowGains,
+    router: Option<&'a mut RouterPlan>,
 }
 
 impl FrameSource for TxSource<'_> {
@@ -369,8 +402,19 @@ impl FrameSource for TxSource<'_> {
             out.fill(0);
             return 0;
         };
+        if let Some(r) = self.router.as_deref_mut().filter(|r| r.covers(self.device)) {
+            // What the grid feeds into this TX channel, then the channel's
+            // own gain as before.
+            let valid = r.eval_tx(self.sessions, self.device, dev_ch, pos, out);
+            self.gains.apply(channel, out);
+            return valid;
+        }
         for s in self.sessions.iter_mut() {
-            if s.device != self.device || dev_ch < s.first || dev_ch >= s.first + s.count {
+            if s.device != self.device
+                || matches!(s.port, SessionPort::Card(_))
+                || dev_ch < s.first
+                || dev_ch >= s.first + s.count
+            {
                 continue;
             }
             let SessionEnd::Consumer(c) = &mut s.end else {
@@ -387,18 +431,27 @@ impl FrameSource for TxSource<'_> {
                     }),
                     None => {
                         out.fill(0);
+                        self.gains.apply(channel, out);
                         return 0;
                     }
                 },
                 _ => c.read::<i32>(plane, pos, out).map(|r| r.valid),
             };
             s.read_end = s.read_end.max(pos.saturating_add(out.len() as u64));
-            return valid.unwrap_or_else(|_| {
+            let valid = valid.unwrap_or_else(|_| {
                 out.fill(0);
                 0
             });
+            // Per device channel, on the flow's copy: the ring is untouched,
+            // so a channel two flows send is scaled once in each.
+            self.gains.apply(channel, out);
+            return valid;
         }
+        // No client covers this channel: silence, but through the gain all
+        // the same, so its smoother follows a change made meanwhile and a
+        // client that attaches later does not ramp from a stale gain.
         out.fill(0);
+        self.gains.apply(channel, out);
         0
     }
 }
@@ -449,6 +502,7 @@ impl Worker {
             was_idle: true,
             tx_suppressed: false,
             stopping: false,
+            router: None,
         }
     }
 
@@ -590,6 +644,16 @@ impl Worker {
                     self.retire(Retired::Tables(b));
                 }
                 Cmd::SetFreeRunningTx(v) => self.cfg.free_running_tx = v,
+                Cmd::SetRouter(mut new) => {
+                    // Between two ticks: the new plan takes over the old
+                    // one's buses, smoothers and cursors, the old one goes
+                    // back to be freed (no allocation or free here).
+                    if let Some(mut old) = self.router.take() {
+                        new.inherit(&mut old);
+                        self.retire(Retired::Router(old));
+                    }
+                    self.router = Some(new);
+                }
                 Cmd::Stop => self.stopping = true,
             }
         }
@@ -639,6 +703,9 @@ impl Worker {
                         if let SessionEnd::Producer(p) = &mut sess.end {
                             p.reset();
                         }
+                    }
+                    if let Some(r) = self.router.as_deref_mut() {
+                        r.on_epoch();
                     }
                     emit(
                         &mut self.events,
@@ -718,8 +785,12 @@ impl Worker {
             cfg,
             events,
             stamp_clock,
+            router,
             ..
         } = self;
+        // The router mixes up to the playback position as of the start of
+        // the phase: every flow delivers at least that far below.
+        let start = frozen.now();
         for f in &mut t.rx {
             let mut got = false;
             let mut batches = 0;
@@ -818,7 +889,21 @@ impl Worker {
                     f.counters.keepalive_failures.inc();
                 }
             }
-            deliver(f, &mut t.sessions, frozen, cfg.max_span_frames);
+            deliver(
+                f,
+                &mut t.sessions,
+                frozen,
+                cfg.max_span_frames,
+                router.as_deref_mut(),
+            );
+        }
+        if let Some(r) = router.as_deref_mut() {
+            r.mix_rx(
+                &mut t.sessions,
+                start.media_ns,
+                start.epoch,
+                cfg.max_span_frames,
+            );
         }
     }
 
@@ -843,7 +928,13 @@ impl Worker {
                 EngineEvent::TxSuppressed(self.tx_suppressed),
             );
         }
-        let Self { t, cfg, events, .. } = self;
+        let Self {
+            t,
+            cfg,
+            events,
+            router,
+            ..
+        } = self;
         let Tables {
             tx,
             socks,
@@ -886,6 +977,8 @@ impl Worker {
                     device: f.device,
                     chan: &f.chan,
                     scratch_f: &mut f.scratch_f,
+                    gains: &mut f.gains,
+                    router: router.as_deref_mut(),
                 };
                 match f.flow.poll(frozen, &mut src, slot) {
                     Ok(TxPoll::Sent(p)) => {
@@ -922,9 +1015,20 @@ impl Worker {
     }
 }
 
-/// Deliver the span of positions that became due since the last tick into the
-/// RX rings of the sessions that cover each channel.
-fn deliver<C: MediaClock>(f: &mut RxRt, sessions: &mut [Box<SessionRt>], clock: &C, max_span: u64) {
+/// Deliver the span of positions that became due since the last tick: into
+/// the router's bus of each channel when a router plan covers the device
+/// (the router mixes the rings), else straight into the RX rings of the
+/// sessions that cover each channel, through the output stage.
+fn deliver<C: MediaClock>(
+    f: &mut RxRt,
+    sessions: &mut [Box<SessionRt>],
+    clock: &C,
+    max_span: u64,
+    mut router: Option<&mut RouterPlan>,
+) {
+    if router.as_deref().is_some_and(|r| !r.covers(f.device)) {
+        router = None;
+    }
     // The epoch check, every tick (also resets the flow's buffer).
     let po = f.flow.tick(clock);
     let pos = po.position;
@@ -955,8 +1059,24 @@ fn deliver<C: MediaClock>(f: &mut RxRt, sessions: &mut [Box<SessionRt>], clock: 
                 break;
             };
             f.flow.read(clock, c, p, out);
+            // Per device channel, before any ring, bridge or bus sees it.
+            f.gains.apply(c, out);
+            if let Some(r) = router.as_deref_mut() {
+                // The router reads it from the bus (a channel the grid does
+                // not route has none).
+                if let Some(bus) = r.rx_bus(f.device, dev_ch) {
+                    bus.write(p, out);
+                }
+                continue;
+            }
+            // The output stage, before any ring or bridge.
+            f.out_gains.apply(c, out);
             for s in sessions.iter_mut() {
-                if s.device != f.device || dev_ch < s.first || dev_ch >= s.first + s.count {
+                if s.device != f.device
+                    || matches!(s.port, SessionPort::Card(_))
+                    || dev_ch < s.first
+                    || dev_ch >= s.first + s.count
+                {
                     continue;
                 }
                 let SessionEnd::Producer(prod) = &mut s.end else {

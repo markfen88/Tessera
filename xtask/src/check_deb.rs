@@ -31,20 +31,55 @@ fn field(deb: &Path, name: &str) -> Result<String> {
 }
 
 /// The files a Markdown text links to: targets that are neither a URL nor only an anchor, with
-/// their anchors removed.
+/// their anchors and titles removed.
 fn markdown_file_links(text: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find("](") {
         let tail = &rest[at + 2..];
         let end = tail.find(')').unwrap_or(tail.len());
-        let file = tail[..end].split('#').next().unwrap_or_default();
+        let file = tail[..end]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .split('#')
+            .next()
+            .unwrap_or_default();
         if !file.is_empty() && !file.contains(':') {
             links.push(file.to_owned());
         }
         rest = &tail[end..];
     }
     links
+}
+
+/// The links of a document shipped in `/usr/share/doc/<package>/` that build-deb points at a
+/// shipped document or image (see `build_deb::package_links`), and that do not resolve in
+/// `support`, where the selected packages are extracted. A link into a package that is not
+/// selected is not checked.
+fn unresolved_doc_links(text: &str, package: &str, support: &Path) -> Vec<String> {
+    let doc = Path::new("usr/share/doc");
+    markdown_file_links(text)
+        .into_iter()
+        .filter(|link| {
+            let name = link.rsplit('/').next().unwrap_or_default();
+            let shipped_doc = name
+                .strip_suffix(".md")
+                .is_some_and(|name| crate::build_deb::doc_package(name).is_some());
+            let image = link
+                .trim_start_matches(&format!("../{}/", crate::build_deb::IMAGE_PACKAGE))
+                .starts_with(crate::build_deb::DOC_IMAGES);
+            if !shipped_doc && !image {
+                return false;
+            }
+            let owner = link
+                .strip_prefix("../")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or(package);
+            support.join(doc).join(owner).is_dir()
+                && !support.join(doc).join(package).join(link).is_file()
+        })
+        .collect()
 }
 
 /// The names in a Depends field, without versions and alternatives' other branches.
@@ -483,6 +518,7 @@ fn verify_dsp(checks: &mut Checks, root: &Path, conffiles: &str, temp: &Path) ->
         "usr/share/doc/tessera-dsp/dsp.lock",
         "usr/share/doc/tessera-dsp/vendored.txt",
         "usr/share/doc/tessera-dsp/README.md",
+        "usr/share/doc/tessera-dsp/dsp.md",
         "usr/share/doc/tessera-dsp/examples/Speaker.yml.in",
         "usr/lib/systemd/system/camilladsp.service",
         "usr/lib/systemd/system/camillagui.service",
@@ -799,6 +835,29 @@ fn package(checks: &mut Checks, deb: &Path) -> Result<()> {
         );
     }
     if pkg == "tessera" {
+        let shipped = fs::read_dir(root.join("usr/share/tessera/surfaces"))
+            .map(|entries| {
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.ends_with(".toml"))
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(crate::build_deb::surface_profiles)
+            .transpose()?
+            .unwrap_or_default();
+        let missing: Vec<&String> = source.iter().filter(|n| !shipped.contains(*n)).collect();
+        checks.check(
+            !shipped.is_empty() && missing.is_empty(),
+            &format!(
+                "/usr/share/tessera/surfaces/ has the {} shipped surface profile(s)",
+                shipped.len()
+            ),
+            &format!("/usr/share/tessera/surfaces/ lacks surface profiles {missing:?}"),
+        );
         checks.check(
             conffiles
                 .lines()
@@ -835,6 +894,35 @@ fn package(checks: &mut Checks, deb: &Path) -> Result<()> {
             root.join("usr/share/doc/tessera/NEWS.Debian.gz").is_file(),
             "NEWS.Debian.gz is present",
             "no NEWS.Debian.gz",
+        );
+        for doc in ["user-guide.md", "surface-profiles.md"] {
+            checks.check(
+                root.join("usr/share/doc/tessera").join(doc).is_file(),
+                &format!("ships /usr/share/doc/tessera/{doc}"),
+                &format!("missing /usr/share/doc/tessera/{doc}"),
+            );
+        }
+    }
+    // The shipped documents' links to the other shipped documents and to their images find
+    // them where the packages put them.
+    let doc = root.join("usr/share/doc").join(&pkg);
+    let mut documents: Vec<PathBuf> = fs::read_dir(&doc)
+        .map(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+                .collect()
+        })
+        .unwrap_or_default();
+    documents.sort();
+    for document in documents {
+        let name = document.file_name().unwrap_or_default().to_string_lossy();
+        let missing = unresolved_doc_links(&fs::read_to_string(&document)?, &pkg, &checks.support);
+        checks.check(
+            missing.is_empty(),
+            &format!("{name}'s links to shipped documents and images resolve"),
+            &format!("{name} links to files no selected package ships: {missing:?}"),
         );
     }
     if pkg == "tessera-dsp" {
@@ -1079,6 +1167,32 @@ mod tests {
     }
 
     #[test]
+    fn shipped_documents_must_find_the_documents_and_images_they_link_to() {
+        let support = TempDir::new("tessera-doc-links").unwrap();
+        let doc = support.path().join("usr/share/doc");
+        for file in [
+            "tessera/user-guide.md",
+            "tessera/surface-profiles.md",
+            "tessera/images/0.6/grid.png",
+        ] {
+            fs::create_dir_all(doc.join(file).parent().unwrap()).unwrap();
+            fs::write(doc.join(file), "").unwrap();
+        }
+        fs::create_dir_all(doc.join("tessera-web")).unwrap();
+        let web = "[p](../tessera/surface-profiles.md#x) ![g](../tessera/images/0.6/grid.png) ![m](../tessera/images/0.6/gone.png) [cli](cli.md) [dsp](../tessera-dsp/dsp.md) [u](https://e.org/images/a.png)";
+        // cli.md is not a shipped document and tessera-dsp is not selected: neither is checked.
+        assert_eq!(
+            unresolved_doc_links(web, "tessera-web", support.path()),
+            ["../tessera/images/0.6/gone.png"]
+        );
+        let guide = "[p](surface-profiles.md) ![g](images/0.6/grid.png) [w](../tessera-web/web-portal.md) ![x](images/0.6/x.png)";
+        assert_eq!(
+            unresolved_doc_links(guide, "tessera", support.path()),
+            ["../tessera-web/web-portal.md", "images/0.6/x.png"]
+        );
+    }
+
+    #[test]
     fn the_readmes_links_are_the_files_it_points_at() {
         assert_eq!(
             markdown_file_links(
@@ -1087,6 +1201,10 @@ mod tests {
             ["web-portal.md", "../tessera/troubleshooting.md"]
         );
         assert!(markdown_file_links("").is_empty());
+        assert_eq!(
+            markdown_file_links("![a](images/a.png \"title\")"),
+            ["images/a.png"]
+        );
         // The shipped text of docs/dsp.md points only where packages put documents.
         let shipped =
             crate::build_deb::package_links(include_str!("../../docs/dsp.md"), "tessera-dsp");

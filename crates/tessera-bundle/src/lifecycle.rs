@@ -11,6 +11,13 @@ use std::time::Duration;
 
 /// The speaker profile's device configuration, written once and then the operator's.
 const SPEAKER_CONFIG: &str = "/etc/tessera/config.d/60-speaker.toml";
+/// The daemon's amplifier volume (`[host_volume]`, since 0.6.0), written with the portal's
+/// Volume card. A `60-` name: the record takes only `config.d/60-*.toml` files, in this
+/// installer and in the 0.5.x one, whose uninstall then still reads the record and removes
+/// it (a 0.5.x daemon refuses the `[host_volume]` table and would not start).
+const HOST_VOLUME_DROPIN: &str = "/etc/tessera/config.d/60-host-volume.toml";
+/// The daemon's saved state, and the copy an uninstall keeps of it for a downgrade.
+const STATE_FILE: &str = "/var/lib/tessera/state.toml";
 /// What the CamillaDSP stage keeps: the engine's configurations and its state file.
 const DSP_CONFIGS: &str = "/opt/camilladsp/configs";
 const DSP_COEFFS: &str = "/opt/camilladsp/coeffs";
@@ -1109,6 +1116,13 @@ impl<R: Runner> Lifecycle<'_, R> {
                 "\n[appliance.volume]\ncard = \"{}\"\ncontrol = \"{control}\"\nmin_db = -60\nmax_db = 0\n",
                 card.name
             ));
+            // Since 0.6.0 tesserad sets the amplifier volume ([host_volume]) and the
+            // portal and control surfaces send it commands; the portal hands its saved
+            // value over once and keeps its own table for a rollback.
+            self.write_once(
+                HOST_VOLUME_DROPIN,
+                &dsp::host_volume_dropin(&card.name, control),
+            )?;
         }
         self.write_once(PORTAL_DROPIN, &portal)?;
         if let Some(address) = &gui_address {
@@ -1696,6 +1710,9 @@ impl<R: Runner> Lifecycle<'_, R> {
             }
         }
         self.keep_aside_report();
+        if !self.options.purge {
+            self.downgrade_note()?;
+        }
         for directory in [
             "/etc/systemd/system/tesserad.service.d",
             "/etc/systemd/system/tessera-web.service.d",
@@ -1870,6 +1887,41 @@ impl<R: Runner> Lifecycle<'_, R> {
 
     /// Units of the operator's that the installer moved aside stay where they are; say how to
     /// get one back.
+    /// Before a downgrade (uninstall, then the older bundle's install): keep a copy of the
+    /// daemon's state, since a 0.5.x daemon reads the file but drops what it does not know
+    /// (control surfaces, the host router, the host volume, mixer strips, card bridges,
+    /// channel gains and mutes) at its next write; and say what to do.
+    fn downgrade_note(&mut self) -> Result<()> {
+        let state = self.paths.at(STATE_FILE);
+        let kept = match fs::symlink_metadata(&state) {
+            Ok(metadata) if metadata.is_file() => {
+                let version = Some(self.record.version.as_str())
+                    .filter(|v| !v.is_empty() && crate::manifest::token(v))
+                    .unwrap_or("before-uninstall");
+                let copy = format!("{STATE_FILE}.{version}");
+                fs::copy(&state, self.paths.at(&copy))?;
+                // The daemon's account owns its state: so does the copy.
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    std::os::unix::fs::chown(
+                        self.paths.at(&copy),
+                        Some(metadata.uid()),
+                        Some(metadata.gid()),
+                    )?;
+                }
+                Some(copy)
+            }
+            _ => None,
+        };
+        println!(
+            "note: to go back to tessera 0.5.x, install the older bundle now (its install refuses a newer installed version, so uninstall first, as done). The configuration files this bundle wrote are removed, {HOST_VOLUME_DROPIN} included (a 0.5.x daemon refuses [host_volume] and would not start); remove any other [host_volume], [[surface]] or 0.6 key you added to /etc/tessera yourself.{}",
+            kept.map_or(String::new(), |copy| format!(
+                " A 0.5.x daemon drops the 0.6 parts of {STATE_FILE} (control surfaces, router, host volume, mixer strips, card bridges, channel gains and mutes) when it next saves it; a copy is kept at {copy}: after upgrading again, stop tesserad and copy it back with cp -p before the start."
+            ))
+        );
+        Ok(())
+    }
+
     fn keep_aside_report(&self) {
         for unit in DSP_UNITS {
             let file = format!("{UNIT_DIRECTORY}/{unit}.service.{ASIDE}");
@@ -1975,6 +2027,22 @@ mod tests {
             os_release: root.join("os-release"),
             uid: 0,
         }
+    }
+
+    #[test]
+    fn the_host_volume_dropin_is_a_path_every_record_takes() {
+        // This installer's record, and the 0.5.x one (same rule), take it: an uninstall
+        // of either removes it before a downgrade.
+        let record = Record {
+            files: vec![HOST_VOLUME_DROPIN.into(), SPEAKER_CONFIG.into()],
+            ..Record::default()
+        };
+        record.validate().unwrap();
+        let wrong = Record {
+            files: vec!["/etc/tessera/config.d/61-host-volume.toml".into()],
+            ..Record::default()
+        };
+        assert!(wrong.validate().is_err());
     }
 
     #[test]

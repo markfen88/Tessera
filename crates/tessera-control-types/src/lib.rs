@@ -57,9 +57,15 @@ use core::num::NonZeroU16;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+mod host_router;
 mod impact;
+mod mixer;
 mod routing;
+pub use host_router::*;
+pub use mixer::*;
 pub use routing::*;
+mod surface;
+pub use surface::*;
 
 pub use impact::{
     Impact, ImpactToken, Limits, RemovedSubscription, RestartImpact, RestartScope, RingMemory,
@@ -181,6 +187,8 @@ pub enum Origin {
     Api { principal: String },
     /// The daemon itself (e.g. restoring persisted state).
     Internal,
+    /// A hardware control surface (`[[surface]]` name).
+    Surface { name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +483,186 @@ pub enum Command {
     ResetAccessLock {
         device: DeviceKey,
     },
+    /// Mute or unmute channels. Never owned by a surface. `Invalid` for an
+    /// unknown device or channel. Saved intent.
+    SetChannelMute {
+        target: ChannelSet,
+        muted: bool,
+    },
+    /// Set the gain of channels. Refused with [`CommandError::GainOwned`]
+    /// for a channel a connected surface's non-motorized fader owns,
+    /// unless the command comes from that surface. Saved intent.
+    SetChannelGain {
+        target: ChannelSet,
+        gain: Gain,
+    },
+    /// Set the OUTPUT level of RX channels: applied after the local mix
+    /// (`SetMonitor`), so it scales network audio and monitored inputs
+    /// together, like a master fader. Independent of `SetChannelGain` (the
+    /// channel's input level). Never owned. Saved intent (provisional 0.x).
+    SetOutputGain {
+        target: ChannelSet,
+        gain: Gain,
+    },
+    /// Mute the OUTPUT of RX channels (after the local mix). Saved intent.
+    SetOutputMute {
+        target: ChannelSet,
+        muted: bool,
+    },
+    /// Add a control surface, or replace the one with the same name.
+    /// Saved intent (provisional 0.x).
+    SetSurface {
+        surface: SurfaceSpec,
+    },
+    /// Remove a control surface. `NotFound` if there is none by that name.
+    RemoveSurface {
+        name: String,
+    },
+    /// Add a sound-card bridge, or replace the one with the same name: a
+    /// card's inputs to TX channels (capture) or RX channels to its outputs
+    /// (playback). Saved intent; a `[[bridge]]` of the configuration files
+    /// with that name cannot be replaced (`Locked`). Restarts that bridge
+    /// only (provisional 0.x).
+    SetCardBridge {
+        bridge: CardBridgeSpec,
+    },
+    /// Remove a sound-card bridge added with `SetCardBridge`.
+    RemoveCardBridge {
+        name: String,
+    },
+    /// Local monitoring of a device: RX channel `n` also plays TX channel
+    /// `rx_from_tx[n-1]` (1-based; 0: none), mixed in after that TX
+    /// channel's gain and mute, read `delay_us` behind playback. `delay_us`
+    /// 0 (the default when absent) is auto: the lowest delay at which a
+    /// feeding capture bridge's audio is reliably there. Saved intent;
+    /// overrides `[[device]] monitor_rx_from_tx` and `monitor_delay_us`
+    /// (provisional 0.x).
+    SetMonitor {
+        device: DeviceKey,
+        rx_from_tx: Vec<u16>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        delay_us: u32,
+    },
+    /// The daemon's surface runtime reports that a surface's device was
+    /// opened or lost. Runtime state, not saved intent; accepted only from
+    /// [`Origin::Internal`]. Decides gain ownership.
+    ///
+    /// `connected: true` is refused (`Invalid`) for a surface that is
+    /// disabled, and, when `epoch` is given, for one whose
+    /// [`SurfaceStatus::connection_epoch`] is no longer `epoch` (it was
+    /// disabled, re-enabled or moved to another source since the daemon
+    /// read it: read [`Query::Surfaces`] again and report with the new
+    /// epoch). `connected: false` with an old `epoch` changes nothing: that
+    /// connection was dropped already when the epoch changed. `epoch` absent
+    /// (an older daemon): only the enabled check.
+    ReportSurfaceConnection {
+        name: String,
+        connected: bool,
+        /// The [`SurfaceStatus::connection_epoch`] the report is made under.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        epoch: Option<u64>,
+    },
+    /// Replace the saved host-router grid and the local port labels (see
+    /// [`RouterSpec`]; the module `host_router` explains the model). Every
+    /// crosspoint's destination must be a destination port, its ports must
+    /// exist (a crosspoint already saved unchanged is not checked again),
+    /// no pair twice, no loop through taps, and none may repeat a
+    /// crosspoint a network card bridge implies. From then on the saved
+    /// grid replaces the default one. A label equal to the port's default
+    /// is not saved, and only new or changed labels are checked (to rename
+    /// one port, prefer [`Command::SetPortLabel`]). Refused with
+    /// [`CommandError::AccessLocked`] when it changes the effective
+    /// crosspoints (patch, gain, mute) or labels of a locked device, and
+    /// with [`CommandError::LevelOwned`] when it changes the gain of a
+    /// crosspoint a connected surface fader owns (as `ResetRouter`,
+    /// `SetCrosspoint` and `SetMonitor` are). Saved intent, no restart
+    /// (provisional 0.x).
+    SetRouter {
+        router: RouterSpec,
+    },
+    /// Forget the saved grid: the default grid (identity, `[[route]]`,
+    /// monitoring) applies again. Port labels and levels stay.
+    ResetRouter,
+    /// Add one crosspoint, or replace the one with the same source and
+    /// destination (its gain and mute). Checked as in `SetRouter`. When no
+    /// grid is saved, the default grid is saved first, then changed.
+    SetCrosspoint {
+        crosspoint: Crosspoint,
+    },
+    /// Remove one crosspoint of the saved grid (the default grid is saved
+    /// first when none is). `NotFound` if it is not patched; `Invalid` for
+    /// one a network card bridge implies (change the bridge).
+    RemoveCrosspoint {
+        source: RouterPort,
+        destination: RouterPort,
+    },
+    /// Set the gain of patched crosspoints. Refused with
+    /// [`CommandError::LevelOwned`] for one a connected surface's fader
+    /// owns, unless it comes from that surface. Not for crosspoints a
+    /// network card bridge implies (their levels are the ports').
+    SetCrosspointGain {
+        crosspoints: Vec<CrosspointKey>,
+        gain: Gain,
+    },
+    /// Mute or unmute patched crosspoints. Never owned.
+    SetCrosspointMute {
+        crosspoints: Vec<CrosspointKey>,
+        muted: bool,
+    },
+    /// Set the level of router ports. On `NetworkRx` / `NetworkTx` it is
+    /// the channel's gain (`SetChannelGain`), on `HostOut` the RX channel's
+    /// output level (`SetOutputGain`), with their events; other ports'
+    /// levels are stored with the router (`PortGainChanged`). Fader priority
+    /// applies ([`CommandError::GainOwned`] / [`CommandError::LevelOwned`]).
+    SetPortGain {
+        ports: Vec<RouterPort>,
+        gain: Gain,
+    },
+    /// Mute or unmute router ports (network ports as `SetChannelMute`,
+    /// `HostOut` as `SetOutputMute`). Never owned.
+    SetPortMute {
+        ports: Vec<RouterPort>,
+        muted: bool,
+    },
+    /// Label one port of the router, or give it its default label again
+    /// (`label: None`). Local ports (`AppOut`, `CardIn`, `CardOut`) and host
+    /// outputs (`HostOut`) only; network channels are labelled with
+    /// [`Command::SetChannelLabel`]. Only this label is checked (1..=31
+    /// bytes, ASCII, no `=`, `.` or `@`), so a port whose default or saved
+    /// label would not pass does not block renaming another. The grid is
+    /// not touched. Saved intent, no restart (provisional 0.x).
+    SetPortLabel {
+        port: RouterPort,
+        #[cfg_attr(feature = "serde", serde(default))]
+        label: Option<String>,
+    },
+    /// Set the host (speaker amplifier) volume: `[host_volume]` of the
+    /// configuration names the ALSA mixer control and its range; the daemon
+    /// sets the control and restores it at start. `Gain::Off` is the bottom
+    /// of the control. `Unsupported` without `[host_volume]`; `Invalid`
+    /// outside the configured range; [`CommandError::LevelOwned`] while a
+    /// surface fader owns it. Saved intent (provisional 0.x).
+    SetHostVolume {
+        gain: Gain,
+    },
+    /// Mute or unmute the host volume (the control's playback switch, or
+    /// its minimum when it has none). Never owned. Saved intent.
+    SetHostMute {
+        muted: bool,
+    },
+    /// Add a mixer panel, or replace the one with the same id. Changes no
+    /// audio and creates no surface binding. `InvalidMixer` when it does not
+    /// fit. Saved intent (provisional 0.x).
+    SetMixer {
+        mixer: MixerSpec,
+    },
+    /// Remove a mixer panel. `NotFound` if there is none by that id.
+    RemoveMixer {
+        id: String,
+    },
 }
 
 impl Command {
@@ -502,6 +690,29 @@ impl Command {
         "lock_access",
         "unlock_access",
         "reset_access_lock",
+        "set_channel_mute",
+        "set_channel_gain",
+        "set_surface",
+        "remove_surface",
+        "report_surface_connection",
+        "set_card_bridge",
+        "remove_card_bridge",
+        "set_monitor",
+        "set_output_gain",
+        "set_output_mute",
+        "set_router",
+        "reset_router",
+        "set_crosspoint",
+        "remove_crosspoint",
+        "set_crosspoint_gain",
+        "set_crosspoint_mute",
+        "set_port_gain",
+        "set_port_mute",
+        "set_port_label",
+        "set_host_volume",
+        "set_host_mute",
+        "set_mixer",
+        "remove_mixer",
     ];
 
     /// The command's name without its arguments: safe to log (the arguments
@@ -533,6 +744,29 @@ impl Command {
             Self::LockAccess { .. } => "lock_access",
             Self::UnlockAccess { .. } => "unlock_access",
             Self::ResetAccessLock { .. } => "reset_access_lock",
+            Self::SetChannelMute { .. } => "set_channel_mute",
+            Self::SetChannelGain { .. } => "set_channel_gain",
+            Self::SetSurface { .. } => "set_surface",
+            Self::RemoveSurface { .. } => "remove_surface",
+            Self::ReportSurfaceConnection { .. } => "report_surface_connection",
+            Self::SetCardBridge { .. } => "set_card_bridge",
+            Self::RemoveCardBridge { .. } => "remove_card_bridge",
+            Self::SetMonitor { .. } => "set_monitor",
+            Self::SetOutputGain { .. } => "set_output_gain",
+            Self::SetOutputMute { .. } => "set_output_mute",
+            Self::SetRouter { .. } => "set_router",
+            Self::ResetRouter => "reset_router",
+            Self::SetCrosspoint { .. } => "set_crosspoint",
+            Self::RemoveCrosspoint { .. } => "remove_crosspoint",
+            Self::SetCrosspointGain { .. } => "set_crosspoint_gain",
+            Self::SetCrosspointMute { .. } => "set_crosspoint_mute",
+            Self::SetPortGain { .. } => "set_port_gain",
+            Self::SetPortMute { .. } => "set_port_mute",
+            Self::SetPortLabel { .. } => "set_port_label",
+            Self::SetHostVolume { .. } => "set_host_volume",
+            Self::SetHostMute { .. } => "set_host_mute",
+            Self::SetMixer { .. } => "set_mixer",
+            Self::RemoveMixer { .. } => "remove_mixer",
         }
     }
 }
@@ -570,6 +804,32 @@ pub enum Query {
     /// The in-daemon hardware-card bridges and their live state
     /// (`Reply::Bridges`).
     Bridges,
+    /// Devices present on the host and configured control surfaces with
+    /// their live state (`Reply::Surfaces`, provisional 0.x).
+    Surfaces,
+    /// Watch a detected device for up to `timeout_ms` (at most 30 s) and
+    /// report the first control that moves (`Reply::LearnedControl`; `None`
+    /// if nothing moved). The first second is taken as idle (hands off) to
+    /// learn the device's own noise. `moving_up`: the user was asked to move
+    /// a fader up, so a falling value means an inverted fader. While a learn
+    /// runs, the surface using that device does not act on it.
+    /// Administrators only (provisional 0.x).
+    LearnControl {
+        device: String,
+        timeout_ms: u32,
+        #[cfg_attr(feature = "serde", serde(default))]
+        moving_up: bool,
+    },
+    /// The surface profiles the daemon knows: built in, and the files of
+    /// `/usr/share/tessera/surfaces/` and `/etc/tessera/surfaces.d/`
+    /// (`Reply::SurfaceProfiles`, provisional 0.x).
+    SurfaceProfiles,
+    /// The host router: every port with its level and every crosspoint in
+    /// effect or saved (`Reply::Router`, provisional 0.x).
+    Router,
+    /// The saved mixer panels, in id order (`Reply::Mixers`; empty when
+    /// none is saved, then the portal shows its default panel).
+    Mixers,
 }
 
 /// Why a command was refused.
@@ -647,6 +907,31 @@ pub enum CommandError {
     /// [`Command::UnlockAccess`] with a PIN that does not match. Nothing
     /// changed.
     IncorrectPin,
+    /// The channel's gain is set by the fader of a connected control
+    /// surface (`surface`), which has priority. Nothing changed; mute is
+    /// still available.
+    GainOwned {
+        device: DeviceKey,
+        direction: Direction,
+        channel: Channel,
+        surface: String,
+    },
+    /// A level other than a network channel's gain (a port level, a
+    /// crosspoint gain, the host volume, a host output's level) is set by
+    /// the fader of a connected control surface (`surface`), which has
+    /// priority. Nothing changed; mute is still available.
+    LevelOwned {
+        /// The level, in words (`host volume`, `crosspoint card_in
+        /// hw:CARD=CQ,DEV=0 15 → host_out main 1`).
+        what: String,
+        surface: String,
+    },
+    /// A mixer panel ([`Command::SetMixer`]) does not fit: bad id or
+    /// label, a strip action that does not fit its control, a target that
+    /// does not exist. Nothing changed.
+    InvalidMixer {
+        reason: String,
+    },
 }
 
 impl CommandError {
@@ -676,7 +961,7 @@ impl fmt::Display for CommandError {
                 f.write_str("routing inventory changed; refresh and choose again")
             }
             Self::ReceiverReadTimeout => {
-                f.write_str("receiver did not answer in time; no retry was sent")
+                f.write_str("receiver did not answer in time (asked twice)")
             }
             Self::ReceiverReadUnavailable { reason } => {
                 write!(f, "receiver read unavailable: {reason}")
@@ -707,6 +992,21 @@ impl fmt::Display for CommandError {
                 device.0
             ),
             Self::IncorrectPin => f.write_str("incorrect PIN"),
+            Self::GainOwned {
+                device,
+                channel,
+                surface,
+                ..
+            } => write!(
+                f,
+                "the gain of `{}` channel {channel} is set by the fader of surface `{surface}`; mute is still available",
+                device.0
+            ),
+            Self::LevelOwned { what, surface } => write!(
+                f,
+                "the {what} is set by the fader of surface `{surface}`; mute is still available"
+            ),
+            Self::InvalidMixer { reason } => write!(f, "invalid mixer panel: {reason}"),
         }
     }
 }
@@ -913,6 +1213,32 @@ pub struct ChannelStatus {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub routing: Option<ReceiverRoute>,
+    /// Channel gain (unity by default).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gain: Gain,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub muted: bool,
+    /// The connected surface whose fader sets this channel's gain; other
+    /// origins cannot change it (mute stays available).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub gain_owner: Option<String>,
+    /// RX: output level after the local mix (unity by default).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_gain: Gain,
+    /// RX: output muted.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_muted: bool,
+    /// RX: the connected surface whose fader sets the output level (a
+    /// `PortGain` fader on this channel's `HostOut` port); other origins
+    /// cannot change it. `OutputGain` bindings own nothing.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub output_gain_owner: Option<String>,
 }
 
 impl ChannelStatus {
@@ -923,6 +1249,12 @@ impl ChannelStatus {
             channel,
             label: label.into(),
             routing: None,
+            gain: Gain::default(),
+            muted: false,
+            gain_owner: None,
+            output_gain: Gain::default(),
+            output_muted: false,
+            output_gain_owner: None,
         }
     }
 }
@@ -965,6 +1297,17 @@ pub struct DeviceStatus {
         serde(default, skip_serializing_if = "core::ops::Not::not")
     )]
     pub access_locked: bool,
+    /// Local monitoring: RX channel `n` also plays the TX channel in entry
+    /// `n` (1-based; 0: none). See [`Command::SetMonitor`].
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub monitor_rx_from_tx: Vec<u16>,
+    /// How far behind playback the monitored inputs are read, microseconds;
+    /// 0: auto (the lowest safe delay, the default).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub monitor_delay_us: u32,
 }
 
 /// What a device's sample rate and encoding can be set to now: exactly the
@@ -1070,6 +1413,8 @@ impl DeviceStatus {
             routing_locks: None,
             formats: None,
             access_locked: false,
+            monitor_rx_from_tx: Vec::new(),
+            monitor_delay_us: 0,
         }
     }
 
@@ -1272,6 +1617,13 @@ pub struct Status {
     /// configuration. `None` from a daemon that predates them.
     #[cfg_attr(feature = "serde", serde(default))]
     pub limits: Option<Limits>,
+    /// The host (speaker amplifier) volume, when `[host_volume]` is
+    /// configured. `None` otherwise, and from a daemon that predates it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub host_volume: Option<HostVolumeStatus>,
 }
 
 impl Status {
@@ -1288,6 +1640,7 @@ impl Status {
             warnings: Vec::new(),
             bridges: Vec::new(),
             limits: None,
+            host_volume: None,
         }
     }
 
@@ -1295,6 +1648,13 @@ impl Status {
     #[must_use]
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = Some(limits);
+        self
+    }
+
+    /// Set the host volume.
+    #[must_use]
+    pub fn with_host_volume(mut self, host_volume: HostVolumeStatus) -> Self {
+        self.host_volume = Some(host_volume);
         self
     }
 
@@ -1400,6 +1760,13 @@ pub struct BridgeStatus {
     pub first_channel: u16,
     /// Channels carried.
     pub channels: u16,
+    /// First card channel carried (1-based; 1 from daemons that predate
+    /// it). See [`CardBridgeSpec::card_first_channel`].
+    pub card_first_channel: u16,
+    /// The bridge opens its card for the host router only (no device
+    /// channels); see [`CardBridgeSpec::local_only`]. False from daemons that
+    /// predate it.
+    pub local_only: bool,
     /// Life cycle.
     pub state: BridgeState,
     /// Frames queued in the card (playback: written, not yet played;
@@ -1488,6 +1855,8 @@ impl BridgeStatus {
             direction,
             first_channel: 1,
             channels: 0,
+            card_first_channel: 1,
+            local_only: false,
             state,
             fill_frames: 0,
             position_error_frames: 0,
@@ -1982,6 +2351,82 @@ pub enum Event {
         locked: bool,
         origin: Origin,
     },
+    /// Channels were muted or unmuted.
+    ChannelMuteChanged {
+        target: ChannelSet,
+        muted: bool,
+        origin: Origin,
+    },
+    /// The gain of channels changed.
+    ChannelGainChanged {
+        target: ChannelSet,
+        gain: Gain,
+        origin: Origin,
+    },
+    /// The output level of RX channels changed.
+    OutputGainChanged {
+        target: ChannelSet,
+        gain: Gain,
+        origin: Origin,
+    },
+    /// The output of RX channels was muted or unmuted.
+    OutputMuteChanged {
+        target: ChannelSet,
+        muted: bool,
+        origin: Origin,
+    },
+    /// A surface was added, replaced or removed, or connected or lost:
+    /// re-read `Query::Surfaces`.
+    SurfacesChanged {
+        origin: Origin,
+    },
+    /// The host-router grid changed (crosspoints added or removed, saved or
+    /// reset, port labels, a bridge or channel count that changes which
+    /// ports exist): re-read `Query::Router`. Gain and mute changes have
+    /// their own events.
+    RouterChanged {
+        origin: Origin,
+    },
+    /// The gain of crosspoints changed.
+    CrosspointGainChanged {
+        crosspoints: Vec<CrosspointKey>,
+        gain: Gain,
+        origin: Origin,
+    },
+    /// Crosspoints were muted or unmuted.
+    CrosspointMuteChanged {
+        crosspoints: Vec<CrosspointKey>,
+        muted: bool,
+        origin: Origin,
+    },
+    /// The level of local router ports (`AppOut`, `CardIn`, `CardOut`)
+    /// changed. Network ports and host outputs report `ChannelGainChanged`
+    /// and `OutputGainChanged` instead.
+    PortGainChanged {
+        ports: Vec<RouterPort>,
+        gain: Gain,
+        origin: Origin,
+    },
+    /// Local router ports were muted or unmuted (network ports and host
+    /// outputs: `ChannelMuteChanged`, `OutputMuteChanged`).
+    PortMuteChanged {
+        ports: Vec<RouterPort>,
+        muted: bool,
+        origin: Origin,
+    },
+    /// The saved host volume or its mute changed. `gain: None`: no volume
+    /// saved (the control is left as it is).
+    HostVolumeChanged {
+        gain: Option<Gain>,
+        muted: bool,
+        origin: Origin,
+    },
+    /// A mixer panel was added, replaced or removed: re-read
+    /// `Query::Mixers`.
+    MixerChanged {
+        id: String,
+        origin: Origin,
+    },
 }
 
 /// Body of a request on the local control socket.
@@ -2098,6 +2543,16 @@ pub enum Reply {
     EffectiveConfig(String),
     /// The hardware-card bridges (`Query::Bridges`).
     Bridges(Vec<BridgeStatus>),
+    /// `Query::Surfaces`.
+    Surfaces(SurfacesReport),
+    /// `Query::LearnControl`: the control that moved, if any.
+    LearnedControl(Option<LearnedControl>),
+    /// `Query::SurfaceProfiles`.
+    SurfaceProfiles(Vec<SurfaceProfileInfo>),
+    /// `Query::Router`.
+    Router(RouterReport),
+    /// `Query::Mixers`: the saved panels in id order.
+    Mixers(Vec<MixerSpec>),
     /// On an event stream: this subscriber fell behind and `dropped` events
     /// were lost. Re-read `Status` to resynchronise; newer events follow.
     Lagged {
@@ -2482,6 +2937,20 @@ mod shape_tests {
 mod kind_tests {
     use super::*;
 
+    fn sample_rx() -> RouterPort {
+        RouterPort::NetworkRx {
+            device: DeviceKey("d".into()),
+            channel: Channel::new(1).unwrap(),
+        }
+    }
+
+    fn sample_out() -> RouterPort {
+        RouterPort::HostOut {
+            device: DeviceKey("d".into()),
+            channel: Channel::new(1).unwrap(),
+        }
+    }
+
     #[test]
     fn kind_is_the_serde_variant_name() {
         let samples = [
@@ -2561,6 +3030,119 @@ mod kind_tests {
             },
             Command::ResetAccessLock {
                 device: DeviceKey("d".into()),
+            },
+            Command::SetChannelMute {
+                target: ChannelSet {
+                    device: DeviceKey("d".into()),
+                    direction: Direction::Tx,
+                    channels: vec![Channel::new(1).unwrap()],
+                },
+                muted: true,
+            },
+            Command::SetChannelGain {
+                target: ChannelSet {
+                    device: DeviceKey("d".into()),
+                    direction: Direction::Rx,
+                    channels: vec![Channel::new(2).unwrap()],
+                },
+                gain: Gain::Off,
+            },
+            Command::SetSurface {
+                surface: SurfaceSpec::new(
+                    "s",
+                    SurfaceSource::Hidraw {
+                        vendor_id: 1,
+                        product_id: 2,
+                        interface: None,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            },
+            Command::RemoveSurface { name: "s".into() },
+            Command::ReportSurfaceConnection {
+                name: "s".into(),
+                connected: true,
+                epoch: Some(3),
+            },
+            Command::SetCardBridge {
+                bridge: CardBridgeSpec {
+                    name: "b".into(),
+                    enabled: true,
+                    device: DeviceKey("d".into()),
+                    card: "hw:CARD=X,DEV=0".into(),
+                    direction: BridgeDirection::Capture,
+                    first_channel: 1,
+                    channels: 2,
+                    period_frames: None,
+                    card_first_channel: 1,
+                    local_only: false,
+                },
+            },
+            Command::RemoveCardBridge { name: "b".into() },
+            Command::SetRouter {
+                router: RouterSpec::default(),
+            },
+            Command::ResetRouter,
+            Command::SetCrosspoint {
+                crosspoint: Crosspoint::new(sample_rx(), sample_out()),
+            },
+            Command::RemoveCrosspoint {
+                source: sample_rx(),
+                destination: sample_out(),
+            },
+            Command::SetCrosspointGain {
+                crosspoints: vec![Crosspoint::new(sample_rx(), sample_out()).key()],
+                gain: Gain::Off,
+            },
+            Command::SetCrosspointMute {
+                crosspoints: Vec::new(),
+                muted: true,
+            },
+            Command::SetPortGain {
+                ports: vec![sample_out()],
+                gain: Gain::MilliDb(-6000),
+            },
+            Command::SetPortMute {
+                ports: vec![sample_out()],
+                muted: false,
+            },
+            Command::SetPortLabel {
+                port: sample_out(),
+                label: Some("Desk".into()),
+            },
+            Command::SetHostVolume {
+                gain: Gain::MilliDb(-20_000),
+            },
+            Command::SetHostMute { muted: true },
+            Command::SetMixer {
+                mixer: MixerSpec {
+                    id: "main".into(),
+                    title: "Main".into(),
+                    strips: Vec::new(),
+                },
+            },
+            Command::RemoveMixer { id: "main".into() },
+            Command::SetMonitor {
+                device: DeviceKey("d".into()),
+                rx_from_tx: vec![1, 2],
+                delay_us: 20_000,
+            },
+            Command::SetOutputGain {
+                target: ChannelSet {
+                    device: DeviceKey("d".into()),
+                    direction: Direction::Rx,
+                    channels: vec![Channel::new(1).unwrap()],
+                },
+                gain: Gain::Off,
+            },
+            Command::SetOutputMute {
+                target: ChannelSet {
+                    device: DeviceKey("d".into()),
+                    direction: Direction::Rx,
+                    channels: vec![Channel::new(1).unwrap()],
+                },
+                muted: true,
             },
         ];
         let mut seen: Vec<&str> = Vec::new();
@@ -2889,6 +3471,21 @@ mod round2_tests {
     use alloc::string::ToString;
 
     #[test]
+    fn set_monitor_without_a_delay_is_auto() {
+        let c: Command =
+            serde_json::from_str(r#"{"set_monitor":{"device":"main","rx_from_tx":[1,2]}}"#)
+                .unwrap();
+        assert_eq!(
+            c,
+            Command::SetMonitor {
+                device: DeviceKey("main".into()),
+                rx_from_tx: alloc::vec![1, 2],
+                delay_us: 0,
+            }
+        );
+    }
+
+    #[test]
     fn locked_by_has_its_own_field_and_old_json_still_parses() {
         let e = CommandError::locked_by("role", "<command line>");
         let json = serde_json::to_string(&e).unwrap();
@@ -3060,5 +3657,209 @@ mod access_lock_tests {
         let json = serde_json::to_string(&locked).unwrap();
         assert!(json.contains(r#""access_locked":true"#), "{json}");
         assert_eq!(serde_json::from_str::<DeviceStatus>(&json).unwrap(), locked);
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod host_router_wire_tests {
+    use super::*;
+
+    fn ch(n: u16) -> Channel {
+        Channel::new(n).unwrap()
+    }
+
+    fn cq(n: u16) -> RouterPort {
+        RouterPort::CardIn {
+            card: "hw:CARD=CQ,DEV=0".into(),
+            channel: ch(n),
+        }
+    }
+
+    fn speaker(n: u16) -> RouterPort {
+        RouterPort::HostOut {
+            device: DeviceKey("main".into()),
+            channel: ch(n),
+        }
+    }
+
+    fn round_trip<T>(v: &T) -> String
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + fmt::Debug,
+    {
+        let j = serde_json::to_string(v).unwrap();
+        assert_eq!(&serde_json::from_str::<T>(&j).unwrap(), v, "{j}");
+        j
+    }
+
+    #[test]
+    fn the_new_commands_round_trip() {
+        let mut x = Crosspoint::new(cq(15), speaker(1));
+        x.gain = Gain::MilliDb(-3000);
+        let cmds = [
+            Command::SetRouter {
+                router: RouterSpec {
+                    crosspoints: vec![x.clone()],
+                    labels: vec![PortLabel {
+                        port: cq(15),
+                        label: "CQ Main L".into(),
+                    }],
+                },
+            },
+            Command::ResetRouter,
+            Command::SetCrosspoint {
+                crosspoint: x.clone(),
+            },
+            Command::RemoveCrosspoint {
+                source: cq(15),
+                destination: speaker(1),
+            },
+            Command::SetCrosspointGain {
+                crosspoints: vec![x.key()],
+                gain: Gain::Off,
+            },
+            Command::SetCrosspointMute {
+                crosspoints: vec![x.key()],
+                muted: true,
+            },
+            Command::SetPortGain {
+                ports: vec![cq(15), cq(16)],
+                gain: Gain::MilliDb(-6000),
+            },
+            Command::SetPortMute {
+                ports: vec![speaker(1)],
+                muted: true,
+            },
+            Command::SetHostVolume {
+                gain: Gain::MilliDb(-20_000),
+            },
+            Command::SetHostMute { muted: false },
+            Command::SetPortLabel {
+                port: cq(15),
+                label: None,
+            },
+            Command::SetMixer {
+                mixer: MixerSpec {
+                    id: "main".into(),
+                    title: "Speaker".into(),
+                    strips: vec![MixerStrip::new("main", StripControl::host_volume())],
+                },
+            },
+            Command::RemoveMixer { id: "main".into() },
+        ];
+        for c in &cmds {
+            round_trip(c);
+        }
+        assert_eq!(
+            serde_json::to_string(&Command::ResetRouter).unwrap(),
+            "\"reset_router\""
+        );
+        let j = serde_json::to_string(&cmds[8]).unwrap();
+        assert_eq!(j, "{\"set_host_volume\":{\"gain\":{\"milli_db\":-20000}}}");
+    }
+
+    #[test]
+    fn the_new_queries_replies_events_and_errors_round_trip() {
+        assert_eq!(serde_json::to_string(&Query::Router).unwrap(), "\"router\"");
+        assert_eq!(serde_json::to_string(&Query::Mixers).unwrap(), "\"mixers\"");
+        let mut report = RouterReport::default();
+        report.ports.push(PortStatus::new(cq(15), "CQ in 15"));
+        report.crosspoints.push(CrosspointStatus::new(
+            Crosspoint::new(cq(15), speaker(1)),
+            CrosspointOrigin::Saved,
+        ));
+        let r = Reply::Router(report);
+        let j = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Reply>(&j).unwrap(), r);
+        let m = Reply::Mixers(Vec::new());
+        assert_eq!(serde_json::to_string(&m).unwrap(), "{\"mixers\":[]}");
+        let origin = Origin::Surface { name: "cq".into() };
+        for e in [
+            Event::RouterChanged {
+                origin: origin.clone(),
+            },
+            Event::CrosspointGainChanged {
+                crosspoints: vec![Crosspoint::new(cq(15), speaker(1)).key()],
+                gain: Gain::Off,
+                origin: origin.clone(),
+            },
+            Event::CrosspointMuteChanged {
+                crosspoints: Vec::new(),
+                muted: true,
+                origin: origin.clone(),
+            },
+            Event::PortGainChanged {
+                ports: vec![cq(15)],
+                gain: Gain::MilliDb(1000),
+                origin: origin.clone(),
+            },
+            Event::PortMuteChanged {
+                ports: vec![cq(16)],
+                muted: false,
+                origin: origin.clone(),
+            },
+            Event::HostVolumeChanged {
+                gain: None,
+                muted: true,
+                origin: origin.clone(),
+            },
+            Event::MixerChanged {
+                id: "main".into(),
+                origin,
+            },
+        ] {
+            let j = serde_json::to_string(&e).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&j).unwrap(), e, "{j}");
+        }
+        for e in [
+            CommandError::LevelOwned {
+                what: "host volume".into(),
+                surface: "cq".into(),
+            },
+            CommandError::InvalidMixer {
+                reason: "strip `x`: no target".into(),
+            },
+        ] {
+            round_trip(&e);
+        }
+        assert_eq!(
+            CommandError::LevelOwned {
+                what: "host volume".into(),
+                surface: "cq".into()
+            }
+            .to_string(),
+            "the host volume is set by the fader of surface `cq`; mute is still available"
+        );
+    }
+
+    /// JSON from clients and daemons that predate the router still parses,
+    /// with the new fields at their defaults.
+    #[test]
+    fn older_json_still_parses() {
+        let status: Status = serde_json::from_str(
+            "{\"version\":\"0.5.2\",\"devices\":[],\"clocks\":[],\"warnings\":[]}",
+        )
+        .unwrap();
+        assert_eq!(status.host_volume, None);
+        let ch: ChannelStatus =
+            serde_json::from_str("{\"channel\":1,\"label\":\"L\",\"output_gain\":\"off\"}")
+                .unwrap();
+        assert_eq!(ch.output_gain_owner, None);
+        let b: SurfaceBinding = serde_json::from_str(
+            "{\"control\":\"f\",\"action\":\"gain\",\
+             \"target\":{\"device\":\"main\",\"direction\":\"rx\",\"channels\":[1]}}",
+        )
+        .unwrap();
+        assert!(b.ports.is_empty() && b.crosspoints.is_empty() && b.follow.is_none());
+        let bridge: CardBridgeSpec = serde_json::from_str(
+            "{\"name\":\"cq\",\"enabled\":true,\"device\":\"main\",\"card\":\"hw:CARD=CQ,DEV=0\",\
+             \"direction\":\"capture\",\"first_channel\":1,\"channels\":2}",
+        )
+        .unwrap();
+        assert!(!bridge.local_only);
+        // An unchanged legacy binding serializes exactly as before.
+        let j = serde_json::to_string(&b).unwrap();
+        assert!(!j.contains("ports") && !j.contains("follow"), "{j}");
+        let row: BridgeStatus = serde_json::from_str("{\"name\":\"x\"}").unwrap();
+        assert!(!row.local_only);
     }
 }

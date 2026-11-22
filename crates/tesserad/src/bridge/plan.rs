@@ -6,7 +6,14 @@ use std::time::Duration;
 
 use tessera_media::Quality;
 use tessera_state::Config;
-use tessera_state::config::{Backoff, BridgeDirection, Resampler};
+use tessera_state::config::{Backoff, BridgeDirection, DEFAULT_BRIDGE_TIME_CONSTANT_S, Resampler};
+
+/// Periods per second of a monitored capture bridge left at its default
+/// period (2 ms).
+pub const MONITOR_PERIODS_PER_S: u32 = 500;
+/// Drift-loop time constant of a monitored capture bridge left at the
+/// default one, seconds.
+pub const MONITOR_TIME_CONSTANT_S: f64 = 20.0;
 use tessera_state::model::DeviceModel;
 
 /// One bridge as the bridge manager runs it.
@@ -24,6 +31,12 @@ pub struct BridgePlan {
     pub first_channel: u16,
     /// Channels.
     pub channels: u16,
+    /// First card channel carried (1-based).
+    pub card_first_channel: u16,
+    /// `local_only`: the card is opened for the host router only; its
+    /// channels are card ports, never device channels (`first_channel` is
+    /// not used).
+    pub local_only: bool,
     /// The device's rate, which the card must run at.
     pub rate: u32,
     /// Card period, frames.
@@ -165,6 +178,8 @@ pub struct PlanError {
     pub first_channel: u16,
     /// Channels (0 if the device is unknown).
     pub channels: u16,
+    /// First card channel.
+    pub card_first_channel: u16,
     /// Why it cannot run.
     pub reason: String,
 }
@@ -179,6 +194,20 @@ pub fn plan_bridges(
     devices: &[DeviceModel],
     no_rt: bool,
 ) -> (Vec<BridgePlan>, Vec<PlanError>) {
+    plan_bridges_with(cfg, devices, no_rt, &std::collections::BTreeSet::new())
+}
+
+/// [`plan_bridges`] where `listened` names the card inputs (`pcm`, 1-based
+/// card channel) the host router plays locally (into a host or card output,
+/// [`crate::router::local_listeners`]): a capture bridge carrying one of
+/// them runs for latency like a monitored one.
+#[must_use]
+pub fn plan_bridges_with(
+    cfg: &Config,
+    devices: &[DeviceModel],
+    no_rt: bool,
+    listened: &std::collections::BTreeSet<(String, u16)>,
+) -> (Vec<BridgePlan>, Vec<PlanError>) {
     let mut plans = Vec::new();
     let mut errors = Vec::new();
     for b in cfg.bridges.iter().filter(|b| b.enabled) {
@@ -189,6 +218,7 @@ pub fn plan_bridges(
             direction: b.direction,
             first_channel: b.first_channel,
             channels,
+            card_first_channel: b.card_first_channel,
             reason,
         };
         let Some(d) = devices.iter().find(|d| d.key.0 == b.device) else {
@@ -199,7 +229,16 @@ pub fn plan_bridges(
             BridgeDirection::Playback => d.rx_channels,
             BridgeDirection::Capture => d.tx_channels,
         };
-        let channels = b.channel_count(available);
+        // A local-only bridge has no device channels: its count is its own.
+        let channels = if b.local_only {
+            b.channels.unwrap_or(0)
+        } else {
+            b.channel_count(available)
+        };
+        if b.local_only && channels == 0 {
+            errors.push(error(0, "a local_only bridge needs `channels`".into()));
+            continue;
+        }
         // A device whose count was reduced at run time (or a direction at 0):
         // the bridge cannot run rather than open a card for channels the
         // device does not have. The state engine refuses such changes for
@@ -218,7 +257,9 @@ pub fn plan_bridges(
             ));
             continue;
         }
-        if u32::from(b.first_channel) + u32::from(channels) - 1 > u32::from(available) {
+        if !b.local_only
+            && u32::from(b.first_channel) + u32::from(channels) - 1 > u32::from(available)
+        {
             errors.push(error(
                 channels,
                 format!(
@@ -247,6 +288,44 @@ pub fn plan_bridges(
             },
             r => r,
         };
+        // A capture bridge whose channels are monitored locally runs for
+        // latency where its keys are left at their defaults: 2 ms periods
+        // and a faster drift loop (its transient, which the lead holds as
+        // headroom, shrinks from ~10 ms to ~1.6 ms at 48 kHz).
+        // The same for a capture bridge whose card inputs the host router
+        // plays locally.
+        let monitored = b.direction == BridgeDirection::Capture
+            && ((!b.local_only
+                && cfg.devices.iter().any(|dev| {
+                    dev.id == b.device
+                        && dev.monitor_rx_from_tx.iter().any(|&tx| {
+                            tx >= b.first_channel
+                                && u32::from(tx) < u32::from(b.first_channel) + u32::from(channels)
+                        })
+                }))
+                || (0..channels).any(|i| {
+                    b.card_first_channel
+                        .checked_add(i)
+                        .is_some_and(|c| listened.contains(&(b.alsa_pcm.clone(), c)))
+                }));
+        let (period_frames, buffer_frames, time_constant_s) = if monitored {
+            let period = b
+                .period_frames
+                .unwrap_or_else(|| (d.sample_rate / MONITOR_PERIODS_PER_S).max(32));
+            let buffer = b.buffer_frames.unwrap_or_else(|| period.saturating_mul(4));
+            let tau = if b.time_constant_s == DEFAULT_BRIDGE_TIME_CONSTANT_S {
+                MONITOR_TIME_CONSTANT_S
+            } else {
+                b.time_constant_s
+            };
+            (period, buffer, tau)
+        } else {
+            (
+                b.period(d.sample_rate),
+                b.buffer(d.sample_rate),
+                b.time_constant_s,
+            )
+        };
         plans.push(BridgePlan {
             name: b.name.clone(),
             device: b.device.clone(),
@@ -254,15 +333,17 @@ pub fn plan_bridges(
             direction: b.direction,
             first_channel: b.first_channel,
             channels,
+            card_first_channel: b.card_first_channel,
+            local_only: b.local_only,
             rate: d.sample_rate,
-            period_frames: b.period(d.sample_rate),
-            buffer_frames: b.buffer(d.sample_rate),
+            period_frames,
+            buffer_frames,
             quality,
             latency_us: d.latency_us,
             latency_max_us: d.latency_bounds_us[1].max(d.latency_us),
             rt_priority: (!no_rt && b.rt_priority > 0).then_some(b.rt_priority),
             cpu: b.cpu.map(|c| c as usize),
-            time_constant_s: b.time_constant_s,
+            time_constant_s,
             max_correction_ppm: b.max_correction_ppm,
             backoff: b.backoff(&cfg.defaults.bridge),
             error_sleep: b.error_sleep(&cfg.defaults.bridge),
@@ -306,6 +387,74 @@ mod tests {
         }
     }
 
+    /// Device `main` monitoring TX channels 1 and 2 on its RX channels 1, 2.
+    fn monitoring_device() -> tessera_state::config::DeviceConfig {
+        tessera_state::config::DeviceConfig {
+            id: "main".into(),
+            name: "n".into(),
+            rx_channels: 8,
+            tx_channels: 2,
+            sample_rate: 48_000,
+            encoding: 24,
+            latency_us: 4_000,
+            latency_bounds_us: [1_000, 40_000],
+            allow_unsafe_latency: false,
+            locked: BTreeSet::new(),
+            rx_channel_labels: BTreeMap::new(),
+            tx_channel_labels: BTreeMap::new(),
+            multicast: tessera_state::config::MulticastConfig::default(),
+            monitor_rx_from_tx: vec![1, 2],
+            monitor_delay_us: 0,
+        }
+    }
+
+    #[test]
+    fn a_monitored_capture_bridge_runs_for_latency_where_left_at_defaults() {
+        let capture = BridgeConfig::new("main", "hw:CARD=SC3,DEV=0", BridgeDirection::Capture);
+        let mut c = cfg(vec![capture.clone()]);
+        c.devices = vec![monitoring_device()];
+        let (p, e) = plan_bridges(&c, &[dev(48_000)], false);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!((p[0].period_frames, p[0].buffer_frames), (96, 384));
+        assert_eq!(p[0].time_constant_s, MONITOR_TIME_CONSTANT_S);
+        // About 1.6 ms of loop transient instead of about 10 ms.
+        assert!(p[0].transient_frames() < 100, "{}", p[0].transient_frames());
+
+        // The auto offset: the playback position plus the latency, less 1 ms
+        // (here the lead is 3 periods: T + 2 c is less).
+        let off = crate::runtime::monitor_offset_ns(0, 4_000, &[&p[0]]);
+        let c3 = 3 * 96;
+        let t = p[0].transient_frames();
+        let extra_ns = (c3 - (t + 2 * 96)) * 1_000_000_000 / 48_000;
+        assert_eq!(off, 3_000_000 + i64::try_from(extra_ns).unwrap());
+        assert!(crate::runtime::feeds_monitor(&p[0], "main", &[1]));
+        assert!(!crate::runtime::feeds_monitor(&p[0], "main", &[3]));
+        assert!(!crate::runtime::feeds_monitor(&p[0], "other", &[1]));
+        // A configured delay is a delay; auto without a bridge reads at the
+        // playback position.
+        assert_eq!(
+            crate::runtime::monitor_offset_ns(20_000, 4_000, &[&p[0]]),
+            -20_000_000
+        );
+        assert_eq!(crate::runtime::monitor_offset_ns(0, 4_000, &[]), 0);
+
+        // Explicit keys stay as they are; a bridge nobody monitors keeps the
+        // plain defaults.
+        let mut explicit = capture.clone();
+        explicit.period_frames = Some(240);
+        explicit.time_constant_s = 60.0;
+        let mut c = cfg(vec![explicit]);
+        c.devices = vec![monitoring_device()];
+        let (p, _) = plan_bridges(&c, &[dev(48_000)], false);
+        assert_eq!((p[0].period_frames, p[0].time_constant_s), (240, 60.0));
+        let mut c = cfg(vec![capture]);
+        let mut d = monitoring_device();
+        d.monitor_rx_from_tx.clear();
+        c.devices = vec![d];
+        let (p, _) = plan_bridges(&c, &[dev(48_000)], false);
+        assert_eq!((p[0].period_frames, p[0].time_constant_s), (480, 120.0));
+    }
+
     #[test]
     fn a_plan_resolves_the_defaults_against_the_device() {
         let mut b = BridgeConfig::new("main", "hw:Loopback,0,0", BridgeDirection::Playback);
@@ -314,6 +463,7 @@ mod tests {
         assert!(e.is_empty());
         let p = &p[0];
         assert_eq!((p.first_channel, p.channels), (3, 6));
+        assert_eq!(p.card_first_channel, 1, "card channel 1 unless set");
         assert_eq!(
             (p.rate, p.period_frames, p.buffer_frames),
             (48_000, 480, 1920)
@@ -497,6 +647,7 @@ mod tests {
             "alsa_pcm = \"hw:1\"",
             "direction = \"capture\"",
             "first_channel = 2",
+            "card_first_channel = 3",
             "period_frames = 256",
             "buffer_frames = 4096",
             "resampler = \"linear\"",
@@ -540,5 +691,28 @@ mod tests {
         let (p, _) = plan_bridges(&c, &[dev(48_000)], false);
         assert_eq!(p[0].quality, Resampler::Linear);
         assert_eq!(p[0].media_quality(), Quality::Linear);
+    }
+
+    #[test]
+    fn a_local_only_bridge_has_its_own_channels_and_runs_for_latency_when_heard() {
+        let mut b = BridgeConfig::new("main", "hw:CARD=CQ,DEV=0", BridgeDirection::Capture);
+        b.local_only = true;
+        b.card_first_channel = 15;
+        // More channels than the device has TX channels: they are card
+        // ports, not device channels.
+        b.channels = Some(4);
+        let (p, e) = plan_bridges(&cfg(vec![b.clone()]), &[dev(48_000)], false);
+        assert!(e.is_empty(), "{e:?}");
+        assert!(p[0].local_only);
+        assert_eq!((p[0].channels, p[0].card_first_channel), (4, 15));
+        assert_eq!(p[0].period_frames, 480, "nobody listens: the default 10 ms");
+        let heard = std::collections::BTreeSet::from([("hw:CARD=CQ,DEV=0".to_owned(), 16)]);
+        let (p, _) = plan_bridges_with(&cfg(vec![b.clone()]), &[dev(48_000)], false, &heard);
+        assert_eq!((p[0].period_frames, p[0].buffer_frames), (96, 384));
+        // Without a channel count it cannot run.
+        b.channels = None;
+        let (p, e) = plan_bridges(&cfg(vec![b]), &[dev(48_000)], false);
+        assert!(p.is_empty());
+        assert!(e[0].reason.contains("channels"), "{e:?}");
     }
 }

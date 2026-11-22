@@ -153,6 +153,7 @@ pub mod loader;
 pub mod model;
 pub mod network_profiles;
 pub mod persist;
+pub mod router;
 pub mod schema;
 pub mod validate;
 

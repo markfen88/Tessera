@@ -100,9 +100,12 @@ pub async fn speaker(State(st): State<Shared>, headers: HeaderMap) -> Response {
     };
     let (metrics, act) = flow_activity(&st).await;
     let sessions = metrics.as_ref().map(|m| m.audio.sessions);
-    let vol = match a.config.volume.as_ref() {
-        Some(v) => Some(volume::read(&*a.runner, v).await),
-        None => None,
+    // The daemon sets the volume once its status says so; until then the
+    // portal reads the card with amixer.
+    let host = status.as_ref().ok().and_then(|s| s.host_volume.clone());
+    let vol = match (a.config.volume.as_ref(), &host) {
+        (Some(v), None) => Some(volume::read(&*a.runner, v).await),
+        _ => None,
     };
     // `bluetoothctl` blocks for seconds while the service is down: ask only
     // when the `bluetooth` unit itself (in any entry) is active.
@@ -138,7 +141,7 @@ pub async fn speaker(State(st): State<Shared>, headers: HeaderMap) -> Response {
     });
     let body = html! {
         div.grid {
-            (master_card(a, vol.as_ref(), eq.as_ref(), gui.as_deref(), &s.csrf))
+            (master_card(a, host.as_ref(), vol.as_ref(), eq.as_ref(), gui.as_deref(), &s.csrf))
             @if let (Some(check), Some(eq)) = (capture_rate.as_ref(), eq.as_ref()) {
                 (capture_rate_card(check, eq.active_label(), &s.csrf, a.config.rate_follow.enabled))
             }
@@ -287,6 +290,7 @@ fn format_card(notice: &FormatNotice, config_label: &str) -> Markup {
 /// configured.
 fn master_card(
     a: &Appliance,
+    host: Option<&tessera_control_types::HostVolumeStatus>,
     vol: Option<&Result<volume::Level, String>>,
     eq: Option<&Snapshot>,
     gui: Option<&str>,
@@ -299,15 +303,20 @@ fn master_card(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     });
-    if volume.is_none() && eq.is_none() && gui.is_none() && follow.is_none() {
+    if host.is_none() && volume.is_none() && eq.is_none() && gui.is_none() && follow.is_none() {
         return html! {};
     }
     html! {
         section.card.master id="master" {
-            @if volume.is_some() || eq.is_some() {
+            @if host.is_some() || volume.is_some() || eq.is_some() {
                 div.panes {
-                    @if let Some((cfg, cur)) = volume { (volume::pane(cfg, cur, csrf)) }
+                    @if let Some(hv) = host { (volume::host_pane(hv, csrf)) }
+                    @else if let Some((cfg, cur)) = volume { (volume::pane(cfg, cur, csrf)) }
                     @if let Some(eq) = eq { (camilla::boost_pane(&eq.active, csrf)) }
+                }
+                div.actions.mixer-link {
+                    a.btn href="/mixer" { "Open mixer" }
+                    span.muted { "the inputs and Main as faders, on one desk" }
                 }
             }
             @if let Some(r) = &follow { (rate_follow_line(r)) }
@@ -1175,7 +1184,7 @@ mod tests {
         let mut c = cfg();
         let a = Appliance::new(c.clone(), runner.clone());
         assert!(
-            master_card(&a, None, None, None, "t")
+            master_card(&a, None, None, None, None, "t")
                 .into_string()
                 .is_empty()
         );
@@ -1185,7 +1194,7 @@ mod tests {
             rate: Some(48_000),
             error: None,
         };
-        let out = master_card(&a, None, None, None, "t").into_string();
+        let out = master_card(&a, None, None, None, None, "t").into_string();
         assert!(
             out.contains("id=\"master\"") && out.contains("48000 Hz"),
             "{out}"

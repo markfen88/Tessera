@@ -44,6 +44,20 @@ and memberships. A missing record causes conservative package-only removal.
 Removing additional dependent packages requires `--remove-dependents` after
 reviewing the simulated plan; `--yes` alone never grants that consent.
 
+Downgrade to 0.5.x: `install` refuses an older bundle while a newer version is
+installed, so run this bundle's `uninstall` (without `--purge`) first, then the
+older bundle's `install`. The uninstall removes the configuration files the bundle
+wrote, `/etc/tessera/config.d/60-host-volume.toml` included: a 0.5.x daemon refuses
+its `[host_volume]` table and would not start. Remove any other 0.6 key you added
+to `/etc/tessera` yourself (a 0.5.x daemon that refuses to start names each
+unknown key in `journalctl -u tesserad`). A 0.5.x daemon reads
+`/var/lib/tessera/state.toml` but drops what it does not know (control surfaces,
+the host router, the host volume, mixer strips, card bridges, channel gains and
+mutes) the next time it saves the file; the uninstall keeps a copy at
+`/var/lib/tessera/state.toml.<version>`. After
+upgrading again, stop `tesserad`, copy it back over `state.toml` with `cp -p`
+(it keeps the owner; it replaces what was saved under 0.5.x), and start it.
+
 `verify` authenticates `SHA256SUMS.minisig` (prehashed minisign ED), checks its
 trusted comment for product `tessera`, the exact bundle version and `SHA256SUMS`,
 then checks both manifests and every payload file. Unsafe paths, links, duplicate

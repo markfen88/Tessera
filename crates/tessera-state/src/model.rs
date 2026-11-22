@@ -174,6 +174,161 @@ fn parse_channel(s: &str) -> Option<u16> {
     s.parse::<u16>().ok().filter(|n| *n >= 1)
 }
 
+/// Saved mute lists and gains as the engine needs them (a hand-edited
+/// `state.toml` may break that): mute lists ascending, without duplicates or
+/// channel 0; gain keys canonical channel numbers, values in range, unity not
+/// stored. Channels beyond the current count are kept but inactive, like
+/// labels: they apply again if the count grows.
+fn normalize_channel_controls(key: &str, ds: &mut DeviceIntent, warnings: &mut Vec<Issue>) {
+    let p = format!("state.device.{key}");
+    for (side, list) in [
+        ("rx_muted", &mut ds.rx_muted),
+        ("tx_muted", &mut ds.tx_muted),
+        ("rx_output_muted", &mut ds.rx_output_muted),
+    ] {
+        let mut fixed = list.clone();
+        fixed.retain(|c| *c >= 1);
+        fixed.sort_unstable();
+        fixed.dedup();
+        if fixed != *list {
+            warn(
+                warnings,
+                format!("{p}.{side}"),
+                "not an ascending list of distinct channels from 1; normalised".to_owned(),
+            );
+            *list = fixed;
+        }
+    }
+    for (side, map) in [
+        ("rx_channel_gain", &mut ds.rx_channel_gain),
+        ("tx_channel_gain", &mut ds.tx_channel_gain),
+        ("rx_output_gain", &mut ds.rx_output_gain),
+    ] {
+        let path = format!("{p}.{side}");
+        let mut fixed = BTreeMap::new();
+        for (k, g) in std::mem::take(map) {
+            let Some(n) = parse_channel(&k) else {
+                warn(
+                    warnings,
+                    format!("{path}.{k}"),
+                    "not a channel number; dropped".to_owned(),
+                );
+                continue;
+            };
+            if !g.is_valid() {
+                warn(
+                    warnings,
+                    format!("{path}.{k}"),
+                    format!("{g:?} is out of range; dropped (unity)"),
+                );
+                continue;
+            }
+            let canonical = n.to_string();
+            if canonical != k {
+                warn(
+                    warnings,
+                    format!("{path}.{k}"),
+                    format!("key is not canonical; normalised to `{canonical}`"),
+                );
+            }
+            // Unity is the default and is not stored. Of two keys for one
+            // channel (`1` and `01`), the canonical one wins (non-canonical
+            // keys start with `0` or `+`, so they sort before it).
+            if g == tessera_control_types::Gain::default() {
+                if canonical == k {
+                    fixed.remove(&canonical);
+                }
+                continue;
+            }
+            if canonical == k || !fixed.contains_key(&canonical) {
+                fixed.insert(canonical, g);
+            }
+        }
+        *map = fixed;
+    }
+}
+
+/// Saved card bridges: names are unique, as for surfaces.
+fn normalize_card_bridges(intent: &mut StateFile, warnings: &mut Vec<Issue>) {
+    let mut seen = BTreeSet::new();
+    intent.card_bridge.retain(|b| {
+        let first = seen.insert(b.name.clone());
+        if !first {
+            warn(
+                warnings,
+                format!("state.card_bridge.{}", b.name),
+                "a bridge by this name is stored twice; the later entry is dropped".to_owned(),
+            );
+        }
+        first
+    });
+}
+
+/// Saved mixer panels: ids are unique and listed in id order; saved router
+/// crosspoints, labels and levels name each pair or port once. A
+/// hand-edited `state.toml` may repeat one: the first is kept.
+fn normalize_router_and_mixers(intent: &mut StateFile, warnings: &mut Vec<Issue>) {
+    let mut seen = BTreeSet::new();
+    intent.mixer.retain(|m| {
+        let first = seen.insert(m.id.clone());
+        if !first {
+            warn(
+                warnings,
+                format!("state.mixer.{}", m.id),
+                "a mixer panel by this id is stored twice; the later entry is dropped".to_owned(),
+            );
+        }
+        first
+    });
+    intent.mixer.sort_by(|a, b| a.id.cmp(&b.id));
+    let r = &mut intent.router;
+    let mut keys = BTreeSet::new();
+    r.crosspoint.retain(|x| {
+        let first = keys.insert(x.key());
+        if !first {
+            warn(
+                warnings,
+                "state.router.crosspoint".to_owned(),
+                format!(
+                    "{} is stored twice; the later entry is dropped",
+                    crate::router::describe_key(&x.key())
+                ),
+            );
+        }
+        first
+    });
+    if !r.saved && !r.crosspoint.is_empty() {
+        warn(
+            warnings,
+            "state.router.crosspoint".to_owned(),
+            "crosspoints are stored without `saved = true`; they are taken as the saved grid"
+                .to_owned(),
+        );
+        r.saved = true;
+    }
+    let mut ports = BTreeSet::new();
+    r.label.retain(|l| ports.insert(l.port.clone()));
+    let mut ports = BTreeSet::new();
+    r.level.retain(|l| ports.insert(l.port.clone()));
+}
+
+/// Saved surfaces: names are unique (a hand-edited `state.toml` may repeat
+/// one); the first entry of a name is kept.
+fn normalize_surfaces(intent: &mut StateFile, warnings: &mut Vec<Issue>) {
+    let mut seen = BTreeSet::new();
+    intent.surface.retain(|s| {
+        let first = seen.insert(s.name.clone());
+        if !first {
+            warn(
+                warnings,
+                format!("state.surface.{}", s.name),
+                "a surface by this name is stored twice; the later entry is dropped".to_owned(),
+            );
+        }
+        first
+    });
+}
+
 /// Resolve one label map. Config labels are the base; unless locked, valid
 /// persisted labels override them. Persisted labels that cannot take effect
 /// (channel beyond the current count, bad channel key, invalid text) stay in
@@ -607,6 +762,12 @@ pub fn reconcile(
             &mut warnings,
         ));
     }
+    for (key, ds) in &mut intent.device {
+        normalize_channel_controls(key, ds, &mut warnings);
+    }
+    normalize_surfaces(intent, &mut warnings);
+    normalize_card_bridges(intent, &mut warnings);
+    normalize_router_and_mixers(intent, &mut warnings);
     for key in intent.device.keys() {
         if config.device(key).is_none() {
             warnings.push(Issue::warning(
